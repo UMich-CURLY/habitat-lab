@@ -26,7 +26,7 @@ except ImportError:
     pass
 
 SENTENCE_SPLIT_REGEX = re.compile(r"([^\w-]+)")
-DEFAULT_PHYSICS_CONFIG_PATH = "data/default.physics_config.json"
+DEFAULT_PHYSICS_CONFIG_PATH = "/home/catkin_ws/src/habitat_ros_interface/data/default.physics_config.json"
 
 
 def tokenize(

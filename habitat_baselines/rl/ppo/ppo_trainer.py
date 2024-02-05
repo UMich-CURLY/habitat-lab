@@ -64,7 +64,7 @@ from habitat_baselines.utils.common import (
     get_num_actions,
     is_continuous_action_space,
 )
-
+from IPython import embed
 
 @baseline_registry.register_trainer(name="ddppo")
 @baseline_registry.register_trainer(name="ppo")
@@ -908,7 +908,6 @@ class PPOTrainer(BaseRLTrainer):
             )
         else:
             ckpt_dict = {}
-
         if self.config.EVAL.USE_CKPT_CONFIG:
             config = self._setup_eval_config(ckpt_dict["config"])
         else:

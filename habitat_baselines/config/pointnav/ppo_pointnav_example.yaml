@@ -11,7 +11,7 @@ TENSORBOARD_DIR: "tb"
 VIDEO_DIR: "video_dir"
 # To evaluate on all episodes, set this to -1
 TEST_EPISODE_COUNT: 2
-EVAL_CKPT_PATH_DIR: "data/new_checkpoints"
+EVAL_CKPT_PATH_DIR: "/home/catkin_ws/src/habitat_ros_interface/data/checkpoints/ckpt.0.pth"
 NUM_ENVIRONMENTS: 1
 SENSORS: ["RGB_SENSOR", "DEPTH_SENSOR"]
 CHECKPOINT_FOLDER: "data/new_checkpoints"

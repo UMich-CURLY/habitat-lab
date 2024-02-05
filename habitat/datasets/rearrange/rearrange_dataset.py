@@ -18,7 +18,11 @@ from habitat.core.registry import registry
 from habitat.core.utils import DatasetFloatJSONEncoder
 from habitat.datasets.pointnav.pointnav_dataset import PointNavDatasetV1
 from habitat.datasets.utils import check_and_gen_physics_config
-
+from habitat.tasks.nav.nav import (
+    NavigationEpisode,
+    NavigationGoal,
+    ShortestPathPoint,
+)
 
 @attr.s(auto_attribs=True, kw_only=True)
 class RearrangeEpisode(Episode):
@@ -37,6 +41,7 @@ class RearrangeEpisode(Episode):
     markers: Dict[str, Tuple[str, Tuple]] = {}
     target_receptacles: List[Tuple[str, int]] = []
     goal_receptacles: List[Tuple[str, int]] = []
+    goals: List[NavigationGoal] = []
 
 
 @registry.register_dataset(name="RearrangeDataset-v0")
@@ -69,7 +74,7 @@ class RearrangeDatasetV0(PointNavDatasetV1):
         self, json_str: str, scenes_dir: Optional[str] = None
     ) -> None:
         deserialized = json.loads(json_str)
-
+        print("Checking in episode")
         for i, episode in enumerate(deserialized["episodes"]):
             rearrangement_episode = RearrangeEpisode(**episode)
             rearrangement_episode.episode_id = str(i)

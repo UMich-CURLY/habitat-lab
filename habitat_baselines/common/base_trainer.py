@@ -23,6 +23,9 @@ from habitat_baselines.utils.common import (
     get_checkpoint_id,
     poll_checkpoint_folder,
 )
+from IPython import embed
+import sys
+sys.path.append('/home/catkin_ws/src/habitat_ros_interface')
 
 
 class BaseTrainer:
@@ -96,7 +99,6 @@ class BaseTrainer:
             assert (
                 len(self.config.VIDEO_DIR) > 0
             ), "Must specify a directory for storing videos on disk"
-
         with get_writer(self.config, flush_secs=self.flush_secs) as writer:
             if os.path.isfile(self.config.EVAL_CKPT_PATH_DIR):
                 # evaluate singe checkpoint

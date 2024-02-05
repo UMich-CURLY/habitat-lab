@@ -2,22 +2,21 @@
 
 VERBOSE: False
 
-BASE_TASK_CONFIG_PATH: "/home/catkin_ws/src/habitat_ros_interface/configs/tasks/pointnav_mp3d.yaml"
+BASE_TASK_CONFIG_PATH: "/home/catkin_ws/src/habitat_ros_interface/configs/tasks/clean_rearrange.yml"
 TRAINER_NAME: "ppo"
 ENV_NAME: "NavRLEnv"
 SIMULATOR_GPU_ID: 0
 TORCH_GPU_ID: 0
 VIDEO_OPTION: []
 # Can be uncommented to generate videos.
-VIDEO_OPTION: ["tensorboard"]
+# VIDEO_OPTION: ["disk", "tensorboard"]
 TENSORBOARD_DIR: "tb"
 VIDEO_DIR: "video_dir"
 # Evaluate on all episodes
 TEST_EPISODE_COUNT: -1
-EVAL_CKPT_PATH_DIR: "/home/catkin_ws/src/habitat_ros_interface/data/checkpoints/mp3d.pth"
-
+EVAL_CKPT_PATH_DIR: "/home/catkin_ws/src/habitat_ros_interface/data/checkpoints/ckpt.0.pth"
 NUM_ENVIRONMENTS: 2
-SENSORS: ["RGB_SENSOR"]
+SENSORS: ["HEAD_DEPTH_SENSOR"]
 CHECKPOINT_FOLDER: "data/new_checkpoints"
 TOTAL_NUM_STEPS: -1.0
 LOG_INTERVAL: 25
@@ -25,8 +24,7 @@ NUM_CHECKPOINTS: 100
 # Force PyTorch to be single threaded as
 # this improves performance considerably
 FORCE_TORCH_SINGLE_THREADED: True
-EVAL:
-  USE_CKPT_CONFIG: False
+
 RL:
   PPO:
     # ppo params

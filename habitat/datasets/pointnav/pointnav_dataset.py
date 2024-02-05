@@ -17,11 +17,12 @@ from habitat.tasks.nav.nav import (
     NavigationGoal,
     ShortestPathPoint,
 )
-
+from IPython import embed
+import sys
 CONTENT_SCENES_PATH_FIELD = "content_scenes_path"
 DEFAULT_SCENE_PATH_PREFIX = "data/scene_datasets/"
 
-
+sys.path.append('/home/catkin_ws/src/habitat_ros_interface')
 @registry.register_dataset(name="PointNav-v1")
 class PointNavDatasetV1(Dataset):
     r"""Class inherited from Dataset that loads Point Navigation dataset."""
@@ -31,6 +32,8 @@ class PointNavDatasetV1(Dataset):
 
     @staticmethod
     def check_config_paths_exist(config: Config) -> bool:
+        print("data path is ",config.DATA_PATH.format(split=config.SPLIT))
+        print("scenedir path is ", config.SCENES_DIR)
         return os.path.exists(
             config.DATA_PATH.format(split=config.SPLIT)
         ) and os.path.exists(config.SCENES_DIR)
@@ -43,6 +46,7 @@ class PointNavDatasetV1(Dataset):
         dataset_dir = os.path.dirname(
             config.DATA_PATH.format(split=config.SPLIT)
         )
+        
         if not cls.check_config_paths_exist(config):
             raise FileNotFoundError(
                 f"Could not find dataset file `{dataset_dir}`"

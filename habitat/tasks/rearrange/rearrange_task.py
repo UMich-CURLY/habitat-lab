@@ -19,7 +19,7 @@ from habitat.tasks.rearrange.utils import (
     rearrange_logger,
 )
 
-
+from IPython import embed
 def merge_sim_episode_with_object_config(sim_config, episode):
     sim_config.defrost()
     sim_config.ep_info = [episode.__dict__]
@@ -54,6 +54,8 @@ class RearrangeTask(NavigationTask):
         self._targ_idx: int = 0
         self._episode_id: str = ""
         self._cur_episode_step = 0
+        self.nav_target_pos = dataset.episodes[0].goals[0]["position"]
+        print(self.nav_target_pos)
 
     @property
     def targ_idx(self):

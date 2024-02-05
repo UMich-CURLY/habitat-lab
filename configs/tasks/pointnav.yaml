@@ -11,6 +11,12 @@ SIMULATOR:
   DEPTH_SENSOR:
     WIDTH: 256
     HEIGHT: 256
+  HABITAT_SIM_V0:
+    ALLOW_SLIDING: false
+    ENABLE_PHYSICS: true
+    GPU_DEVICE_ID: 0
+    GPU_GPU: false
+    PHYSICS_CONFIG_FILE: /home/catkin_ws/src/habitat_ros_interface/data/default.physics_config.json
 TASK:
   TYPE: Nav-v0
 
@@ -23,3 +29,8 @@ TASK:
   MEASUREMENTS: ['DISTANCE_TO_GOAL', 'SUCCESS', 'SPL']
   SUCCESS:
     SUCCESS_DISTANCE: 0.2
+DATASET:
+  DATA_PATH: /home/catkin_ws/src/habitat_ros_interface/data/datasets/rearrange/mp3d/v1/test/content/Vvot9Ly1tCj0.json.gz
+  SCENES_DIR: /home/catkin_ws/src/habitat_ros_interface/data/scene_datasets/mp3d/
+  SPLIT: test
+  TYPE: PointNav-v1

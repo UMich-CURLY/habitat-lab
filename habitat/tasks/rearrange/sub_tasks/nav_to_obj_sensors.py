@@ -51,15 +51,15 @@ class TargetOrGoalStartPointGoalSensor(Sensor):
     def get_observation(self, task, *args, **kwargs):
         robot_T = self._sim.robot.base_transformation
 
-        if task.nav_to_obj_type == RearrangeObjectTypes.GOAL_POSITION:
-            to_pos = self._sim.get_targets()[1][self._task.targ_idx]
-        elif task.nav_to_obj_type == RearrangeObjectTypes.RIGID_OBJECT:
-            to_pos = self._sim.get_target_objs_start()[self._task.targ_idx]
-        else:
-            raise ValueError(
-                f"Got navigate to object type {RearrangeObjectTypes.RIGID_OBJECT}"
-            )
-
+        # if task.nav_to_obj_type == RearrangeObjectTypes.GOAL_POSITION:
+        #     to_pos = self._sim.get_targets()[1][self._task.targ_idx]
+        # elif task.nav_to_obj_type == RearrangeObjectTypes.RIGID_OBJECT:
+        #     to_pos = self._sim.get_target_objs_start()[self._task.targ_idx]
+        # else:
+        #     raise ValueError(
+        #         f"Got navigate to object type {RearrangeObjectTypes.RIGID_OBJECT}"
+        #     )
+        to_pos = task.nav_target_pos
         dir_vector = robot_T.inverted().transform_point(to_pos)
         rho, phi = cartesian_to_polar(dir_vector[0], dir_vector[1])
 
