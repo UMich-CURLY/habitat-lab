@@ -97,22 +97,26 @@ from IPython import embed
 DEFAULT_POSE_PATH = "data/humanoids/humanoid_data/walking_motion_processed.pkl"
 DEFAULT_CFG = "benchmark/rearrange/play/play.yaml"
 DEFAULT_RENDER_STEPS_LIMIT = 60
-SAVE_VIDEO_DIR = "/habitat-lab/data/vids/Train_data_15/exp_7.23/HUMAN_ORCA"
+SAVE_VIDEO_DIR = "/habitat-lab/data/vids/Test_Data_nov_5/single_test/exp7.40"
 SAVE_ACTIONS_DIR = "./data/interactive_play_replays"
 MAP_DIR = "/home/catkin_ws/src/habitat_ros_interface/maps/"
 THIRD_RGB_SIZE = 128
 GRID_SIZE = 6
 HUMAN_HEAD_START = 0       #60
-CSV_PATH = "/habitat-lab/data/vids/Train_data_15/exp_7.23/HUMAN_ORCA/results.csv"
+CSV_PATH = "/habitat-lab/data/vids/Test_Data_nov_5/single_test/exp7.40/results.csv"
 
 USE_TOPO_MAP = True
-USE_RL_CONTROL = True
+USE_RL_CONTROL = False
 USE_CLICKED_POINT = True
 HUMAN_RVO = True
 HUMAN_SFM = False
 USE_INSTANT_VEL = True
 USE_IRL_AGENT = True
 SAVE_DATA = True
+USE_CLICKED_POINT_IRL = False
+RANDOM_AGENT = False
+ALLOW_BACKOFF = False
+NO_ROBOT = False
 lock = threading.Lock()
 
 def to_grid(pathfinder, points, grid_dimensions):
@@ -215,12 +219,13 @@ class sim_env(threading.Thread):
         f.write("origin: [" + str(-1) + "," + str(-self.grid_dimensions[0]*meters_per_pixel+1) + ", 0.000000]\n")
         f.write("negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196")
         f.close()
-        
+        if NO_ROBOT:
+            self.env.sim.agents_mgr[0].articulated_agent.base_pos = self.env.sim.pathfinder.get_random_navigable_point()
         rospy.init_node("sim", anonymous=False)
         sim_cfg = config['habitat']['simulator']
         self.control_frequency = int(np.floor(sim_cfg['ctrl_freq']/sim_cfg['ac_freq_ratio']))
         time_step = 1.0 / (self.control_frequency)
-        self.control_frequency = 1.0
+        self.control_frequency = 5.0
         self._r = rospy.Rate(self._sensor_rate)
         self._r_control = rospy.Rate(self.control_frequency)
         
@@ -377,6 +382,14 @@ class sim_env(threading.Thread):
         print("Starting the work now")
         self.im_array = []
         self._current_episode = 0
+        self.clicked_point = None
+        self.prev_positions = None
+        self.counter_deadlock = 0
+        self.backoff_mode = False
+        self.robot_moved = []
+        self.human_moved = []
+        self.human_num_steps = 0
+        self.full_init_state = []
         
 
         # self.sfm.get_velocity(self.initial_state, filename = MAP_DIR+"run_rvo2", save_anim = True)
@@ -394,6 +407,7 @@ class sim_env(threading.Thread):
             results_dict["avg_robot_to_human_dis_over_epi"] = metrics["social_nav_stats"]["avg_robot_to_human_dis_over_epi"]
             results_dict["social_nav_reward"] = metrics["social_nav_reward"]
             results_dict["actual_num_steps"] = self.actual_num_steps   
+            results_dict["human_num_steps"] = self.human_num_steps
             results_dict["ep_no"] =  self.env.current_episode.episode_id
             results_dict["drift_counter"] = self.drift_counter
             results_dict["USE_HUMAN_RVO"] = HUMAN_RVO
@@ -409,6 +423,9 @@ class sim_env(threading.Thread):
                     writer.writeheader()
                 writer.writerow(results_dict)
         #### Finish writing csv file ####
+        if NO_ROBOT:
+            self.env.sim.agents_mgr[0].articulated_agent.base_pos = self.env.sim.pathfinder.get_random_navigable_point()
+
         self.observations = self.env.reset()
         meters_per_pixel =0.025
         map_name = "sample_map"
@@ -439,6 +456,8 @@ class sim_env(threading.Thread):
         if SAVE_DATA:
             self.im_array[0].save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".gif", save_all=True, append_images=self.im_array[1:], duration=100, loop=0)
             self.im_array = []
+            init_states_array = np.array(self.full_init_state)
+            np.save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".npy", init_states_array)
         self._current_episode += 1
         self.initial_state = []
         for i in range(self.number_of_agents):
@@ -459,6 +478,14 @@ class sim_env(threading.Thread):
         self.got_sem_cloud = False
         self.cloud_wait_counter = 0
         self.actual_num_steps = 0
+        self.backoff_mode = False
+        self.cheating_point = None
+        self.waiting_for_traj = True
+        self.counter_deadlock = 0
+        self.robot_moved = []
+        self.human_moved = []
+        self.human_num_steps = 0
+        self.full_init_state = []
         rospy.sleep(10)
 
     def img_to_grid(self):
@@ -602,7 +629,8 @@ class sim_env(threading.Thread):
         if not self.start_ep:
             base_vel = [0.0, 0.0]
             # print("Caught here ", not self.start_ep,  self.waiting_for_traj , self.current_point is None)
-            self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
+            self.observations.update(self.env._sim.get_sensor_observations())
+            # self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
             return
         self.wait_counter +=1
         while (dist_human_moved<0.2):
@@ -628,7 +656,7 @@ class sim_env(threading.Thread):
                 if dist_between_human_and_point > 0.5:
                     break
         self.initial_state[1][4:6] = to_grid(self.env._sim.pathfinder, points, self.grid_dimensions)
-        print("Human goal in 2d update in play agent is ", self.initial_state[1][4:6])
+        # print("Human goal in 2d update in play agent is ", self.initial_state[1][4:6])
     
         self._pub_start_ep.publish(True)
         self._pub_get_traj.publish(True)
@@ -645,7 +673,14 @@ class sim_env(threading.Thread):
         #         print("Setting to robot final goal")
         #     print("Current point is ", self.current_point)
         if USE_IRL_AGENT:
-            
+            robot_final_goal = self.env.current_episode.info['robot_goal']
+            dist_to_goal = np.linalg.norm((np.array(robot_final_goal)-np.array(self.objs[0].base_pos))[[0, 2]])
+            metrics = self.env.get_metrics()
+            # dist_to_goal_human = np.linalg.norm((np.array(self.env.current_episode.info['human_goal'])-np.array(self.objs[1].base_pos))[[0,2]])
+            # print("Distance to human goal is ", dist_to_goal_human)
+            if dist_to_goal <=1.0:
+                self.current_point = robot_final_goal
+                self.waiting_for_traj = False
             while self.cheating_point is None or self.waiting_for_traj:
                 # base_vel = [0.0, 0.0]
                 wait_time = (rospy.Time.now()-self.prev_query_time).to_sec()
@@ -686,8 +721,42 @@ class sim_env(threading.Thread):
         if USE_CLICKED_POINT:
             if self.cheating_point is not None:
                 self.initial_state[0][4:6] = self.cheating_point
+        if USE_CLICKED_POINT_IRL:
+            if self.clicked_point is not None:
+                self.initial_state[0][4:6] = self.clicked_point
         positions = self.sfm.get_future_position(np.array(self.initial_state), num_steps=1)
-        
+        if ALLOW_BACKOFF:
+            if self.prev_positions is not None and not self.backoff_mode:
+                human_final_goal = self.env.current_episode.info['human_goal']
+                dist_to_goal = np.linalg.norm((np.array(human_final_goal)-np.array(self.objs[1].base_pos))[[0, 2]])
+                if len(self.robot_moved )>50:
+                    print("Robot total moved is ", np.sum(self.robot_moved[-50:], axis = 0))
+                    print("Human total moved is ", np.sum(self.human_moved[-50:], axis = 0))
+                    if (np.sum(self.robot_moved[-50:], axis = 0) < [0.1, 0.1]).all() and (np.sum(self.human_moved[-50:], axis = 0) < [0.1, 0.1]).all():
+                        self.counter_deadlock +=1
+                        if self.counter_deadlock > 20 and dist_to_goal >0.2:
+                            self.backoff_mode = True
+                            self.backoff_goal_3d = self.env.current_episode.start_position
+                            self.backoff_goal = to_grid(self.env._sim.pathfinder, self.backoff_goal_3d, self.grid_dimensions)
+                            self.backing_off_counter = 0
+                            print("Backoff mode activated")
+                    else:
+                        self.counter_deadlock = 0
+            self.prev_positions = positions
+            if self.backoff_mode:
+                print("Backing off ")
+                self.initial_state[0][4:6] = self.backoff_goal
+                positions = self.sfm.get_future_position(np.array(self.initial_state), num_steps=1)
+                
+                # if positions[0][0] == self.backoff_goal[0] and positions[0][1] == self.backoff_goal[1]:
+                human_final_goal = self.env.current_episode.info['human_goal']
+                dist_to_goal = np.linalg.norm((np.array(human_final_goal)-np.array(self.objs[1].base_pos))[[0, 2]])
+                if dist_to_goal < 0.2:  
+                    self.backoff_mode = False
+                    print("Stopping backoff mode")
+                    self.counter_deadlock = 0
+                self.backing_off_counter+=1
+
         self.current_point_2d = positions[0]
         if USE_INSTANT_VEL:
             distx = (self.current_point_2d[0] - self.initial_state[0][0])
@@ -699,6 +768,10 @@ class sim_env(threading.Thread):
         if USE_RL_CONTROL:
             if self.cheating_point is not None:
                 self.current_point_2d = self.cheating_point
+            if USE_CLICKED_POINT_IRL:
+                if self.clicked_point is not None:
+                    self.current_point_2d = self.clicked_point
+
         point_3d = from_grid(self.env._sim.pathfinder, [self.current_point_2d[0]/0.025, self.current_point_2d[1]/0.025], self.grid_dimensions)
         self.current_point = np.array([point_3d[0], point_3d[1], point_3d[2]])
         self.human_goal_2d = positions[1]
@@ -711,16 +784,17 @@ class sim_env(threading.Thread):
             self.human_goal_2d = [positionx, positiony]
         point_3d = from_grid(self.env._sim.pathfinder, [self.human_goal_2d[0]/0.025,self.human_goal_2d[1]/0.025], self.grid_dimensions)
         self.human_goal_rvo = np.array([point_3d[0], point_3d[1], point_3d[2]])
-        print("Human goal in 2d is ", self.human_goal_2d)
+        # print("Human goal in 2d is ", self.human_goal_2d)
         robot_final_goal = self.env.current_episode.info['robot_goal']
         dist_to_goal = np.linalg.norm((np.array(robot_final_goal)-np.array(self.objs[0].base_pos))[[0, 2]])
-        print("Distance to final goal is ", dist_to_goal)
+        metrics = self.env.get_metrics()
+        print("Distance to final goal is ", dist_to_goal == metrics["social_dist_to_goal"])
         # dist_to_goal_human = np.linalg.norm((np.array(self.env.current_episode.info['human_goal'])-np.array(self.objs[1].base_pos))[[0,2]])
         # print("Distance to human goal is ", dist_to_goal_human)
-        if dist_to_goal <0.5:
+        if dist_to_goal <=1.0:
             self.current_point = robot_final_goal
             self.waiting_for_traj = False
-        print("Current point is ", self.current_point)
+        # print("Current point is ", self.current_point)
         # print("Computed Poistion for robot and human is ", positions)
         # if (self.wait_counter < HUMAN_HEAD_START):
         # while (dist_human_moved<0.2):
@@ -769,6 +843,13 @@ class sim_env(threading.Thread):
                 self.reset()
                 return
             self.actual_num_steps +=1
+            human_final_goal = self.env.current_episode.info['human_goal']
+            dist_to_goal_human = np.linalg.norm((np.array(human_final_goal)-np.array(self.objs[1].base_pos))[[0, 2]])
+            # print("Distance to human goal is!!!! ", dist_to_goal_human)
+            if dist_to_goal_human > 0.2:
+                self.human_num_steps +=1
+            else:
+                self.human_goal_rvo = human_final_goal
             k = 'agent_1_oracle_nav_randcoord_action'
             if HUMAN_RVO:
                 self.env.task.actions[k].coord_nav = self.human_goal_rvo
@@ -777,6 +858,10 @@ class sim_env(threading.Thread):
             else:
                 self.observations.update(self.env.step({"action":k, "action_args":{}}))
             k = 'agent_0_oracle_nav_randcoord_action'
+            if metrics["social_dist_to_goal"] <1.0:
+                self.current_point = robot_final_goal
+                self.waiting_for_traj = False
+                print("Setting to robot final goal")
             self.env.task.actions[k].coord_nav = self.current_point### Read the point from the traj
             
             coord_nav = self.current_point
@@ -787,7 +872,12 @@ class sim_env(threading.Thread):
                 print("Done with episode and starting a new one")
                 self.reset()
                 return
-            self.observations.update(self.env.step({"action":k, "action_args":{"agent_0_oracle_nav_randcoord_action":coord_nav}}))
+            if not NO_ROBOT:
+                self.observations.update(self.env.step({"action":k, "action_args":{"agent_0_oracle_nav_randcoord_action":coord_nav}}))
+            robot_pos_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_0_third_rgb"].shape[0], H = self.observations["agent_0_third_rgb"].shape[1], agent_state = self.objs[0].base_pos)
+            human_pos_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_0_third_rgb"].shape[0], H = self.observations["agent_0_third_rgb"].shape[1], agent_state = self.objs[1].base_pos)
+            robot_goal_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_0_third_rgb"].shape[0], H = self.observations["agent_0_third_rgb"].shape[1], agent_state = self.env.current_episode.info['robot_goal'])
+            self.full_init_state.append([robot_pos_in_img, human_pos_in_img, robot_goal_in_img])
             self.im_array.append(Image.fromarray(self.observations["agent_1_third_rgb"].astype(np.uint8)))
         # self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
         # if (self.actual_num_steps%10 == 0):
@@ -799,6 +889,8 @@ class sim_env(threading.Thread):
         dist_moved_robot = np.array(positions_now[0]) - np.array(positions_here[0])
         dist_moved_human = np.array(positions_now[1]) - np.array(positions_here[1])
         print("Robot moved ", dist_moved_robot, " and human moved ", dist_moved_human)
+        self.robot_moved.append(dist_moved_robot)
+        self.human_moved.append(dist_moved_human)
         self.initial_state[0][2:4] = dist_moved_robot*self.control_frequency
         self.initial_state[1][2:4] = dist_moved_human*self.control_frequency
         self.initial_state[0][0:2] = positions_now[0]
@@ -1053,6 +1145,9 @@ class sim_env(threading.Thread):
         if self.start_ep and not USE_IRL_AGENT:
             self.cheating_point = p
             return
+        if self.start_ep and USE_IRL_AGENT:
+            self.clicked_point = p
+            return
         self.line.append(p)
         
         prompt = '> '
@@ -1150,7 +1245,6 @@ class sim_env(threading.Thread):
             print("The robot state has drifted from the initial state ", norm_list[0:start_index])
             return
         end_index = len(traj_2d)-1
-        end_index = 20
         # print("Length of norm list is ", len(norm_list))
         # for i in range(len(norm_list)):
         #     print("I is ", i)

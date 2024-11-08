@@ -92,6 +92,31 @@ DEFAULT_POSE_PATH = "data/humanoids/humanoid_data/walking_motion_processed.pkl"
 DEFAULT_CFG = "benchmark/rearrange/play/play.yaml"
 DEFAULT_RENDER_STEPS_LIMIT = 60
 THIRD_RGB_SIZE = 128
+def traj_interp(c):
+    d = c.astype(int)
+    iter = len(d) - 1
+    added = 0
+    i = 0
+    while i < iter:
+        while np.sqrt((d[i+added,0]-d[i+1+added,0])**2 + (d[i+added,1]-d[i+1+added,1])**2) > np.sqrt(1):
+            d = np.insert(d, i+added+1, [0, 0], axis=0)
+            if d[i+added+2, 0] - d[i+added, 0] > 0:
+                d[i+added+1, 0] = d[i+added, 0] + 1
+                d[i+added+1, 1] = d[i+added, 1]
+            elif d[i+added+2, 0] - d[i+added, 0] < 0:
+                d[i+added+1, 0] = d[i+added, 0] - 1
+                d[i+added+1, 1] = d[i+added, 1]
+            else:
+                d[i+added+1, 0] = d[i+added, 0]
+                if d[i+added+2, 1] - d[i+added, 1] > 0:
+                    d[i+added+1, 1] = d[i+added, 1] + 1
+                elif d[i+added+2, 1] - d[i+added, 1] < 0:
+                    d[i+added+1, 1] = d[i+added, 1] - 1
+                else:
+                    d[i+added+1, 1] = d[i+added, 1]
+            added += 1
+        i += 1
+    return np.array(d)
 def to_grid(pathfinder, points, grid_dimensions):
     map_points = maps.to_grid(
                         points[2],
@@ -147,15 +172,26 @@ def world_to_img(proj, cam, agent_state, W, H, debug = False):
     image_coordinate = image_coordinate/image_coordinate[2]
     v = H-(image_coordinate[0]+1)*(H/2)
     u = W-(1-image_coordinate[1])*(W/2)
+    
     return [int(u),int(v)]
+
+def grid_coord_to_raw(coord, img_res, grid_img_res):
+    factor = grid_img_res/img_res
+    # factor = 1/factor
+    return [int((60-coord[0])*factor), int((60-coord[1])*factor)]
+
+def raw_to_grid(coord, img_res, grid_img_res):
+    factor = grid_img_res/img_res
+    # factor = 1/factor
+    return [60-int(coord[0]/factor), 60-int(coord[1]/factor)]
 
 class Hallucinate():
     def __init__(self, config):
         self.env = habitat.Env(config = config)
         remove_ep_list = [0,1,2,8]
         self.observations = self.env.reset()
-        while self.env.current_episode.episode_id in remove_ep_list:
-            self.observations = self.env.reset()
+        # while self.env.current_episode.episode_id in remove_ep_list:
+        #     self.observations = self.env.reset()
         meters_per_pixel =0.025
         map_name = "sample_map"
         hablab_topdown_map = maps.get_topdown_map(
@@ -185,7 +221,12 @@ class Hallucinate():
         world_coord = img_to_world(proj = self.proj, cam = self.cam, W = THIRD_RGB_SIZE, H = THIRD_RGB_SIZE, u = 0, v = 0)
         # head_camera = self.env.sim.get_agent(0).scene_node.node_sensor_suite.get_sensors()['agent_1_head_rgb']
         world_coord_1 = img_to_world(proj = self.proj, cam = self.cam, W = THIRD_RGB_SIZE, H = THIRD_RGB_SIZE, u = THIRD_RGB_SIZE, v = THIRD_RGB_SIZE)
-        self.img_res = abs(world_coord_1[0] - world_coord[0])/THIRD_RGB_SIZE
+        self.img_res_1 = abs(world_coord_1[0] - world_coord[0]+1)/THIRD_RGB_SIZE
+        self.img_res_2 = abs(world_coord_1[2] - world_coord[2]+1)/THIRD_RGB_SIZE
+        self.img_res = (self.img_res_1+self.img_res_2)/2
+        grid_img_res_1 = abs(world_coord_1[0] - world_coord[0]+1)/60
+        grid_img_res_2 = abs(world_coord_1[2] - world_coord[2]+1)/60
+        self.grid_img_res = (grid_img_res_1+grid_img_res_2)/2
         self.initial_state = []
         self.number_of_agents = len(self.env.sim.agents_mgr)
         self.objs = []
@@ -208,12 +249,15 @@ class Hallucinate():
             self.objs[1].base_rot = self.env.current_episode.info['human_rot'][2]
         except:
             self.objs[1].base_rot = 0.0
-            
+        self.failed_list = []
         print("started epsiode")
         
-    def read_data(self, folder):
-        img = self.observations["agent_1_third_rgb"]
-        im = Image.fromarray(np.uint8(img))
+    def read_data(self, folder, noise_counter):
+        img = self.observations["agent_1_third_rgb"][:,:,:3]
+        old_image = Image.open(folder+"/raw_img.png")
+        old_image = old_image.resize((THIRD_RGB_SIZE,THIRD_RGB_SIZE))
+        both_img = np.concatenate((np.asarray(old_image), img), axis = 1)
+        im = Image.fromarray(np.uint8(both_img))
         im.save(folder+"/old_obs.png")
         self.image_fol = folder
         with open(self.image_fol+"/human_past_traj.npy", 'rb') as f:
@@ -226,25 +270,190 @@ class Hallucinate():
         
         robot_past_traj = full_traj
 
-        
-        
+        with open(self.image_fol+"/heading.npy", 'rb') as f:
+            full_traj = np.load(f)
+        heading = full_traj
         robot_pos = np.array([robot_past_traj[-1,0], robot_past_traj[-1,1]])
         human_pos = np.array([human_past_traj[-1,0], human_past_traj[-1,1]])
-        factor = 0.1/self.img_res
-        factor = 1/factor
-        robot_pos_world = img_to_world(proj = self.proj, cam = self.cam, W = img.shape[0], H = img.shape[1], u = (60-robot_pos[1])/factor, v = (60-robot_pos[0])/factor)
+        raw_coord_robot = grid_coord_to_raw(robot_pos, self.img_res, self.grid_img_res)
+        robot_pos_world = img_to_world(proj = self.proj, cam = self.cam, W = img.shape[0], H = img.shape[1], u = raw_coord_robot[1], v = raw_coord_robot[0])
         robot_pos_world[1] = 0.0
         self.objs[0].base_pos = mn.Vector3([robot_pos_world[0], robot_pos_world[1], robot_pos_world[2]])
-        human_pos_world = img_to_world(proj = self.proj, cam = self.cam, W = img.shape[0], H = img.shape[1], u = (60-human_pos[1])/factor, v = (60-human_pos[0])/factor)
+        self.objs[0].base_rot = heading[0]
+        raw_coord_human = grid_coord_to_raw(human_pos, self.img_res, self.grid_img_res)
+        human_pos_world = img_to_world(proj = self.proj, cam = self.cam, W = img.shape[0], H = img.shape[1], u = raw_coord_human[1], v = raw_coord_human[0])
         human_pos_world[1] = 0.0
         self.objs[1].base_pos = mn.Vector3([human_pos_world[0], human_pos_world[1], human_pos_world[2]])
-        base_vel = [0.0, 0.0]
-            # print("Caught here ", not self.start_ep,  self.waiting_for_traj , self.current_point is None)
-        self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
-        img = self.observations["agent_1_third_rgb"]
-        im = Image.fromarray(np.uint8(img))
-        im.save(folder+"/new_obs.png")
+        self.objs[1].base_rot = heading[1]
+        # base_vel = [0.0, 0.0]
+        # self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
+        self.observations.update(self.env._sim.get_sensor_observations())
+        img = self.observations["agent_1_third_rgb"][:,:,:3]
+        both_img = np.concatenate((np.asarray(old_image), img), axis = 1)
+        im = Image.fromarray(np.uint8(both_img))
+        im.save(folder+"/new_obs"+str(noise_counter)+".png")
+        return im
         
+
+    def get_trajectory(self, folder, data_dir, noise_counter):
+        img = self.observations["agent_1_third_rgb"][:,:,:3]
+        self.image_fol = folder
+        with open(self.image_fol+"/human_past_traj.npy", 'rb') as f:
+            full_traj = np.load(f)
+        human_past_traj = full_traj
+        
+
+        with open(self.image_fol+"/robot_past_traj.npy", 'rb') as f:
+            full_traj = np.load(f)
+        
+        robot_past_traj = full_traj
+
+        with open(self.image_fol+"/heading.npy", 'rb') as f:
+            full_traj = np.load(f)
+        heading = full_traj
+        robot_pos = np.array([robot_past_traj[-1,0], robot_past_traj[-1,1]])
+        human_pos = np.array([human_past_traj[-1,0], human_past_traj[-1,1]])
+        raw_coord_robot = grid_coord_to_raw(robot_pos, self.img_res, self.grid_img_res)
+        robot_pos_world = img_to_world(proj = self.proj, cam = self.cam, W = img.shape[0], H = img.shape[1], u = raw_coord_robot[1], v = raw_coord_robot[0])
+        robot_pos_world[1] = 0.0
+        self.objs[0].base_pos = mn.Vector3([robot_pos_world[0], robot_pos_world[1], robot_pos_world[2]])
+        self.objs[0].base_rot = heading[0]
+        raw_coord_human = grid_coord_to_raw(human_pos, self.img_res, self.grid_img_res)
+        human_pos_world = img_to_world(proj = self.proj, cam = self.cam, W = img.shape[0], H = img.shape[1], u = raw_coord_human[1], v = raw_coord_human[0])
+        human_pos_world[1] = 0.0
+        self.objs[1].base_pos = mn.Vector3([human_pos_world[0], human_pos_world[1], human_pos_world[2]])
+        self.objs[1].base_rot = heading[1]
+        file = open(self.image_fol+ '/new_crossing_count.txt', 'r')
+        counter_crossing_data = file.read().split('\n')
+        number_of_stops = len(counter_crossing_data)
+        current_fol_number = int(self.image_fol.split('/')[-1])
+        # print("Number of stops ", number_of_stops, counter_crossing_data)
+        for counter_crossing in counter_crossing_data:
+            counter_crossing = int(counter_crossing)
+            if counter_crossing >= current_fol_number:
+                break
+        counter_fol = data_dir+"/"+self.image_fol.split('/')[-2] + '/' + str(counter_crossing)
+        print("counter_fol", counter_fol)
+        robot_past_at_crossing = np.load(counter_fol+"/robot_past_traj.npy")
+        human_past_at_crossing = np.load(counter_fol+"/human_past_traj.npy")
+        heading_at_crossing = np.load(counter_fol+"/heading.npy")
+        robot_pos_at_crossing = np.array([robot_past_at_crossing[-1,0], robot_past_at_crossing[-1,1]])
+        human_pos_at_crossing = np.array([human_past_at_crossing[-1,0], human_past_at_crossing[-1,1]])
+        raw_coord_robot_at_crossing = grid_coord_to_raw(robot_pos_at_crossing, self.img_res, self.grid_img_res)
+        robot_pos_world_at_crossing = img_to_world(proj = self.proj, cam = self.cam, W = img.shape[0], H = img.shape[1], u = raw_coord_robot_at_crossing[1], v = raw_coord_robot_at_crossing[0])    
+        robot_pos_world_at_crossing[1] = 0.0
+        sampled_new_pos = self.env._sim.pathfinder.get_random_navigable_point_near(robot_pos_world, radius = 0.5)
+        radius = 0.5
+        while np.isnan(sampled_new_pos[0]):
+            sampled_new_pos = self.env._sim.pathfinder.get_random_navigable_point_near(robot_pos_world, radius = radius)
+            radius +=0.1
+        self.objs[0].base_pos = mn.Vector3([sampled_new_pos[0], sampled_new_pos[1], sampled_new_pos[2]])
+        self.observations.update(self.env._sim.get_sensor_observations())
+        img = self.observations["agent_1_third_rgb"][:,:,:3]
+        img[raw_coord_robot_at_crossing[1]-2:raw_coord_robot_at_crossing[1]+2, raw_coord_robot_at_crossing[0]-2:raw_coord_robot_at_crossing[0]+2] = [255,0,0]
+        Image.fromarray(np.uint8(img)).save(folder+"/new_goal"+str(noise_counter)+".png")
+        new_robot_traj = []
+        new_robot_traj_raw = []
+        im_array = []
+        path = habitat_sim.ShortestPath()
+        path.requested_start = self.objs[0].base_pos
+        path.requested_end = robot_pos_world_at_crossing
+        found_path = self.env._sim.pathfinder.find_path(path)
+        points_outside = True
+        max_tries = 50
+        trial_counter = 0
+        while not found_path or points_outside:
+            sampled_new_pos = self.env._sim.pathfinder.get_random_navigable_point_near(robot_pos_world, radius = radius)
+            path.requested_start = sampled_new_pos
+            found_path = self.env._sim.pathfinder.find_path(path)
+            for point in path.points:
+                path_point_raw_image = world_to_img(proj = self.proj, cam = self.cam, agent_state = [point[0], point[1], point[2]], W = img.shape[0], H = img.shape[1])
+                new_robot_traj_raw.append(path_point_raw_image)
+                new_robot_traj.append(raw_to_grid(path_point_raw_image, self.img_res, self.grid_img_res))
+                try:
+                    img[path_point_raw_image[0], path_point_raw_image[1]] = [0,255,0]
+                except:
+                    points_outside = True
+                    break
+                points_outside = False
+            trial_counter += 1
+            if trial_counter > max_tries:
+                self.failed_list.append(folder)
+                return Image.fromarray(np.uint8(img)), Image.fromarray(np.uint8(img))
+        # new_robot_traj_raw = np.array(new_robot_traj_raw)
+        # new_robot_traj_raw = traj_interp(new_robot_traj_raw)
+        # new_robot_traj = np.array(new_robot_traj)
+        # new_robot_traj = traj_interp(new_robot_traj)
+        # for point in new_robot_traj_raw:
+        #     img[point[0], point[1]] = [0,0,255]
+        # print(new_robot_traj)
+        # Image.fromarray(np.uint8(img)).save(folder+"/path.png")
+        # return Image.fromarray(np.uint8(img))
+        self.objs[0].base_pos = mn.Vector3([sampled_new_pos[0], sampled_new_pos[1], sampled_new_pos[2]])
+        robot_pos_world_at_crossing = path.points[-1]
+        steps = 0
+        k = 'agent_0_oracle_nav_randcoord_action'
+        self.observations.update(self.env._sim.get_sensor_observations())
+        img = self.observations["agent_1_third_rgb"][:,:,:3]
+        robot_traj_grid = []
+        while not self.env.task.actions[k].skill_done and not self.env.episode_over:
+            robot_pos_now_world = self.objs[0].base_pos
+            self.env.task.actions[k].coord_nav = robot_pos_world_at_crossing
+            self.observations.update(self.env.step({"action": k, "action_args": {"agent_0_oracle_nav_randcoord": robot_pos_world_at_crossing}}))
+            robot_pos_now = world_to_img(proj = self.proj, cam = self.cam, agent_state = [robot_pos_now_world[0], robot_pos_now_world[1], robot_pos_now_world[2]], W = img.shape[0], H = img.shape[1])
+            point = robot_pos_now
+            if point[0] <0 and point[0]>-5:
+                point[0] = 0
+            if point[1] <0 and point[1]>-5:
+                point[1] = 0
+            if point[0] >= THIRD_RGB_SIZE and point[0] <THIRD_RGB_SIZE+5:
+                point[0] = THIRD_RGB_SIZE-1
+            if point[1] >= THIRD_RGB_SIZE and point[1] <THIRD_RGB_SIZE+5:
+                point[1] = THIRD_RGB_SIZE-1
+            robot_pos_now = point
+            img[robot_pos_now[0], robot_pos_now[1]] = [255,0,0]
+
+            im_array.append(self.observations["agent_1_third_rgb"][:,:,:3])
+            robot_pos_grid = raw_to_grid(robot_pos_now, self.img_res, self.grid_img_res)
+            robot_traj_grid.append(robot_pos_grid)
+            steps += 1
+        Image.fromarray(np.uint8(img)).save(folder+"/raw_img_noise_overlay"+str(noise_counter)+".png")
+        print("steps", steps)
+        imageio.mimsave(folder+"/noise"+str(noise_counter)+".gif", im_array)
+        self.env.task.actions[k].skill_done = False
+        if self.env.episode_over:
+            print("Episode over")
+            self.observations = self.env.reset()
+        robot_traj_grid = np.array(robot_traj_grid)
+        robot_traj_grid = traj_interp(robot_traj_grid)
+        FIXED_LEN = 20
+        if len(robot_traj_grid) <FIXED_LEN:
+            for i in range(FIXED_LEN - len(robot_traj_grid)):
+                robot_traj_grid = np.insert(robot_traj_grid, len(robot_traj_grid), robot_traj_grid[-1], axis=0)
+        robot_traj_grid = robot_traj_grid[:FIXED_LEN]
+        grid_img = np.array(Image.open(self.image_fol+"/grid_map.png"))[:,:,0:3]
+        for point in robot_traj_grid:
+            if point[0] <0:
+                point[0] = 0
+            if point[1] <0:
+                point[1] = 0
+            if point[0] >= 60:
+                point[0] = 59
+            if point[1] >= 60:
+                point[1] = 59
+            grid_img[point[0], point[1]] = [0,0,255]
+        grid_img[point[0], point[1]] = [255,0,0]
+        Image.fromarray(np.uint8(grid_img)).save(folder+"/grid_map_noise_overlay"+str(noise_counter)+".png")
+        with open(folder+"/robot_noise_traj"+str(noise_counter)+".npy", 'wb') as f:
+            np.save(f, robot_traj_grid)
+        
+        metrics = self.env.get_metrics()
+        if metrics['did_collide']:
+            print("Collided")
+            imageio.mimsave(folder+"/noise_collision"+str(noise_collision)+".gif", im_array)
+            self.failed_list.append(folder)
+        # self.observations = self.env.reset()
+        return img, grid_img
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-render", action="store_true", default=True)
@@ -378,7 +587,41 @@ if __name__ == "__main__":
             task_config.actions.arm_action.arm_controller = "ArmEEAction"
         if task_config.type == "RearrangePddlTask-v0":
             task_config.actions["pddl_apply_action"] = PddlApplyActionConfig()
-
+    
     my_env = Hallucinate(config)
-    folder = "/home/catkin_ws/src/habitat_ros_interface/data/dataset_full_ep/irl_sept_24_3/demo_1/8"
-    my_env.read_data(folder)
+    data_dir = "/home/catkin_ws/src/habitat_ros_interface/data/training/irl_sept_24_3_new_cross/train"
+    out_dir = "/home/catkin_ws/src/habitat_ros_interface/data/training/irl_sept_24_3_noise_1/train"
+    NUMBER_OF_EXTRA_DEMOS = 5
+    for counter in range(NUMBER_OF_EXTRA_DEMOS):
+        demos = os.listdir(data_dir)
+        demos = [ x for x in demos if x[5:].isdigit()]
+        demos.sort(key=lambda x:int(x[5:]))
+        for demo in demos:
+            items = os.listdir(data_dir+"/"+demo)
+            items = [ x for x in items if x.isdigit() ]
+            items.sort(key=lambda x:int(x))
+            im_array = []
+            steps = 0
+            if not (os.path.exists(data_dir+"/"+demo+"/0"+"/new_crossing_count.txt")):
+                continue
+            for item in items:
+                folder = data_dir+"/"+demo+"/"+item
+                
+                print("reading folder", folder)
+                im = my_env.read_data(folder, counter)
+                
+                im0, im = my_env.get_trajectory(folder, data_dir, counter)
+                im_array.append(im)
+                # steps += 1
+                # print("Steps are !!!!", steps )
+                # if steps >20:
+                #     my_env.observations = my_env.env.reset()
+            print("Failed list", my_env.failed_list)
+
+            # while len(my_env.failed_list) > 0:
+            #     for folder in my_env.failed_list:
+            #         my_env.failed_list.remove(folder)
+            #         im0, im = my_env.get_trajectory(folder, data_dir)
+            #         im_array.append(im)
+                    
+            imageio.mimsave(data_dir+"/"+demo+"/new_paths"+str(counter)+".gif", im_array)

@@ -93,6 +93,7 @@ class OracleNavCoordAction(OracleNavAction):  # type: ignore
             # final_nav_targ = nav_to_target_coord
             # print("final nav target here is", final_nav_targ)
         #KL: generate humanoidpath from here
+
         base_T = self.cur_articulated_agent.base_transformation
         curr_path_points = self._path_to_point(final_nav_targ)
         robot_pos = np.array(self.cur_articulated_agent.base_pos)
@@ -141,7 +142,7 @@ class OracleNavCoordAction(OracleNavAction):  # type: ignore
                         self.nav_mode = "avoid"
                     else:
                         self.nav_mode = "dont_avoid"
-                    print(self.nav_mode)
+                    # print(self.nav_mode)
                     if self.nav_mode == "avoid":
                         backward = np.array([-1.0, 0, 0])
                         robot_backward = np.array(
@@ -150,14 +151,14 @@ class OracleNavCoordAction(OracleNavAction):  # type: ignore
                         robot_backward = robot_backward[[0, 2]]
                         angle_to_target = get_angle(robot_backward, rel_targ)
                         # self.simple_backward = True
-                        print("Angle to target is ", angle_to_target)
+                        # print("Angle to target is ", angle_to_target)
                         if (
                             self.simple_backward
                             or angle_to_target < self._config.turn_thresh
                         ):
                             # Move backwards the target
                             vel = [-self._config.forward_velocity, 0]
-                            print ("Backward thresh is ", self._config.turn_thresh)
+                            # print ("Backward thresh is ", self._config.turn_thresh)
                             # Robot's rear looks at the target waypoint.
                         else:
                             print("Got here? ")

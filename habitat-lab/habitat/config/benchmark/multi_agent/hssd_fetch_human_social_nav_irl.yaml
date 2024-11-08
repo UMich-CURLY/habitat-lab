@@ -106,7 +106,7 @@ habitat:
         allow_dyn_slide: True
         # There is a collision if the difference between the clamped NavMesh position and target position
         # is more than than collision_threshold for any point
-        collision_threshold: 1e-2
+        collision_threshold: 1.0
         # The x and y locations of the clamped NavMesh position
         navmesh_offset: [[0.0, 0.0], [0.225, 0.0]]
         # If we allow the robot to move laterally
@@ -163,7 +163,7 @@ habitat:
       # - agent_1_articulated_agent_arm_panoptic
 
   environment:
-    max_episode_steps: 600
+    max_episode_steps: 1200
 
   simulator:
     type: RearrangeSim-v0
@@ -221,7 +221,7 @@ habitat:
   dataset:
     # data_path: data/datasets/hssd/rearrange/{split}/social_rearrange.json.gz
     # data_path: /habitat-lab/data/social_nav_episode_last.json.gz
-    data_path: /habitat-lab/data/scene_wise/test_dataset15_final_final.json.gz
+    data_path: /habitat-lab/data/scene_wise/test_dataset15_single_7.json.gz
     # data_path: /habitat-lab/data/test_dataset_last.json.gz
     # data_path: data/social_nav_episode_mp3d.json.gz
     # data_path: /habitat-lab/data/versioned_data/hab3_episodes/{split}/social_rearrange.json.gz
