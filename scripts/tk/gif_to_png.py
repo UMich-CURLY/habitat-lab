@@ -5,7 +5,7 @@ def extract_frames_from_gif(gif_path):
     with Image.open(gif_path) as img:
         frames = []
         num_frames = img.n_frames
-        img_path = "robo_frames/exp_7.39/episode_24/"
+        img_path = "robo_frames/exp_7.62/demo_3/"
         for i in range(num_frames):
 
             # img_frame = img.copy()
@@ -39,7 +39,7 @@ def save_stacked_image(stacked_image, output_path):
     stacked_image.save(output_path)
 
 def main():
-    gif_path = 'data/vids/Train_data_15/exp_7.39/HUMAN_ORCA/episode_24.gif'
+    gif_path = 'data/vids/robot_traj_demo_3_7.62_mid.gif'
     output_path = 'orca_backoff_24.png'
 
     frames = extract_frames_from_gif(gif_path)

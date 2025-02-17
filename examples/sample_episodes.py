@@ -37,16 +37,19 @@ import json
 
 if __name__ == "__main__":
     dataset = RearrangeDatasetV0()
-    json_file_path = "/habitat-lab/data/scene_wise/test_dataset15_final.json"
-    output_path = "/habitat-lab/data/scene_wise/test_dataset15_single_7.json.gz"
+    json_file_path = "/habitat-lab/data/scene_wise/test_dataset15_finalest.json"
+    output_path = "/habitat-lab/data/scene_wise/test_dataset15_finalest_only_9.json.gz"
     with open(json_file_path, 'r') as j:
         contents = json.loads(j.read())
-    remove_list = [18,17,15,12,14]
+    # remove_list = [18,17,15,12,14]
     for i in range(len(contents['episodes'])):
-        if contents['episodes'][i]['episode_id'] in remove_list:
-            continue
-        if contents['episodes'][i]['episode_id'] ==7:
+        # if contents['episodes'][i]['episode_id'] in remove_list:
+        #     continue
+        print(contents['episodes'][i]['episode_id'])
+        num = int(contents['episodes'][i]['episode_id'])
+        if num == 9:
             dataset.episodes.append(contents['episodes'][i])
-    
+            print("adding ", num)
+        
     with gzip.open(output_path, "wt") as f:
         f.write(dataset.to_json())

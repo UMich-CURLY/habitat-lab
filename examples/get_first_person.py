@@ -11,7 +11,7 @@ import magnum as mn
 import numpy as np
 from habitat.core.spaces import ActionSpace
 from habitat_sim.utils.common import d3_40_colors_rgb
-from PIL import Image, ImageDraw
+from PIL import Image
 import cv2
 import habitat
 import habitat.tasks.rearrange.rearrange_task
@@ -256,8 +256,8 @@ class Hallucinate():
         img = self.observations["agent_1_third_rgb"][:,:,:3]
         old_image = Image.open(folder+"/raw_img.png")
         old_image = old_image.resize((THIRD_RGB_SIZE,THIRD_RGB_SIZE))
-        both_img = np.concatenate((np.asarray(old_image), img), axis = 1)
-        im = Image.fromarray(np.uint8(both_img))
+        # both_img = np.concatenate((np.asarray(old_image), img), axis = 1)
+        im = Image.fromarray(np.uint8(old_image))
         im.save(folder+"/old_obs.png")
         self.image_fol = folder
         with open(self.image_fol+"/human_past_traj.npy", 'rb') as f:
@@ -285,13 +285,27 @@ class Hallucinate():
         human_pos_world[1] = 0.0
         self.objs[1].base_pos = mn.Vector3([human_pos_world[0], human_pos_world[1], human_pos_world[2]])
         self.objs[1].base_rot = heading[1]+np.pi
-        # base_vel = [0.0, 0.0]
+        base_vel = [0.0, 0.0]
+        # k = 'agent_0_oracle_nav_randcoord_action'
+        # for i in range(5):
+        #     k = 'agent_0_oracle_nav_randcoord_action'
+        #     try:
+        #         self.observations.update(self.env.step({"action": k, "action_args": {"agent_0_oracle_nav_randcoord": self.objs[0].base_pos}}))
+        #     except:
+        #         self.observations = self.env.reset()
+        #         break
+        k = 'agent_1_oracle_nav_randcoord_action'
+        self.observations.update(self.env.step({"action":k, "action_args":{}}))
         # self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
-        self.observations.update(self.env._sim.get_sensor_observations())
-        img = self.observations["agent_1_third_rgb"][:,:,:3]
-        both_img = np.concatenate((np.asarray(old_image), img), axis = 1)
-        im = Image.fromarray(np.uint8(both_img))
-        im.save(folder+"/new_obs"+str(noise_counter)+".png")
+        # for i in range(5):
+        #     self.observations.update(self.env._sim.get_sensor_observations())
+        img = self.observations["agent_1_head_rgb"][:,:,:3]
+        # both_img = np.concatenate((np.asarray(old_image), img), axis = 1)
+        im = Image.fromarray(np.uint8(img))
+        im.save(folder+"/new_obs_raw.png")
+        img_firstperson = self.observations["agent_0_third_rgb"][:,:,:3]
+        im = Image.fromarray(np.uint8(img_firstperson))
+        im.save(folder+"/first_person.png")
         return im
     
     def get_min_dist(self, traj1, traj2):
@@ -303,31 +317,7 @@ class Hallucinate():
             if dist < min_dist:
                 min_dist = dist
         return min_dist
-    def annotate_img(self, img, traj):
-        img = Image.fromarray(np.uint8(img))
-        draw = ImageDraw.Draw(img)
-        # x_length = 3  # Length of each diagonal line
-        # [y1,x1] = traj[-1]
-        # # Draw the "X" centered at (x1, y1)
-        # draw.line(
-        #     [(x1 - x_length, y1 - x_length), (x1 + x_length, y1 + x_length)],
-        #     fill=(0, 0, 255),
-        #     width=2,
-        # )  # Top-left to bottom-right
-        # draw.line(
-        #     [(x1 - x_length, y1 + x_length), (x1 + x_length, y1 - x_length)],
-        #     fill=(0, 0, 255),
-        #     width=2,
-        # ) # Bottom-left to top-right
-        marker_color = (255, 0, 0)  # Red color
-        marker_size = 0  # Half the length of the "X" arms
-        line_width = 3  # Line thickness
-        for i in range(len(traj)-1):
-            [y1,x1] = traj[i]
-            [y2,x2] = traj[i+1]
-            draw.line((x1 - marker_size, y1 - marker_size, x2 + marker_size, y2 + marker_size), fill=marker_color, width=line_width)
-        
-        return img
+
     def get_trajectory(self, folder, data_dir, noise_counter):
         img = self.observations["agent_1_third_rgb"][:,:,:3]
         self.image_fol = folder
@@ -441,7 +431,6 @@ class Hallucinate():
         self.observations.update(self.env._sim.get_sensor_observations())
         img = self.observations["agent_1_third_rgb"][:,:,:3]
         robot_traj_grid = []
-        robot_traj_raw = []
         while not self.env.task.actions[k].skill_done and not self.env.episode_over:
             robot_pos_now_world = self.objs[0].base_pos
             self.env.task.actions[k].coord_nav = robot_pos_world_at_crossing
@@ -457,13 +446,12 @@ class Hallucinate():
             if point[1] >= THIRD_RGB_SIZE and point[1] <THIRD_RGB_SIZE+5:
                 point[1] = THIRD_RGB_SIZE-1
             robot_pos_now = point
-            # img[robot_pos_now[0], robot_pos_now[1]] = [255,0,0]
-            robot_traj_raw.append(robot_pos_now)
+            img[robot_pos_now[0], robot_pos_now[1]] = [255,0,0]
+
             im_array.append(self.observations["agent_1_third_rgb"][:,:,:3])
             robot_pos_grid = raw_to_grid(robot_pos_now, self.img_res, self.grid_img_res)
             robot_traj_grid.append(robot_pos_grid)
             steps += 1
-        img = self.annotate_img(img, robot_traj_raw)
         Image.fromarray(np.uint8(img)).save(folder+"/raw_img_noise_overlay"+str(noise_counter)+".png")
         print("steps", steps)
         imageio.mimsave(folder+"/noise"+str(noise_counter)+".gif", im_array)
@@ -638,7 +626,10 @@ if __name__ == "__main__":
     my_env = Hallucinate(config)
     data_dir = "/home/catkin_ws/src/habitat_ros_interface/data/training/irl_sept_24_3_new_cross_noised/train"
     out_dir = "/home/catkin_ws/src/habitat_ros_interface/data/training/irl_sept_24_3_noise_1/train"
-    NUMBER_OF_EXTRA_DEMOS = 6
+    NUMBER_OF_EXTRA_DEMOS = 1
+    data_dir = "test_irl"
+    out_dir = "test_irl"
+    steps = 0
     for counter in range(NUMBER_OF_EXTRA_DEMOS):
         demos = os.listdir(data_dir)
         demos = [ x for x in demos if x[5:].isdigit()]
@@ -648,27 +639,31 @@ if __name__ == "__main__":
             items = [ x for x in items if x.isdigit() ]
             items.sort(key=lambda x:int(x))
             im_array = []
-            steps = 0
-            if not (os.path.exists(data_dir+"/"+demo+"/0"+"/new_crossing_count.txt")):
-                continue
+            
+            # if not (os.path.exists(data_dir+"/"+demo+"/0"+"/new_crossing_count.txt")):
+            #     continue
             for item in items:
                 folder = data_dir+"/"+demo+"/"+item
                 
                 print("reading folder", folder)
+                if my_env.env.episode_over:
+                    my_env.observations = my_env.env.reset()
+                    my_env.observations = my_env.env.reset()
                 im = my_env.read_data(folder, counter)
                 
-                im0, im = my_env.get_trajectory(folder, data_dir, counter)
+            #     im0, im = my_env.get_trajectory(folder, data_dir, counter)
                 im_array.append(im)
                 # steps += 1
                 # print("Steps are !!!!", steps )
-                # if steps >20:
+                # if steps % 100 == 0:
                 #     my_env.observations = my_env.env.reset()
-            print("Failed list", my_env.failed_list)
+                #     my_env.observations = my_env.env.reset()
+            # print("Failed list", my_env.failed_list)
 
-            # while len(my_env.failed_list) > 0:
-            #     for folder in my_env.failed_list:
-            #         my_env.failed_list.remove(folder)
-            #         im0, im = my_env.get_trajectory(folder, data_dir)
-            #         im_array.append(im)
+            # # while len(my_env.failed_list) > 0:
+            # #     for folder in my_env.failed_list:
+            # #         my_env.failed_list.remove(folder)
+            # #         im0, im = my_env.get_trajectory(folder, data_dir)
+            # #         im_array.append(im)
                     
-            imageio.mimsave(data_dir+"/"+demo+"/new_paths"+str(counter)+".gif", im_array)
+            imageio.mimsave(data_dir+"/"+demo+"/first_person.gif", im_array, loop = 0)

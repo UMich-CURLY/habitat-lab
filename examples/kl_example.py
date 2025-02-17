@@ -37,6 +37,7 @@ from habitat.utils.visualizations.utils import (
 )
 from habitat_sim.utils import viz_utils as vut
 from habitat.utils.visualizations.utils import images_to_video
+sys.path.append("/opt/conda/envs/robostackenv/lib/python3.9/site-packages")
 sys.path.append("/usr/lib/python2.7/dist-packages")
 sys.path.append("/opt/ros/kinetic/lib/python2.7/dist-packages/")
 import rospy
@@ -46,6 +47,11 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Twist
 from nav_msgs.msg import Path
 from visualization_msgs.msg import MarkerArray, Marker
 import threading
+import tf
+import tf2_ros
+import geometry_msgs.msg
+from geometry_msgs.msg import PoseArray, Pose
+from habitat.utils.visualizations import maps
 
 from IPython import embed
 # Please reach out to the paper authors to obtain this file
@@ -57,7 +63,29 @@ SAVE_ACTIONS_DIR = "./data/interactive_play_replays"
 
 
 lock = threading.Lock()
-rospy.init_node("robot_1", anonymous=False)
+def to_grid(pathfinder, points, grid_dimensions):
+    map_points = maps.to_grid(
+                        points[2],
+                        points[0],
+                        grid_dimensions,
+                        pathfinder=pathfinder,
+                    )
+    return ([map_points[1]*0.025, map_points[0]*0.025])
+
+def from_grid(pathfinder, points, grid_dimensions):
+    floor_y = 0.0
+    map_points = maps.from_grid(
+                        points[1],
+                        points[0],
+                        grid_dimensions,
+                        pathfinder=pathfinder,
+                    )
+    map_points_3d = np.array([map_points[1], floor_y, map_points[0]])
+    # # agent_state.position = np.array(map_points_3d)  # in world space
+    # # agent.set_state(agent_state)
+    map_points_3d = pathfinder.snap_point(map_points_3d)
+    return map_points_3d
+
 
 class sim_env(threading.Thread):
     _x_axis = 0
@@ -65,22 +93,155 @@ class sim_env(threading.Thread):
     _z_axis = 2
     _dt = 0.00478
     _sensor_rate = 50  # hz
-    _r = rospy.Rate(_sensor_rate)
     _current_episode = 0
     _total_number_of_episodes = 0
     control_frequency = 20
     time_step = 1.0 / (control_frequency)
-    _r_control = rospy.Rate(control_frequency)
     def __init__(self, config):
         threading.Thread.__init__(self)
         self.env = habitat.Env(config = config)
         self.observations = self.env.reset()
+        rospy.init_node("sim", anonymous=False)
+        time_step = 1.0 / (self.control_frequency)
+        self.control_frequency = 5.0
+        self._r = rospy.Rate(self._sensor_rate)
+        self._r_control = rospy.Rate(self.control_frequency)
+        
         self._pub_rgb = rospy.Publisher("~rgb", numpy_msg(Floats), queue_size=1)
         self._pub_rgb_2 = rospy.Publisher("~rgb2", numpy_msg(Floats), queue_size=1)
         self._pub_depth = rospy.Publisher("~depth", numpy_msg(Floats), queue_size=1)
         self._pub_pose = rospy.Publisher("~pose", PoseStamped, queue_size=1)
+        self._pub_all_agents = rospy.Publisher("~all_agents", PoseArray, queue_size=1)
+        self._robot_pose = rospy.Publisher("~robot_pose", PoseStamped, queue_size=1)
+        self.br = tf.TransformBroadcaster()
+        self.br_tf_2 = tf2_ros.TransformBroadcaster()
+        meters_per_pixel =0.025
+        map_name = "sample_map"
+        hablab_topdown_map = maps.get_topdown_map(
+                self.env._sim.pathfinder, 0.0, meters_per_pixel=meters_per_pixel
+            )
+        recolor_map = np.array(
+            [[255, 255, 255], [128, 128, 128], [0, 0, 0]], dtype=np.uint8
+        )
+        hablab_topdown_map = recolor_map[hablab_topdown_map]
+        floor_y = 0.0
+        self.top_down_map = maps.get_topdown_map(
+            self.env._sim.pathfinder, height=floor_y, meters_per_pixel=0.025
+        )
+        self.grid_dimensions = (self.top_down_map.shape[0], self.top_down_map.shape[1])
+        
         self.linear_velocity = [0,0,0]
         self.angular_velocity = [0,0,0]
+        self.initial_state = []
+        self.number_of_agents = len(self.env.sim.agents_mgr)
+        self.objs = []
+        agents_goal_pos_3d = [self.env.current_episode.info['robot_goal'], self.env.current_episode.info['human_goal']]
+        for i in range(self.number_of_agents):
+            agent_pos = self.env.sim.agents_mgr[i].articulated_agent.base_pos
+            start_pos = [agent_pos[0], agent_pos[1], agent_pos[2]]
+            print(start_pos)
+            initial_pos = list(to_grid(self.env._sim.pathfinder, start_pos, self.grid_dimensions))
+            # agents_goal_pos_3d = [self.env.current_episode.info['human_start']]
+            agents_initial_velocity = [0.5,0.0]
+            goal_pos = list(to_grid(self.env._sim.pathfinder, agents_goal_pos_3d[i], self.grid_dimensions))
+            self.initial_state.append(initial_pos+agents_initial_velocity+goal_pos)
+            self.objs.append(self.env.sim.agents_mgr[i].articulated_agent)
+    
+    def get_object_heading(self,obj_transform):
+        a = obj_transform
+        b = a.transform_point([0.5,0.0,0.0])
+        d = a.transform_point([0.0,0.0,0.0])
+        c = np.array(to_grid(self.env._sim.pathfinder, [b[0],b[1],b[2]], self.grid_dimensions))
+        e = np.array(to_grid(self.env._sim.pathfinder, [d[0],d[1],d[2]], self.grid_dimensions))
+        vel = (c-e)*(0.5/np.linalg.norm(c-e)*np.ones([1,2]))[0]
+        return mn.Rad(np.arctan2(vel[1], vel[0]))
+
+    def map_to_base_link(self, msg):
+        theta = msg['theta']
+        use_tf_2 = True
+        
+        if (not use_tf_2):
+            self.br.sendTransform((-self.initial_state[0][0]+1, -self.initial_state[0][1]+1,0.0),
+                            tf.transformations.quaternion_from_euler(0, 0, 0.0),
+                            rospy.Time(0),
+                            "my_map_frame",
+                            "interim_link"
+            )
+            self.br.sendTransform((0.0,0.0,0.0),
+                            tf.transformations.quaternion_from_euler(0, 0, -theta),
+                            rospy.Time(0),
+                            "interim_link",
+                            "base_link"
+            )
+        else:
+            t = geometry_msgs.msg.TransformStamped()
+            t.header.stamp = rospy.Time.now()
+            t.header.frame_id = "interim_link"
+            t.child_frame_id = "my_map_frame"
+            t.transform.translation.x = -self.initial_state[0][0]+1
+            t.transform.translation.y = -self.initial_state[0][1]+1
+            t.transform.translation.z = 0.0
+            q = tf.transformations.quaternion_from_euler(0, 0, 0.0)
+            t.transform.rotation.x = q[0]
+            t.transform.rotation.y = q[1]
+            t.transform.rotation.z = q[2]
+            t.transform.rotation.w = q[3]
+            self.br_tf_2.sendTransform(t)
+
+            t = geometry_msgs.msg.TransformStamped()
+            t.header.stamp = rospy.Time.now()
+            t.header.frame_id = "base_link"
+            t.child_frame_id = "interim_link"
+            t.transform.translation.x = 0.0
+            t.transform.translation.y = 0.0
+            t.transform.translation.z = 0.0
+            
+            q = tf.transformations.quaternion_from_euler(0, 0, -theta)
+            t.transform.rotation.x = q[0]
+            t.transform.rotation.y = q[1]
+            t.transform.rotation.z = q[2]
+            t.transform.rotation.w = q[3]
+            self.br_tf_2.sendTransform(t)
+
+
+        poseMsg = PoseStamped()
+        poseMsg.header.stamp = rospy.Time.now()
+        poseMsg.header.frame_id = "my_map_frame"
+        quat = tf.transformations.quaternion_from_euler(0, 0, theta)
+        poseMsg.pose.orientation.x = quat[0]
+        poseMsg.pose.orientation.y = quat[1]
+        poseMsg.pose.orientation.z = quat[2]
+        poseMsg.pose.orientation.w = quat[3]
+        poseMsg.pose.position.x = self.initial_state[0][0]-1
+        poseMsg.pose.position.y = self.initial_state[0][1]-1
+        poseMsg.pose.position.z = 0.0
+        self._robot_pose.publish(poseMsg)
+
+        ##### Publish other agents 
+        poseArrayMsg = PoseArray()
+        poseArrayMsg.header.frame_id = "my_map_frame"
+        poseArrayMsg.header.stamp = rospy.Time.now()
+        # follower_pos = my_env.follower.rigid_state.translation
+        # theta = my_env.get_object_heading(my_env.follower.transformation)
+        # quat = tf.transformations.quaternion_from_euler(0, 0, theta)
+        # follower_pose_2d = to_grid(my_env.env._sim.pathfinder, follower_pos, my_env.grid_dimensions)
+        # follower_pose_2d = follower_pose_2d*(0.025*np.ones([1,2]))[0]
+        
+        for i in range(len(self.initial_state)-1):
+            poseMsg = Pose()
+            obj_theta = self.get_object_heading(self.objs[i+1].base_transformation) #- mn.Rad(np.pi/2-0.97 +np.pi)
+            quat = tf.transformations.quaternion_from_euler(0, 0, obj_theta)
+            poseMsg.orientation.x = quat[0]
+            poseMsg.orientation.y = quat[1]
+            poseMsg.orientation.z = quat[2]
+            poseMsg.orientation.w = quat[3]
+            poseMsg.position.x = self.initial_state[i+1][0]-1
+            poseMsg.position.y = self.initial_state[i+1][1]-1
+            poseMsg.position.z = 0.0
+            poseArrayMsg.poses.append(poseMsg)
+        self._pub_all_agents.publish(poseArrayMsg)
+
+
 
     def run(self):
         """Publish sensor readings through ROS on a different thread.
@@ -91,7 +252,7 @@ class sim_env(threading.Thread):
             lock.acquire()
             rgb_with_res = np.concatenate(
                 (
-                    np.float32(self.observations["agent_0_third_rgb"].ravel()),
+                    np.float32(self.observations["agent_0_third_rgb"][:,:,:3].ravel()),
                     np.array(
                         [512,512]
                     ),
@@ -99,9 +260,9 @@ class sim_env(threading.Thread):
             )
             rgb2_with_res = np.concatenate(
                 (
-                    np.float32(self.observations["agent_1_head_rgb"].ravel()),
+                    np.float32(self.observations["agent_1_third_rgb"][:,:,:3].ravel()),
                     np.array(
-                        [224,224]
+                        [128,128]
                     ),
                 )
             )
@@ -116,10 +277,19 @@ class sim_env(threading.Thread):
                     ),
                 )
             )       
-            
+            # for i in range(self.number_of_agents):
+            #     agent_pos = self.objs[i].base_pos
+            #     start_pos = [agent_pos[0], agent_pos[1], agent_pos[2]]
+            #     initial_pos = list(to_grid(self.env._sim.pathfinder, start_pos, self.grid_dimensions))
+            #     # agents_goal_pos_3d = [self.env._task.my_nav_to_info.robot_info.nav_goal_pos, self.env._task.my_nav_to_info.human_info.nav_goal_pos]
+            #     agents_initial_velocity = [0.5,0.0]
+            #     # goal_pos = list(to_grid(self.env._sim.pathfinder, agents_goal_pos_3d[i], self.grid_dimensions))
+            #     self.initial_state[i][0:4] = initial_pos+agents_initial_velocity
+            #     # if self.current_point is None:
             self._pub_rgb.publish(np.float32(rgb_with_res))
             self._pub_rgb_2.publish(np.float32(rgb2_with_res))
             self._pub_depth.publish(np.float32(depth_with_res))
+            self.map_to_base_link({'x': self.initial_state[0][0], 'y': self.initial_state[0][1], 'theta': self.get_object_heading(self.env.sim.agents_mgr[0].articulated_agent.base_transformation)})
             lock.release()
             self._r.sleep()
 
@@ -129,7 +299,7 @@ class sim_env(threading.Thread):
         base_vel = [lin_vel, ang_vel]
         self.env._episode_over = False
         k = 'agent_1_oracle_nav_randcoord_action'
-        my_env.env.task.actions[k].observations['agent_0_localization_sensor'][:3]
+        # my_env.env.task.actions[k].observations['agent_0_localization_sensor'][:3]
         self.env.task.actions[k].step()
         self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
         
@@ -273,14 +443,12 @@ if __name__ == "__main__":
     images = []
 
     my_env = sim_env(config)
+    my_env.start()
     rospy.Subscriber("/cmd_vel", Twist, callback, (my_env), queue_size=1)
-    for i in range (1000):
+    while not rospy.is_shutdown():
    
         my_env.update_agent_pos_vel()
-        im_0 = my_env.observations["agent_1_head_rgb"]
-
-        images.append(im_0)
-    images_to_video(images, "test", "trajectory")
-    print("Episode finished")
+        # rospy.spin()
+        my_env._r_control.sleep()
         # rospy.spin()
         

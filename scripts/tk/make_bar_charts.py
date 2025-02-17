@@ -3,10 +3,10 @@ import numpy as np
 
 # Set up data for 8 subplots
 num_subplots = 8
-agents = ['ORCA', 'ORCA-Backoff', 'MEDIRL', 'Expert']
+agents = ['ORCA', 'ORCA-Backoff', 'MEDIRL', 'LZ-MEDIRL (Ours)' 'Expert']
 values = np.random.rand(num_subplots, len(agents))  # Random values between 0 and 1
-values[0] = [1.0,1.0,1.0, 1.0]
-values[1] = [1.0,1.0,1.0, 1.0]
+values[0] = [1.0,1.0,0.7, 1.0]
+values[1] = [1.0,1.0,0.7, 1.0]
 values[2] = [1.0,1.0,1.0, 1.0]
 values[3] = [1.0,1.0,1.0, 1.0]
 values[4] = [1.0,1.0,1.0, 1.0]

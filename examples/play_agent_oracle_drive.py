@@ -494,7 +494,7 @@ class sim_env(threading.Thread):
             lock.acquire()
             rgb_with_res = np.concatenate(
                 (
-                    np.float32(self.observations["agent_0_third_rgb"][:,:,:3].ravel()),
+                    np.float32(self.observations["agent_1_head_rgb"][:,:,:3].ravel()),
                     np.array(
                         [512,512]
                     ),

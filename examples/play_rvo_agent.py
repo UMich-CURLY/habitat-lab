@@ -62,6 +62,7 @@ from sensor_msgs import point_cloud2
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 import tf
+from tf.transformations import euler_from_quaternion
 import tf2_ros
 import threading
 from gym import spaces
@@ -97,13 +98,13 @@ from IPython import embed
 DEFAULT_POSE_PATH = "data/humanoids/humanoid_data/walking_motion_processed.pkl"
 DEFAULT_CFG = "benchmark/rearrange/play/play.yaml"
 DEFAULT_RENDER_STEPS_LIMIT = 60
-SAVE_VIDEO_DIR = "/habitat-lab/data/vids/Test_Data_nov_5/single_test/exp7.40"
+SAVE_VIDEO_DIR = "/habitat-lab/data/vids/Test_data_finalest/Only8/exp_8.12"
 SAVE_ACTIONS_DIR = "./data/interactive_play_replays"
 MAP_DIR = "/home/catkin_ws/src/habitat_ros_interface/maps/"
 THIRD_RGB_SIZE = 128
 GRID_SIZE = 6
 HUMAN_HEAD_START = 0       #60
-CSV_PATH = "/habitat-lab/data/vids/Test_Data_nov_5/single_test/exp7.40/results.csv"
+CSV_PATH = "/habitat-lab/data/vids/Test_data_finalest/Only8/exp_8.12/results.csv"
 
 USE_TOPO_MAP = True
 USE_RL_CONTROL = False
@@ -390,6 +391,8 @@ class sim_env(threading.Thread):
         self.human_moved = []
         self.human_num_steps = 0
         self.full_init_state = []
+        self.hack_to_save = None
+        self.time_between_saves = rospy.Time.now().to_sec()
         
 
         # self.sfm.get_velocity(self.initial_state, filename = MAP_DIR+"run_rvo2", save_anim = True)
@@ -451,7 +454,7 @@ class sim_env(threading.Thread):
         f.write("negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196")
         f.close()
         self.map_to_base_link({'x': 0, 'y': 0, 'theta': self.get_object_heading(self.env.sim.agents_mgr[0].articulated_agent.base_transformation)})
-        self._reload_map_server.publish(True)
+        
         self.start_ep = False
         if SAVE_DATA:
             self.im_array[0].save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".gif", save_all=True, append_images=self.im_array[1:], duration=100, loop=0)
@@ -486,6 +489,8 @@ class sim_env(threading.Thread):
         self.human_moved = []
         self.human_num_steps = 0
         self.full_init_state = []
+        self._reload_map_server.publish(True)
+        self.time_between_saves = rospy.Time.now().to_sec()
         rospy.sleep(10)
 
     def img_to_grid(self):
@@ -557,7 +562,7 @@ class sim_env(threading.Thread):
             lock.acquire()
             rgb_with_res = np.concatenate(
                 (
-                    np.float32(self.observations["agent_0_third_rgb"][:,:,:3].ravel()),
+                    np.float32(self.observations["agent_1_head_rgb"][:,:,:3].ravel()),
                     np.array(
                         [512,512]
                     ),
@@ -678,13 +683,13 @@ class sim_env(threading.Thread):
             metrics = self.env.get_metrics()
             # dist_to_goal_human = np.linalg.norm((np.array(self.env.current_episode.info['human_goal'])-np.array(self.objs[1].base_pos))[[0,2]])
             # print("Distance to human goal is ", dist_to_goal_human)
-            if dist_to_goal <=1.0:
+            if dist_to_goal <=1.3:
                 self.current_point = robot_final_goal
                 self.waiting_for_traj = False
             while self.cheating_point is None or self.waiting_for_traj:
                 # base_vel = [0.0, 0.0]
                 wait_time = (rospy.Time.now()-self.prev_query_time).to_sec()
-                if wait_time > 0.1:
+                if wait_time > 0.5 and self.waiting_for_traj:
                     print("Time between queries is ", (rospy.Time.now()-self.prev_query_time).to_sec())
                     self._pub_get_traj.publish(True)
                     self.prev_query_time = rospy.Time.now()
@@ -874,14 +879,15 @@ class sim_env(threading.Thread):
                 return
             if not NO_ROBOT:
                 self.observations.update(self.env.step({"action":k, "action_args":{"agent_0_oracle_nav_randcoord_action":coord_nav}}))
-            robot_pos_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_0_third_rgb"].shape[0], H = self.observations["agent_0_third_rgb"].shape[1], agent_state = self.objs[0].base_pos)
-            human_pos_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_0_third_rgb"].shape[0], H = self.observations["agent_0_third_rgb"].shape[1], agent_state = self.objs[1].base_pos)
-            robot_goal_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_0_third_rgb"].shape[0], H = self.observations["agent_0_third_rgb"].shape[1], agent_state = self.env.current_episode.info['robot_goal'])
-            self.full_init_state.append([robot_pos_in_img, human_pos_in_img, robot_goal_in_img])
+            robot_pos_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_1_head_rgb"].shape[0], H = self.observations["agent_1_head_rgb"].shape[1], agent_state = self.objs[0].base_pos)
+            human_pos_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_1_head_rgb"].shape[0], H = self.observations["agent_1_head_rgb"].shape[1], agent_state = self.objs[1].base_pos)
+            robot_goal_in_img = world_to_img(proj = self.proj, cam = self.cam, W = self.observations["agent_1_head_rgb"].shape[0], H = self.observations["agent_1_head_rgb"].shape[1], agent_state = self.env.current_episode.info['robot_goal'])
+            self.full_init_state.append([robot_pos_in_img, human_pos_in_img, robot_goal_in_img, [self.hack_to_save, float(rospy.Time.now().to_sec()-self.time_between_saves)]])
+            self.time_between_saves = rospy.Time.now().to_sec()
             self.im_array.append(Image.fromarray(self.observations["agent_1_third_rgb"].astype(np.uint8)))
         # self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
-        # if (self.actual_num_steps%10 == 0):
-        #     self.waiting_for_traj = True
+        if (self.actual_num_steps%10 == 0):
+            self.waiting_for_traj = True
         positions_now = []
         for agent in self.objs: 
             points = np.array([np.array(agent.base_pos)]).T
@@ -1097,6 +1103,7 @@ class sim_env(threading.Thread):
             poseMsg.position.y = self.initial_state[i+1][1]-1
             poseMsg.position.z = 0.0
             poseArrayMsg.poses.append(poseMsg)
+        self.hack_to_save = -euler_from_quaternion(quat)[2]
         self._pub_all_agents.publish(poseArrayMsg)
 
 
@@ -1243,6 +1250,7 @@ class sim_env(threading.Thread):
         print("Robot drift is ", norm_list[0], start_index)
         if start_index>1 and norm_list[0]>0.1:
             print("The robot state has drifted from the initial state ", norm_list[0:start_index])
+            self.waiting_for_traj = True
             return
         end_index = len(traj_2d)-1
         # print("Length of norm list is ", len(norm_list))
