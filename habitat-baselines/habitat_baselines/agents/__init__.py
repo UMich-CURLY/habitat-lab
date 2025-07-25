@@ -8,4 +8,5 @@ __all__ = [
     "ppo_agents",
     "simple_agents",
     "benchmark_gym",
+    "il_agent",
 ]

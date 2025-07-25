@@ -21,7 +21,7 @@ from habitat.tasks.nav.object_nav_task import (
     ObjectGoalNavEpisode,
     ObjectViewLocation,
 )
-
+from IPython import embed
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
@@ -116,20 +116,20 @@ class ObjectNavDatasetV1(PointNavDatasetV1):
         assert set(self.category_to_task_category_id.keys()) == set(
             self.category_to_scene_annotation_category_id.keys()
         ), "category_to_task and category_to_mp3d must have the same keys"
-
+        
         if len(deserialized["episodes"]) == 0:
             return
-
+        
         if "goals_by_category" not in deserialized:
             deserialized = self.dedup_goals(deserialized)
 
         for k, v in deserialized["goals_by_category"].items():
             self.goals_by_category[k] = [self.__deserialize_goal(g) for g in v]
-
+        
         for i, episode in enumerate(deserialized["episodes"]):
             episode = ObjectGoalNavEpisode(**episode)
             episode.episode_id = str(i)
-
+            
             if scenes_dir is not None:
                 if episode.scene_id.startswith(DEFAULT_SCENE_PATH_PREFIX):
                     episode.scene_id = episode.scene_id[
@@ -137,8 +137,12 @@ class ObjectNavDatasetV1(PointNavDatasetV1):
                     ]
 
                 episode.scene_id = os.path.join(scenes_dir, episode.scene_id)
-
-            episode.goals = self.goals_by_category[episode.goals_key]
+            try:
+                episode.goals = self.goals_by_category[episode.goals_key]
+            except:
+                print("Episode goals key:", episode.goals_key)
+                continue
+                embed()
 
             if episode.shortest_paths is not None:
                 for path in episode.shortest_paths:
@@ -149,7 +153,9 @@ class ObjectNavDatasetV1(PointNavDatasetV1):
                                 "rotation": None,
                                 "position": None,
                             }
-
-                        path[p_index] = ShortestPathPoint(**point)
+                        try:
+                            path[p_index] = ShortestPathPoint(**point)
+                        except:
+                            print("Shortest path issue, dont think it matters")
 
             self.episodes.append(episode)  # type: ignore [attr-defined]

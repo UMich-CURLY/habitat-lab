@@ -25,7 +25,9 @@ try:
     )
 except ImportError:
     pass
-
+from habitat.tasks.nav.nav import EmbodiedTask
+from typing import Any, Dict
+from habitat.core.simulator import Observations
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
@@ -37,7 +39,10 @@ class ObjectGoalNavEpisode(NavigationEpisode):
     :param object_category: Category of the obect
     """
     object_category: Optional[str] = None
-
+    is_thda: Optional[bool] = False
+    scene_dataset: Optional[str] = None
+    scene_state: Optional[str] = None
+    reference_replay: Optional[str] = None
     @property
     def goals_key(self) -> str:
         r"""The key to retrieve the goals"""
@@ -177,6 +182,114 @@ class ObjectGoalSensor(Sensor):
                 "Wrong goal_spec specified for ObjectGoalSensor."
             )
 
+@registry.register_sensor(name="DemonstrationSensor")
+class DemonstrationSensor(Sensor):
+    cls_uuid: str = "demonstration"
+    def __init__(
+        self,
+        sim,
+        config: "DictConfig",
+        dataset: "ObjectNavDatasetV1",
+        *args: Any,
+        **kwargs: Any,
+    ):
+        self._sim = sim
+        self._dataset = dataset
+        super().__init__(config=config)
+        self.timestep = 0
+        self.prev_action = 0
+        self.action_map = {
+                            'STOP': 0,
+                            'MOVE_FORWARD': 1,
+                            'TURN_LEFT': 2,
+                            'TURN_RIGHT': 3,
+                            'LOOK_UP': 4,
+                            'LOOK_DOWN': 5
+                            }
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+    
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, **kwargs):
+        # return spaces.Box(shape=(1,), low=1, high=7, dtype=np.float32)
+        return spaces.Discrete(1)
+    
+    def _get_observation(
+        self,
+        observations,
+        *args: Any,
+        episode: ObjectGoalNavEpisode,
+        **kwargs: Any,
+    ):
+        
+        self.timestep = int(
+            self._sim.get_world_time() / self._sim.get_physics_time_step()
+        )
+        
+        if self.timestep < len(episode.reference_replay):
+            action_name = episode.reference_replay[self.timestep]['action']
+            action = self.action_map.get(action_name, 0)    
+        else:
+            action = 0
+            
+        return action
+
+    def get_observation(self, **kwargs):
+        return self._get_observation(**kwargs)
+
+@registry.register_sensor(name="InflectionWeightSensor")
+class InflectionWeightSensor(Sensor):
+    cls_uuid: str = "inflection_weight"
+    def __init__(
+        self,
+        sim,
+        config: "DictConfig",
+        dataset: "ObjectNavDatasetV1",
+        *args: Any,
+        **kwargs: Any,
+    ):     
+        self._sim = sim
+        self._dataset = dataset
+        super().__init__(config=config)
+        self.observation_space = spaces.Discrete(1)
+        self._config = config
+        self.timestep = 0
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+    
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, **kwargs):
+        # return spaces.Box(shape=(1,), low=1, high=7, dtype=np.float32)
+        return spaces.Box(shape=(1,), low=1, high=7, dtype=np.float32)
+
+    def _get_observation(
+        self,
+        observations,
+        *args: Any,
+        episode: ObjectGoalNavEpisode,
+        **kwargs: Any,
+    ):
+        self.timestep = int(
+            self._sim.get_world_time() / self._sim.get_physics_time_step()
+        )
+        
+        inflection_weight = 1.0
+        if self.timestep == 0:
+            inflection_weight = 1.0
+        elif self.timestep >= len(episode.reference_replay):
+            inflection_weight = 1.0 
+        elif episode.reference_replay[self.timestep - 1]['action'] != episode.reference_replay[self.timestep]['action']:
+            inflection_weight = 3.477512060914205
+        return inflection_weight
+
+    def get_observation(self, **kwargs):
+        return self._get_observation(**kwargs)
 
 @registry.register_task(name="ObjectNav-v1")
 class ObjectNavigationTask(NavigationTask):

@@ -16,10 +16,14 @@ from habitat.config.default_structured_configs import register_hydra_plugin
 from habitat_baselines.config.default_structured_configs import (
     HabitatBaselinesConfigPlugin,
 )
-
+from IPython import embed
+from omegaconf import OmegaConf
 if TYPE_CHECKING:
     from omegaconf import DictConfig
-
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
+torch.multiprocessing.set_start_method("spawn", force=True)
 
 @hydra.main(
     version_base=None,
@@ -28,6 +32,10 @@ if TYPE_CHECKING:
 )
 def main(cfg: "DictConfig"):
     cfg = patch_config(cfg)
+    OmegaConf.set_struct(cfg, False)
+    OmegaConf.set_readonly(cfg, False)
+    if not "habitat_baselines" in cfg:
+        cfg.habitat_baselines = cfg.objectnav.habitat_baselines   # For backwards compatibility with objectnav configs, TRIBHIs!!!
     execute_exp(cfg, "eval" if cfg.habitat_baselines.evaluate else "train")
 
 

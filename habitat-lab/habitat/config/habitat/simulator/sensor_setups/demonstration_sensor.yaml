@@ -1,0 +1,6 @@
+# habitat/config/habitat/simulator/sim_sensors/demonstration_sensor.yaml
+
+type: DemonstrationSensor     # Must match your @registry name
+uuid: demonstration
+position: [0, 0, 0]           # Dummy required by Habitat
+orientation: [0, 0, 0]        # Dummy required by Habitat

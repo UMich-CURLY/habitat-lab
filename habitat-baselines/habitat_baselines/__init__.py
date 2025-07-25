@@ -7,6 +7,8 @@
 from habitat_baselines.common.base_il_trainer import BaseILTrainer
 from habitat_baselines.common.base_trainer import BaseRLTrainer, BaseTrainer
 from habitat_baselines.common.rollout_storage import RolloutStorage
+# habitat_baselines/__init__.py
+
 from habitat_baselines.il.trainers.eqa_cnn_pretrain_trainer import (
     EQACNNPretrainTrainer,
 )
@@ -26,4 +28,5 @@ __all__ = [
     "PACMANTrainer",
     "VQATrainer",
     "VERTrainer",
+    "ILEnvTrainer",
 ]

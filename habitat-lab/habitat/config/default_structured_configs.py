@@ -38,6 +38,8 @@ __all__ = [
     "DistanceToGoalRewardMeasurementConfig",
     # NAVIGATION LAB SENSORS
     "ObjectGoalSensorConfig",
+    "DemonstrationSensorConfig",
+    "InflectionSensorConfig",
     "InstanceImageGoalSensorConfig",
     "InstanceImageGoalHFOVSensorConfig",
     "CompassSensorConfig",
@@ -454,6 +456,27 @@ class ObjectGoalSensorConfig(LabSensorConfig):
     goal_spec: str = "TASK_CATEGORY_ID"
     goal_spec_max_val: int = 50
 
+@dataclass
+class DemonstrationSensorConfig(LabSensorConfig):
+    """
+    For IL Object Navigation tasks only.
+    Provides the teacher (demonstration) action at each step.
+
+    :property type: The name of the sensor class to instantiate.
+    :property uuid: The key in the observation dictionary.
+    """
+    type: str = "DemonstrationSensor"  # ✅ Must match @registry.register_sensor
+    
+@dataclass
+class InflectionSensorConfig(LabSensorConfig):
+    """
+    For IL Object Navigation tasks only.
+    Provides the teacher (demonstration) action at each step.
+
+    :property type: The name of the sensor class to instantiate.
+    :property uuid: The key in the observation dictionary.
+    """
+    type: str = "InflectionWeightSensor"  # ✅ Must match @registry.register_sensor
 
 @dataclass
 class ImageGoalSensorConfig(LabSensorConfig):
@@ -2193,6 +2216,20 @@ cs.store(
     group="habitat/task/lab_sensors",
     name="objectgoal_sensor",
     node=ObjectGoalSensorConfig,
+)
+
+cs.store(
+    package="habitat.task.lab_sensors.demonstration_sensor",
+    group="habitat/task/lab_sensors",
+    name="demonstration_sensor",
+    node=DemonstrationSensorConfig,
+)
+
+cs.store(
+    package="habitat.task.lab_sensors.inflection_weight_sensor",
+    group="habitat/task/lab_sensors",
+    name="inflection_weight_sensor",
+    node=InflectionSensorConfig,
 )
 cs.store(
     package="habitat.task.lab_sensors.imagegoal_sensor",

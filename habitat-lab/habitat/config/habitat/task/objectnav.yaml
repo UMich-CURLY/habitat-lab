@@ -18,6 +18,8 @@ defaults:
     - objectgoal_sensor
     - compass_sensor
     - gps_sensor
+    - demonstration_sensor
+    - inflection_weight_sensor
   - _self_
 
 actions:

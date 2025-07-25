@@ -254,7 +254,7 @@ class NetPolicy(nn.Module, Policy):
     action_distribution: nn.Module
 
     def __init__(
-        self, net, action_space, policy_config=None, aux_loss_config=None
+        self, net, action_space, policy_config=None, aux_loss_config=None, no_critic=False 
     ):
         Policy.__init__(self, action_space)
         nn.Module.__init__(self)

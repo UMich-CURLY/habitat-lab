@@ -1202,26 +1202,27 @@ def get_active_obs_transforms(
     config: "DictConfig", agent_name: str = None
 ) -> List[ObservationTransformer]:
     active_obs_transforms = []
-    if (agent_name is None):
-    # When using observation transformations, we
-    # assume for now that the observation space is shared among agents
-        agent_name = list(config.habitat_baselines.rl.policy.keys())[0]
-    obs_trans_conf = config.habitat_baselines.rl.policy[
-        agent_name
-    ].obs_transforms
-    if hasattr(
-        config.habitat_baselines.rl.policy[agent_name], "obs_transforms"
-    ):
-        for obs_transform_config in obs_trans_conf.values():
-            obs_trans_cls = baseline_registry.get_obs_transformer(
-                obs_transform_config.type
-            )
-            if obs_trans_cls is None:
-                raise ValueError(
-                    f"Unkown ObservationTransform with name {obs_transform_config.type}."
+    if hasattr(config.habitat_baselines, "rl"):
+        if (agent_name is None):
+        # When using observation transformations, we
+        # assume for now that the observation space is shared among agents
+            agent_name = list(config.habitat_baselines.rl.policy.keys())[0]
+        obs_trans_conf = config.habitat_baselines.rl.policy[
+            agent_name
+        ].obs_transforms
+        if hasattr(
+            config.habitat_baselines.rl.policy[agent_name], "obs_transforms"
+        ):
+            for obs_transform_config in obs_trans_conf.values():
+                obs_trans_cls = baseline_registry.get_obs_transformer(
+                    obs_transform_config.type
                 )
-            obs_transform = obs_trans_cls.from_config(obs_transform_config)
-            active_obs_transforms.append(obs_transform)
+                if obs_trans_cls is None:
+                    raise ValueError(
+                        f"Unkown ObservationTransform with name {obs_transform_config.type}."
+                    )
+                obs_transform = obs_trans_cls.from_config(obs_transform_config)
+                active_obs_transforms.append(obs_transform)
     return active_obs_transforms
 
 

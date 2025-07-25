@@ -103,6 +103,7 @@ class PointNavDatasetV1(Dataset):
             with open(fname, "rb") as f:
                 self.from_binary(pickle.load(f), scenes_dir=scenes_dir)
         else:
+            # import pdb; pdb.set_trace()
             with gzip.open(fname, "rt") as f:
                 self.from_json(f.read(), scenes_dir=scenes_dir)
 

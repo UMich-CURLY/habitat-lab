@@ -284,6 +284,35 @@ class RNNStateEncoder(nn.Module):
     is that it takes an addition masks input that resets the hidden state between two adjacent
     timesteps to handle episodes ending in the middle of a rollout.
     """
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        rnn_type: str = "GRU",
+    ):
+        r"""An RNN for encoding the state in RL.
+
+        Supports masking the hidden state during various timesteps in the forward lass
+
+        Args:
+            input_size: The input size of the RNN
+            hidden_size: The hidden size
+            num_layers: The number of recurrent layers
+            rnn_type: The RNN cell type.  Must be GRU or LSTM
+        """
+
+        super().__init__()
+        self._num_recurrent_layers = num_layers
+        self._rnn_type = rnn_type
+
+        self.rnn = getattr(nn, rnn_type)(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+        )
+
+        self.layer_init()
 
     def layer_init(self):
         for name, param in self.rnn.named_parameters():
@@ -302,9 +331,9 @@ class RNNStateEncoder(nn.Module):
         self, x, hidden_states, masks
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Forward for a non-sequence input"""
-
+        import pdb; pdb.set_trace()
         hidden_states = torch.where(
-            masks.view(1, -1, 1), hidden_states, hidden_states.new_zeros(())
+            masks.view(1, -1, 1).bool(), hidden_states, hidden_states.new_zeros(())
         )
 
         x, hidden_states = self.rnn(
