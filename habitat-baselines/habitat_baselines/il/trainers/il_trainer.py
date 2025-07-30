@@ -73,7 +73,7 @@ class ILEnvTrainer(BaseRLTrainer):
         self.agent = None
         self.envs = None
         self.obs_transforms = []
-        config.MODEL = config.objectnav.MODEL
+        config.MODEL = config.habitat_baselines.il.model
         if config is not None:
             logger.info(f"config: {config}")
 
