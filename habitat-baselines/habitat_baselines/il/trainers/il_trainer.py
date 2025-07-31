@@ -501,11 +501,11 @@ class ILEnvTrainer(BaseRLTrainer):
                     )
 
    
-                if update == self.config.MODEL.SWITCH_TO_PRED_SEMANTICS_UPDATE - 1:
-                    self.save_checkpoint(
-                        f"ckpt_gt_best.{count_checkpoints}.pth",
-                        dict(step=count_steps),
-                    )
+                # if update == self.config.MODEL.SWITCH_TO_PRED_SEMANTICS_UPDATE - 1:
+                #     self.save_checkpoint(
+                #         f"ckpt_gt_best.{count_checkpoints}.pth",
+                #         dict(step=count_steps),
+                #     )
 
                 # checkpoint model
                 if update % self.config.habitat_baselines.checkpoint_interval == 0:

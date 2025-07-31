@@ -73,7 +73,7 @@ habitat_baselines:
       sem_seg_pred: True
       no_vision: False
       USE_SEMANTICS: False
-      use_pred_semantics: True
+      USE_PRED_SEMANTICS: False
       switch_to_pred_semantics_update: 0
 
       semantic_encoder:

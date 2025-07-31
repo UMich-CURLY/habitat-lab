@@ -39,7 +39,7 @@ class VlnResnetDepthEncoder(nn.Module):
             param.requires_grad_(trainable)
 
         if checkpoint != "NONE":
-            ddppo_weights = torch.load(checkpoint)
+            ddppo_weights = torch.load(checkpoint, weights_only=False)
 
             weights_dict = {}
             for k, v in ddppo_weights["state_dict"].items():
