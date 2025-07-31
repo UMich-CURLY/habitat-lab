@@ -396,17 +396,16 @@ class ILEnvTrainer(BaseRLTrainer):
         pth_time = 0
         count_steps = 0
         count_checkpoints = 0
-        NUM_UPDATES = 1000
         lr_scheduler = LambdaLR(
             optimizer=self.agent.optimizer,
-            lr_lambda=lambda x: linear_decay(x, NUM_UPDATES),  # type: ignore
+            lr_lambda=lambda x: linear_decay(x, self.config.habitat_baselines.num_updates),  # type: ignore
         )
         # self.possible_actions = self.config.TASK_CONFIG.TASK.POSSIBLE_ACTIONS
 
         with TensorboardWriter(
             self.config.habitat_baselines.tensorboard_dir, flush_secs=self.flush_secs
         ) as writer:
-            for update in range(NUM_UPDATES):
+            for update in range(self.config.habitat_baselines.num_updates):
                 profiling_wrapper.on_start_step()
                 profiling_wrapper.range_push("train update")
                 
@@ -417,7 +416,7 @@ class ILEnvTrainer(BaseRLTrainer):
 
                 if il_cfg.use_linear_clip_decay and update > 0:
                     self.agent.clip_param = il_cfg.clip_param * linear_decay(
-                        update, NUM_UPDATES
+                        update, self.config.habitat_baselines.num_updates
                     )
 
                 profiling_wrapper.range_push("rollouts loop")
@@ -508,7 +507,7 @@ class ILEnvTrainer(BaseRLTrainer):
                 #     )
 
                 # checkpoint model
-                if update % self.config.habitat_baselines.checkpoint_interval == 0:
+                if update > 0 and update % (self.config.habitat_baselines.num_updates // self.config.habitat_baselines.num_checkpoints) == 0:
                     self.save_checkpoint(
                         f"ckpt.{count_checkpoints}.pth", dict(step=count_steps)
                     )
