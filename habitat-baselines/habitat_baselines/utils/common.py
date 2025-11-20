@@ -378,6 +378,85 @@ def poll_checkpoint_folder(
         return models_paths[ind]
     return None
 
+def save_logits_heatmap_video(
+    logits: torch.Tensor,
+    action_names=None,
+    out_path="logits_heatmap.mp4",
+    fps=10,
+    cumulative=True,  # if False, shows a single column per frame
+):
+    """
+    logits: [T, A] tensor
+    action_names: list of length A
+    out_path: mp4 filepath
+    fps: frames per second
+    cumulative: True -> heatmap grows over time; False -> one column per frame
+    """
+    assert logits.ndim == 2, f"Expected [T, A], got {tuple(logits.shape)}"
+    T, A = logits.shape
+    if action_names is None:
+        action_names = [f"A{i}" for i in range(A)]
+    assert len(action_names) == A, "action_names length must match num actions"
+
+    data = logits.detach().cpu().numpy()  # [T, A]
+    argmax_each_t = data.argmax(axis=1)   # [T]
+
+    # Set up fig/axes
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Initial image
+    init_data = data[:1].T if cumulative else data[0:1].T  # [A, 1]
+    im = ax.imshow(init_data, aspect="auto", origin="upper")  # default colormap
+    cbar = fig.colorbar(im, ax=ax, label="Logit Value")
+
+    ax.set_yticks(np.arange(A))
+    ax.set_yticklabels(action_names)
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Action Category")
+    title = ax.set_title("Policy Logits Heatmap (t = 0)")
+
+    # Argmax markers (one per column). We'll re-plot every frame.
+    marker_y = [argmax_each_t[0]]
+    marker_x = [0]
+    markers, = ax.plot(marker_x, marker_y, marker='o', linestyle='None')
+
+    # Writer
+    writer = FFMpegWriter(fps=fps, metadata=dict(artist="you"))
+
+    # For stable color scaling across frames
+    vmin = data.min()
+    vmax = data.max()
+
+    with writer.saving(fig, out_path, dpi=200):
+        # First frame
+        im.set_clim(vmin, vmax)
+        writer.grab_frame()
+
+        # Remaining frames
+        for t in range(1, T):
+            if cumulative:
+                frame = data[:t+1].T  # [A, t+1]
+                im.set_data(frame)
+                # update x-axis to match frames width
+                ax.set_xlim(-0.5, frame.shape[1]-0.5)
+                title.set_text(f"Policy Logits Heatmap (t = {t})")
+                # update markers to include all timesteps so far
+                marker_x = list(range(t+1))
+                marker_y = argmax_each_t[:t+1].tolist()
+            else:
+                frame = data[t:t+1].T  # [A, 1]
+                im.set_data(frame)
+                ax.set_xlim(-0.5, 0.5)
+                title.set_text(f"Policy Logits (single step t = {t})")
+                marker_x = [0]
+                marker_y = [argmax_each_t[t]]
+
+            # Re-draw markers
+            markers.set_data(marker_x, marker_y)
+            writer.grab_frame()
+
+    plt.close(fig)
+    print(f"Saved video to: {os.path.abspath(out_path)}")
 
 def generate_video(
     video_option: List[str],

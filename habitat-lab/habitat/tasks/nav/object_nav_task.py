@@ -18,7 +18,10 @@ from habitat.tasks.nav.nav import (
     NavigationGoal,
     NavigationTask,
 )
+from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
+from typing import TYPE_CHECKING, Union, cast
 
+import utils
 try:
     from habitat.datasets.object_nav.object_nav_dataset import (
         ObjectNavDatasetV1,
@@ -182,6 +185,24 @@ class ObjectGoalSensor(Sensor):
                 "Wrong goal_spec specified for ObjectGoalSensor."
             )
 
+def get_action_from_pos(ref_pos, ref_rot, ref_prev_pos, ref_prev_rot):
+    diff_pos = np.linalg.norm(ref_pos - ref_prev_pos)
+    if diff_pos >0.1:
+        return 1
+    diff_rot = ref_rot[3] - ref_prev_rot[3]
+    if abs(diff_rot) <0.01 and diff_pos <0.1:
+        return 0
+    if diff_rot>0.01:
+        return 3
+    elif diff_rot <-0.01:
+        return 2
+    else:
+        return -1
+
+
+
+
+
 @registry.register_sensor(name="DemonstrationSensor")
 class DemonstrationSensor(Sensor):
     cls_uuid: str = "demonstration"
@@ -206,6 +227,13 @@ class DemonstrationSensor(Sensor):
                             'LOOK_UP': 4,
                             'LOOK_DOWN': 5
                             }
+        self.prev_pos = [0,0,0]
+        self.prev_rot = [0,0,0,1]
+        self.shortest_path_follower = ShortestPathFollower(
+            sim=cast("HabitatSim", sim),
+            goal_radius=0.1,
+            return_one_hot=False,
+        )
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
         return self.cls_uuid
@@ -225,20 +253,87 @@ class DemonstrationSensor(Sensor):
         **kwargs: Any,
     ):
         
-        self.timestep = int(
-            self._sim.get_world_time() / self._sim.get_physics_time_step()
-        )
-        
+        # self.timestep = int(
+        #     self._sim.get_world_time() / self._sim.get_physics_time_step()*(1/4)
+        # )
+        # print(f"Current timestep: {self.timestep}")
+        # print(f"World time: {self._sim.get_world_time()}")
+        # print(f"Physics time step: {self._sim.get_physics_time_step()}")
+      
+        # current_pos = self._sim.get_agent_state().position
+        # reference_pos = episode.reference_replay[self.timestep]['agent_state']['position']
+        # current_rot = self._sim.get_agent_state().rotation
+        # reference_rot = episode.reference_replay[self.timestep]['agent_state']['rotation']
+        # print(f"Difference in position at step {self.timestep} : ", current_pos - reference_pos)
+        # print(f"Current position: {current_pos} and rotation: {current_rot}")
+        # print(f"Reference position: {reference_pos} and rotation: {reference_rot}")
+        # if (self.timestep>0):
+        #     print("Previous action: ", episode.reference_replay[self.timestep - 1]['action'])
+
         if self.timestep < len(episode.reference_replay):
             action_name = episode.reference_replay[self.timestep]['action']
-            action = self.action_map.get(action_name, 0)    
+            action = self.action_map.get(action_name, 0)
+
+            reference_state = episode.reference_replay[self.timestep]['agent_state']
+            reference_pos = np.array(reference_state['position'], dtype=np.float32)
+            reference_rot = episode.reference_replay[self.timestep]['agent_state']['rotation']
+            # computed_action = get_action_from_pos(reference_pos, reference_rot, self.prev_pos, self.prev_rot)
+            # if computed_action!=-1:
+            #     if action != computed_action:
+            #         action = computed_action
+            #         print("Post fixed action", action)
+            #     else:
+            #         print("Action is likely correct")
+            self.prev_pos = reference_pos
+            self.prev_rot = reference_rot
+            if (action <4):
+                action = self.shortest_path_follower.get_next_action(
+                episode.reference_replay[self.timestep+1]['agent_state']['position']
+            )
+
         else:
             action = 0
-            
+            action_name = 'STOP'
+            reference_pos = np.zeros(3, dtype=np.float32)
+            reference_rot = np.array([0, 0, 0, 1], dtype=np.float32)  # Identity quaternion
+            self.prev_pos = reference_pos
+            self.prev_rot = reference_rot
+        # Get current agent state
+        current_state = self._sim.get_agent_state()
+        current_pos = np.array(current_state.position, dtype=np.float32)
+
+        # Compute position difference
+        position_diff = current_pos - reference_pos
+
+        # # Print information
+        # print(f"\n=== Step {self.timestep:04d} ===")
+        # print(f"Action taken        : {action} ({action_name})")
+        # print(f"Current position    : {np.round(current_pos, 3)}")
+        # print(f"Reference position  : {np.round(reference_pos, 3)}")
+        # print(f"Position difference : {np.round(position_diff, 3)}")
+        # print(f"Rotation (quaternion): {current_state.rotation}")
+        # print(f"Reference rotation  : {reference_rot}")
+
+
+
+        if self.timestep < len(episode.reference_replay):
+            action_name = episode.reference_replay[self.timestep]['action']
+            # action = self.action_map.get(action_name, 0)
+            if self.timestep == 0:
+                action = 0    
+        else:
+            action = 0
+        # print(f"Timestep: {self.timestep:04d} | Action: {action}", end='\r', flush=True)
+        self.timestep += 1
+        if (self._sim.get_world_time() == 0 and self.timestep >10):
+            self.timestep = 0
+            # print("Resetting timestep to 0")
         return action
 
     def get_observation(self, **kwargs):
         return self._get_observation(**kwargs)
+
+
 
 @registry.register_sensor(name="InflectionWeightSensor")
 class InflectionWeightSensor(Sensor):

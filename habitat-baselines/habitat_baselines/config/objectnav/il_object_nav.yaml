@@ -12,7 +12,7 @@ VIDEO_DIR: "video_dir/objectnav/overfitting/rgbd/seed_1/"
 # To evaluate on all episodes, set this to -1
 TEST_EPISODE_COUNT: 10
 EVAL_CKPT_PATH_DIR: "data/new_checkpoints/objectnav/objectnav_env_v4/rgbd/seed_1_70M/ckpt.22.pth"
-SHOW_TOP_DOWN_MAP: False
+SHOW_TOP_DOWN_MAP: True
 NUM_PROCESSES: 1
 CHECKPOINT_FOLDER: "data/new_checkpoints/objectnav/overfitting/rgbd/seed_1"
 OUTPUT_LOG_DIR: data/objectnav/logs

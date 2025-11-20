@@ -56,7 +56,11 @@ import habitat_baselines.common.env_factory
 from habitat_baselines.common.base_trainer import BaseRLTrainer
 # from habitat_baselines.il.env_based.policy.rednet import load_rednet
 # from habitat_baselines.il.common.sensors import DemonstrationSensor
-
+from typing import Any, Dict, List, Tuple, Union
+from torch import Tensor
+from numpy import ndarray
+from habitat.core.env import Env, RLEnv
+from habitat.core.vector_env import VectorEnv
 os.environ["OMP_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 
@@ -206,6 +210,56 @@ class ILEnvTrainer(BaseRLTrainer):
 
         return results
 
+    @staticmethod
+    def _pause_envs(
+        envs_to_pause: List[int],
+        envs: Union[VectorEnv, RLEnv, Env],
+        test_recurrent_hidden_states: Tensor,
+        not_done_masks: Tensor,
+        current_episode_reward: Tensor,
+        prev_actions: Tensor,
+        batch: Dict[str, Tensor],
+        rgb_frames: Union[List[List[Any]], List[List[ndarray]]],
+    ) -> Tuple[
+        Union[VectorEnv, RLEnv, Env],
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Dict[str, Tensor],
+        List[List[Any]],
+    ]:
+        # pausing self.envs with no new episode
+        if len(envs_to_pause) > 0:
+            state_index = list(range(envs.num_envs))
+            for idx in reversed(envs_to_pause):
+                state_index.pop(idx)
+                envs.pause_at(idx)
+            
+            # indexing along the batch dimensions
+            test_recurrent_hidden_states = test_recurrent_hidden_states[
+                :, state_index
+            ]
+
+            not_done_masks = not_done_masks[state_index]
+            current_episode_reward = current_episode_reward[state_index]
+            prev_actions = prev_actions[state_index]
+
+            for k, v in batch.items():
+                batch[k] = v[state_index]
+
+            rgb_frames = [rgb_frames[i] for i in state_index]
+
+        return (
+            envs,
+            test_recurrent_hidden_states,
+            not_done_masks,
+            current_episode_reward,
+            prev_actions,
+            batch,
+            rgb_frames,
+        )
+
     @profiling_wrapper.RangeContext("_collect_rollout_step")
     def _collect_rollout_step(
         self, rollouts, current_episode_reward, running_episode_stats
@@ -218,23 +272,18 @@ class ILEnvTrainer(BaseRLTrainer):
         # fetch actions and environment state from replay buffer
         current_episodes = self.envs.current_episodes()
 
-        from IPython import embed; 
         next_actions = rollouts.get_next_actions()
         actions = next_actions.long().unsqueeze(-1)
         step_data = [a.item() for a in next_actions.long().to(device="cpu")]
-
         pth_time += time.time() - t_sample_action
 
         t_step_env = time.time()
         profiling_wrapper.range_pop()  # compute actions
-        try:
-            outputs = self.envs.step(step_data)
-        except:
-            embed()
+        outputs = self.envs.step(step_data)
+        
         observations, rewards_l, dones, infos = [
             list(x) for x in zip(*outputs)
         ]
-
         env_time += time.time() - t_step_env
 
         t_update_stats = time.time()
@@ -365,7 +414,6 @@ class ILEnvTrainer(BaseRLTrainer):
         observations = self.envs.reset()
         batch = batch_obs(observations, device=self.device)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
-
         for sensor in rollouts.observations:
             rollouts.observations[sensor][0].copy_(batch[sensor])
             # Use first semantic observations from RedNet predictor as well
@@ -401,7 +449,6 @@ class ILEnvTrainer(BaseRLTrainer):
             lr_lambda=lambda x: linear_decay(x, self.config.habitat_baselines.num_updates),  # type: ignore
         )
         # self.possible_actions = self.config.TASK_CONFIG.TASK.POSSIBLE_ACTIONS
-
         with TensorboardWriter(
             self.config.habitat_baselines.tensorboard_dir, flush_secs=self.flush_secs
         ) as writer:
@@ -431,6 +478,20 @@ class ILEnvTrainer(BaseRLTrainer):
                     pth_time += delta_pth_time
                     env_time += delta_env_time
                     count_steps += delta_steps
+                
+                # if (update % 10 == 0 and update>0):
+                #     rgb_obs = rollouts.observations["rgb"]  # shape: [17, 1, 480, 640, 3]
+                #     frames = rgb_obs[1:, 0]  # 16 steps, shape: [16, 480, 640, 3]
+
+                #     # Convert to [1, T, C, H, W]
+                #     video_tensor = (
+                #         frames.permute(0, 3, 1, 2)     # [T, H, W, C] -> [T, C, H, W]
+                #             .unsqueeze(0)            # -> [1, T, C, H, W]
+                #             .to(torch.uint8)         # must be uint8 for add_video
+                #     )
+                #     video_tag = f"rollout/env0_video_step{update}"
+                #     writer.add_video(video_tag, video_tensor, global_step=rollouts.step, fps=4)
+                #     writer.flush()
                 profiling_wrapper.range_pop()  # rollouts loop
 
                 (
@@ -512,56 +573,24 @@ class ILEnvTrainer(BaseRLTrainer):
                         f"ckpt.{count_checkpoints}.pth", dict(step=count_steps)
                     )
                     count_checkpoints += 1
+                    
+                    # self._eval(writer, count_checkpoints - 1)
+                
 
                 profiling_wrapper.range_pop()  # train update
 
-            self.envs.close()
+        self.envs.close()
 
-    def _eval_checkpoint(
-        self,
-        checkpoint_path: str,
+    def _eval(self,
         writer: TensorboardWriter,
         checkpoint_index: int = 0,
     ) -> None:
-        r"""Evaluates a single checkpoint.
-
-        Args:
-            checkpoint_path: path of checkpoint
-            writer: tensorboard writer object for logging to tensorboard
-            checkpoint_index: index of cur checkpoint for logging
-
-        Returns:
-            None
-        """
         # Map location CPU is almost always better than mapping to a CUDA device.
-        ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
+        # ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
 
-        self._make_results_dir(self.config.EVAL.SPLIT)
-
-        if self.config.EVAL.USE_CKPT_CONFIG:
-            conf = ckpt_dict["config"]
-            config = self._setup_eval_config(ckpt_dict["config"])
-        else:
-            config = self.config.clone()
-
-        il_cfg = config.IL.BehaviorCloning
-
-        config.defrost()
-        config.TASK_CONFIG.DATASET.SPLIT = config.EVAL.SPLIT
-        config.TASK_CONFIG.DATASET.TYPE = "ObjectNav-v1"
-        config.TASK_CONFIG.ENVIRONMENT.MAX_EPISODE_STEPS = 500
-        config.freeze()
-
-        if len(self.config.VIDEO_OPTION) > 0:
-            config.defrost()
-            config.TASK_CONFIG.TASK.MEASUREMENTS.append("COLLISIONS")
-            config.freeze()
-
-        logger.info(f"env config: {config}")
-        self.envs = construct_envs(config, get_env_class(config.ENV_NAME))
-        self._setup_actor_critic_agent(il_cfg, config.MODEL)
-
-        self.agent.load_state_dict(ckpt_dict["state_dict"], strict=True)    
+        # self._make_results_dir(self.config.EVAL.SPLIT)
+        
+        # self.agent.load_state_dict(ckpt_dict["state_dict"], strict=True)    
         self.policy = self.agent.model
         self.policy.eval()
 
@@ -575,31 +604,31 @@ class ILEnvTrainer(BaseRLTrainer):
 
         test_recurrent_hidden_states = torch.zeros(
             self.config.MODEL.STATE_ENCODER.num_recurrent_layers,
-            self.config.NUM_PROCESSES,
-            config.MODEL.STATE_ENCODER.hidden_size,
+            self.config.habitat_baselines.num_processes,
+            self.config.MODEL.STATE_ENCODER.hidden_size,
             device=self.device,
         )
         prev_actions = torch.zeros(
-            self.config.NUM_PROCESSES, 1, device=self.device, dtype=torch.long
+            self.config.habitat_baselines.num_processes, 1, device=self.device, dtype=torch.long
         )
         not_done_masks = torch.zeros(
-            self.config.NUM_PROCESSES, 1, device=self.device
+            self.config.habitat_baselines.num_processes, 1, device=self.device
         )
         stats_episodes: Dict[
             Any, Any
         ] = {}  # dict of dicts that stores stats per episode
-
+        
         current_episode_steps = torch.zeros(
             self.envs.num_envs, 1, device=self.device
         )
 
         rgb_frames = [
-            [] for _ in range(self.config.NUM_PROCESSES)
+            [] for _ in range(self.config.habitat_baselines.num_processes)
         ]  # type: List[List[np.ndarray]]
-        if len(self.config.VIDEO_OPTION) > 0:
-            os.makedirs(self.config.VIDEO_DIR, exist_ok=True)
+        if len(self.config.habitat_baselines.eval.video_option) > 0:
+            os.makedirs(self.config.habitat_baselines.video_dir, exist_ok=True)
 
-        number_of_eval_episodes = self.config.TEST_EPISODE_COUNT
+        number_of_eval_episodes = -1
         if number_of_eval_episodes == -1:
             number_of_eval_episodes = sum(self.envs.number_of_episodes)
         else:
@@ -611,7 +640,6 @@ class ILEnvTrainer(BaseRLTrainer):
                 )
                 logger.warn(f"Evaluating with {total_num_eps} instead.")
                 number_of_eval_episodes = total_num_eps
-
         pbar = tqdm.tqdm(total=number_of_eval_episodes)
         while (
             len(stats_episodes) < number_of_eval_episodes
@@ -622,7 +650,7 @@ class ILEnvTrainer(BaseRLTrainer):
             with torch.no_grad():
                 if self.semantic_predictor is not None:
                     batch["semantic"] = self.semantic_predictor(batch["rgb"], batch["depth"])
-                    if self.config.MODEL.SEMANTIC_ENCODER.is_thda:
+                    if self.config.MODEL.semantic_encoder.is_thda:
                         batch["semantic"] = batch["semantic"] - 1
                 (
                     logits,
@@ -643,6 +671,7 @@ class ILEnvTrainer(BaseRLTrainer):
             # in the subprocesses.
             # For backwards compatibility, we also call .item() to convert to
             # an int
+            
             step_data = [a.item() for a in actions.to(device="cpu")]
 
             outputs = self.envs.step(step_data)
@@ -692,10 +721,10 @@ class ILEnvTrainer(BaseRLTrainer):
                         )
                     ] = episode_stats
 
-                    if len(self.config.VIDEO_OPTION) > 0:
+                    if len(self.config.habitat_baselines.eval.video_option) > 0:
                         generate_video(
-                            video_option=self.config.VIDEO_OPTION,
-                            video_dir=self.config.VIDEO_DIR,
+                            video_option=self.config.habitat_baselines.eval.video_option,
+                            video_dir=self.config.habitat_baselines.video_dir,
                             images=rgb_frames[i],
                             episode_id=current_episodes[i].episode_id,
                             checkpoint_idx=checkpoint_index,
@@ -706,7 +735,7 @@ class ILEnvTrainer(BaseRLTrainer):
                         rgb_frames[i] = []
 
                 # episode continues
-                elif len(self.config.VIDEO_OPTION) > 0:
+                elif len(self.config.habitat_baselines.eval.video_option) > 0:
                     # TODO move normalization / channel changing out of the policy and undo it here
                     frame = observations_to_image(
                         {"rgb": batch["rgb"][i]}, infos[i]
@@ -744,8 +773,263 @@ class ILEnvTrainer(BaseRLTrainer):
             logger.info(f"Average episode {k}: {v:.4f}")
 
         step_id = checkpoint_index
-        if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:
-            step_id = ckpt_dict["extra_state"]["step"]
+        # if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:
+        #     step_id = ckpt_dict["extra_state"]["step"]
+
+        writer.add_scalars(
+            "eval_reward",
+            {"average reward": aggregated_stats["reward"]},
+            step_id,
+        )
+
+        metrics = {k: v for k, v in aggregated_stats.items() if k not in ["reward", "pred_reward"]}
+        if len(metrics) > 0:
+            writer.add_scalars("eval_metrics", metrics, step_id)
+
+    def _eval_checkpoint(
+        self,
+        checkpoint_path: str,
+        writer: TensorboardWriter,
+        checkpoint_index: int = 0,
+    ) -> None:
+        r"""Evaluates a single checkpoint.
+
+        Args:
+            checkpoint_path: path of checkpoint
+            writer: tensorboard writer object for logging to tensorboard
+            checkpoint_index: index of cur checkpoint for logging
+
+        Returns:
+            None
+        """
+        # Map location CPU is almost always better than mapping to a CUDA device.
+        ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu", weights_only=False)
+        step_id = 0
+        # self._make_results_dir(self.config.EVAL.SPLIT)
+
+        # if self.config.EVAL.USE_CKPT_CONFIG:
+        #     conf = ckpt_dict["config"]
+        #     config = self._setup_eval_config(ckpt_dict["config"])
+        # else:
+        #     config = self.config.clone()
+
+        # il_cfg = config.IL.BehaviorCloning
+
+        # config.defrost()
+        # config.TASK_CONFIG.DATASET.SPLIT = config.EVAL.SPLIT
+        # config.TASK_CONFIG.DATASET.TYPE = "ObjectNav-v1"
+        # config.TASK_CONFIG.ENVIRONMENT.MAX_EPISODE_STEPS = 500
+        # config.freeze()
+
+        # if len(self.config.VIDEO_OPTION) > 0:
+        #     config.defrost()
+        #     config.TASK_CONFIG.TASK.MEASUREMENTS.append("COLLISIONS")
+        #     config.freeze()
+
+        # logger.info(f"env config: {config}")
+
+        self._init_envs(self.config)
+        # il_cfg = self.config.IL.BehaviorCloning
+        il_cfg = self.config.habitat_baselines.il.BehaviorCloning ### TRIBHI!!!
+        self.device = (
+            torch.device("cuda", self.config.habitat_baselines.torch_gpu_id)
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        if not os.path.isdir(self.config.habitat_baselines.checkpoint_folder):
+            os.makedirs(self.config.habitat_baselines.checkpoint_folder)
+
+        self._setup_actor_critic_agent(il_cfg)
+
+        self.agent.load_state_dict(ckpt_dict["state_dict"], strict=True)    
+        self.policy = self.agent.model
+        self.policy.eval()
+
+        observations = self.envs.reset()
+        batch = batch_obs(observations, device=self.device)
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        current_episode_reward = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+
+        test_recurrent_hidden_states = torch.zeros(
+            self.config.MODEL.STATE_ENCODER.num_recurrent_layers,
+            self.config.habitat_baselines.num_processes,
+            self.config.MODEL.STATE_ENCODER.hidden_size,
+            device=self.device,
+        )
+        prev_actions = torch.zeros(
+            self.config.habitat_baselines.num_processes, 1, device=self.device, dtype=torch.long
+        )
+        not_done_masks = torch.zeros(
+            self.config.habitat_baselines.num_processes, 1, device=self.device
+        )
+        stats_episodes: Dict[
+            Any, Any
+        ] = {}  # dict of dicts that stores stats per episode
+        
+        current_episode_steps = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+
+        rgb_frames = [
+            [] for _ in range(self.config.habitat_baselines.num_processes)
+        ]  # type: List[List[np.ndarray]]
+        if len(self.config.habitat_baselines.eval.video_option) > 0:
+            os.makedirs(self.config.habitat_baselines.video_dir, exist_ok=True)
+
+        number_of_eval_episodes = -1
+        if number_of_eval_episodes == -1:
+            number_of_eval_episodes = sum(self.envs.number_of_episodes)
+        else:
+            total_num_eps = sum(self.envs.number_of_episodes)
+            if total_num_eps < number_of_eval_episodes:
+                logger.warn(
+                    f"Config specified {number_of_eval_episodes} eval episodes"
+                    ", dataset only has {total_num_eps}."
+                )
+                logger.warn(f"Evaluating with {total_num_eps} instead.")
+                number_of_eval_episodes = total_num_eps
+        pbar = tqdm.tqdm(total=number_of_eval_episodes)
+        while (
+            len(stats_episodes) < number_of_eval_episodes
+            and self.envs.num_envs > 0
+        ):
+            current_episodes = self.envs.current_episodes()
+
+            with torch.no_grad():
+                if self.semantic_predictor is not None:
+                    batch["semantic"] = self.semantic_predictor(batch["rgb"], batch["depth"])
+                    if self.config.MODEL.semantic_encoder.is_thda:
+                        batch["semantic"] = batch["semantic"] - 1
+                (
+                    logits,
+                    test_recurrent_hidden_states,
+                ) = self.policy(
+                    batch,
+                    test_recurrent_hidden_states,
+                    prev_actions,
+                    not_done_masks,
+                )
+                current_episode_steps += 1
+
+                actions = torch.argmax(logits, dim=1)
+                # print(f"Actions: {actions}")
+                prev_actions.copy_(actions.unsqueeze(1))  # type: ignore
+            # NB: Move actions to CPU.  If CUDA tensors are
+            # sent in to env.step(), that will create CUDA contexts
+            # in the subprocesses.
+            # For backwards compatibility, we also call .item() to convert to
+            # an int
+            actions = batch["demonstration"]
+            
+            step_data = [a.item() for a in actions.to(device="cpu")]
+            
+            print("Executing step data ", step_data)
+
+            outputs = self.envs.step(step_data)
+
+            observations, rewards_l, dones, infos = [
+                list(x) for x in zip(*outputs)
+            ]
+            batch = batch_obs(observations, device=self.device)
+            batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+            not_done_masks = torch.tensor(
+                [[0.0] if done else [1.0] for done in dones],
+                dtype=torch.float,
+                device=self.device,
+            )
+
+            rewards = torch.tensor(
+                rewards_l, dtype=torch.float, device=self.device
+            ).unsqueeze(1)
+            current_episode_reward += rewards
+            next_episodes = self.envs.current_episodes()
+            envs_to_pause = []
+            n_envs = self.envs.num_envs
+            for i in range(n_envs):
+                if (
+                    next_episodes[i].scene_id,
+                    next_episodes[i].episode_id,
+                ) in stats_episodes:
+                    envs_to_pause.append(i)
+
+                # episode ended
+                if not_done_masks[i].item() == 0:
+                    pbar.update()
+                    episode_stats = {}
+                    episode_stats["reward"] = current_episode_reward[i].item()
+                    episode_stats.update(
+                        self._extract_scalars_from_info(infos[i])
+                    )
+                    current_episode_reward[i] = 0
+                    current_episode_steps[i] = 0
+
+                    # use scene_id + episode_id as unique id for storing stats
+                    stats_episodes[
+                        (
+                            current_episodes[i].scene_id,
+                            current_episodes[i].episode_id,
+                        )
+                    ] = episode_stats
+
+                    if len(self.config.habitat_baselines.eval.video_option) > 0:
+                        generate_video(
+                            video_option=self.config.habitat_baselines.eval.video_option,
+                            video_dir=self.config.habitat_baselines.video_dir,
+                            images=rgb_frames[i],
+                            episode_id=current_episodes[i].episode_id,
+                            checkpoint_idx=checkpoint_index,
+                            metrics=self._extract_scalars_from_info(infos[i]),
+                            tb_writer=writer,
+                        )
+
+                        rgb_frames[i] = []
+
+                # episode continues
+                elif len(self.config.habitat_baselines.eval.video_option) > 0:
+                    # TODO move normalization / channel changing out of the policy and undo it here
+                    frame = observations_to_image(
+                        {"rgb": batch["rgb"][i]}, infos[i]
+                    )
+                    rgb_frames[i].append(frame)
+
+            (
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                prev_actions,
+                batch,
+                rgb_frames,
+            ) = self._pause_envs(
+                envs_to_pause,
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                prev_actions,
+                batch,
+                rgb_frames,
+            )
+            step_id+=1
+
+        num_episodes = len(stats_episodes)
+        aggregated_stats = {}
+        for stat_key in next(iter(stats_episodes.values())).keys():
+            aggregated_stats[stat_key] = (
+                sum(v[stat_key] for v in stats_episodes.values())
+                / num_episodes
+            )
+
+        for k, v in aggregated_stats.items():
+            logger.info(f"Average episode {k}: {v:.4f}")
+
+        # step_id = checkpoint_index
+        # if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:
+        #     step_id = ckpt_dict["extra_state"]["step"]
 
         writer.add_scalars(
             "eval_reward",

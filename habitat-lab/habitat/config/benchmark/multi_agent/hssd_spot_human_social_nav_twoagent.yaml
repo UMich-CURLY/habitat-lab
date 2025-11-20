@@ -1,0 +1,129 @@
+# @package _global_
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/task: task_config_base
+  # Config agent sensors
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.agent_0: spot_agent
+  - /habitat/simulator/agents@habitat.simulator.agents.agent_0: spot
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.agent_1: rgbd_head_agent
+  - /habitat/simulator/agents@habitat.simulator.agents.agent_1: human
+  # Config agent hssd data
+  - /habitat/dataset/rearrangement: hssd
+  # Config agent action
+  - /habitat/task/actions@habitat.task.actions.agent_0_base_velocity: base_velocity_non_cylinder
+  - /habitat/task/actions@habitat.task.actions.agent_1_base_velocity: base_velocity
+  - /habitat/task/actions@habitat.task.actions.agent_1_rearrange_stop: rearrange_stop
+  - /habitat/task/actions@habitat.task.actions.agent_1_pddl_apply_action: pddl_apply_action
+  # - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_action: oracle_nav_action
+  - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_randcoord_action: oracle_nav_action
+  # Config agent sensor
+  - /habitat/task/measurements:
+    - articulated_agent_force
+    - articulated_agent_colls
+    - num_steps
+    - did_agents_collide
+    - num_agents_collide
+    - force_terminate
+    - social_nav_reward
+    - rot_dist_to_goal
+    - dist_to_goal
+    - nav_to_pos_succ
+    - social_dist_to_goal
+    - social_nav_seek_success
+    - social_nav_stats
+    - social_nav_to_pos_succ
+    
+  - /habitat/task/lab_sensors:
+    - relative_resting_pos_sensor
+    - localization_sensor
+    - other_agent_gps
+    - humanoid_detector_sensor
+    - has_finished_oracle_nav
+  - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_0_goal_to_agent_gps_compass: nav_goal_sensor
+  - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_0_spot_head_stereo_depth_sensor: spot_head_stereo_depth_sensor
+  - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_1_agents_within_threshold: agents_within_threshold
+  - _self_
+
+# This yaml is a variant of the Spot-human social-nav benchmark focused on two-agent
+# social navigation only (collision avoidance and reaching a navigation goal).
+# Objects and object-manipulation observations are removed.
+
+habitat:
+  task:
+    # Use the new minimal TwoAgentSocialNavTask that doesn't bind PDDL/problems
+    type: TwoAgentSocialNavTask-v0
+    min_start_distance: 0.0
+    reward_measure: social_nav_reward
+    success_measure: social_nav_to_pos_success
+    success_reward: 10.0
+    slack_reward: -0.1
+    end_on_success: True
+    min_distance_start_agents: 0.0
+    constraint_violation_ends_episode: False
+    constraint_violation_drops_object: False
+
+    measurements:
+      force_terminate:
+        max_accum_force: -1
+        max_instant_force: -1
+      social_nav_reward:
+        count_coll_pen: 0.01
+        max_count_colls: -1
+        count_coll_end_pen: 5.0
+        safe_dis_min: 0.2
+
+    actions:
+      agent_0_base_velocity:
+        lin_speed: 40.0
+        allow_dyn_slide: True
+        collision_threshold: 1e-5
+        navmesh_offset: [[0.0, 0.0], [0.225, 0.0]]
+        enable_lateral_move: False
+        longitudinal_lin_speed: 10.0
+        lateral_lin_speed: 5.0
+        ang_speed: 10.0
+        enable_rotation_check_for_dyn_slide: False
+
+      agent_1_oracle_nav_randcoord_action:
+        type: OracleNavRandCoordAction
+        motion_control: human_joints
+        lin_speed: 10.0
+        ang_speed: 10.0
+
+    robot_at_thresh: 3.0
+
+  gym:
+    # Remove object-related keys so the policy only receives social-nav observations
+    obs_keys:
+      - agent_0_spot_head_stereo_depth_sensor
+      - agent_0_humanoid_detector_sensor
+      - agent_1_head_depth
+      - agent_1_relative_resting_position
+      - agent_1_localization_sensor
+      - agent_1_has_finished_oracle_nav
+      - agent_1_other_agent_gps
+
+  environment:
+    max_episode_steps: 750
+
+  simulator:
+    type: RearrangeSim-v0
+    seed: 100
+    concur_render: True
+    auto_sleep: True
+    agents_order:
+      - agent_0
+      - agent_1
+    agents:
+      agent_0:
+        joint_start_noise: 0.0
+    kinematic_mode: True
+    ac_freq_ratio: 1
+    step_physics: False
+
+    habitat_sim_v0:
+      allow_sliding: True
+      enable_physics: True
+  dataset:
+    data_path: /habitat-lab/data/social_nav_episode_0415_570.json.gz

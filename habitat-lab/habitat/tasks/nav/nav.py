@@ -837,6 +837,26 @@ class TopDownMap(Measure):
                 maps.MAP_SHORTEST_PATH_COLOR,
                 self.line_thickness,
             )
+    def _draw_reference_path(
+        self, episode: NavigationEpisode, agent_position: AgentState
+    ):
+        path_points = []
+        for i in range(len(episode.reference_replay)):
+            p = episode.reference_replay[i]["agent_state"]["position"]
+            points_2d = maps.to_grid(
+                    p[2],
+                    p[0],
+                    (self._top_down_map.shape[0], self._top_down_map.shape[1]),
+                    sim=self._sim,
+                )
+            path_points.append(points_2d)
+
+        maps.draw_path(
+            self._top_down_map,
+            path_points,
+            8,
+            self.line_thickness,
+        )
 
     def _is_on_same_floor(
         self, height, ref_floor_height=None, ceiling_height=2.0
@@ -859,6 +879,10 @@ class TopDownMap(Measure):
             self._draw_goals_aabb(episode)
             self._draw_goals_positions(episode)
             self._draw_shortest_path(episode, agent_position)
+        
+        if hasattr(episode, "reference_replay"):
+            self._draw_reference_path(episode, agent_position)
+
 
         if self._config.draw_source:
             self._draw_point(

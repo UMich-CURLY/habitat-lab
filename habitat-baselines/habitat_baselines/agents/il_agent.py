@@ -77,7 +77,6 @@ class ILAgent(nn.Module):
 
             T, N, _ = actions_batch.shape
             logits = logits.view(T, N, -1)
-
             action_loss = cross_entropy_loss(logits.permute(0, 2, 1), actions_batch.squeeze(-1).long())
 
             self.optimizer.zero_grad()

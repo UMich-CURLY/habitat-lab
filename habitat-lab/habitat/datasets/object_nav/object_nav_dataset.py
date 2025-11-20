@@ -24,8 +24,8 @@ from habitat.tasks.nav.object_nav_task import (
 from IPython import embed
 if TYPE_CHECKING:
     from omegaconf import DictConfig
-
-
+import numpy as np
+from math import atan2, cos, sin
 @registry.register_dataset(name="ObjectNav-v1")
 class ObjectNavDatasetV1(PointNavDatasetV1):
     r"""Class inherited from PointNavDataset that loads Object Navigation dataset."""
@@ -139,11 +139,43 @@ class ObjectNavDatasetV1(PointNavDatasetV1):
                 episode.scene_id = os.path.join(scenes_dir, episode.scene_id)
             try:
                 episode.goals = self.goals_by_category[episode.goals_key]
+                print("Valid goals key:", episode.goals_key)
+                
+                # if (episode.goals_key != "sT4fr6TAbpF.glb_tv_monitor"):
+                #     continue
             except:
                 print("Episode goals key:", episode.goals_key)
                 continue
-                embed()
+            # --- inputs ---
+            ref_pos   = np.array(episode.reference_replay[0]['agent_state']['position'], dtype=np.float32)   # world
+            start_pos = np.array(episode.start_position, dtype=np.float32)                                   # world
 
+            # direction from start to reference, projected onto XZ (ignore vertical)
+            d = ref_pos - start_pos
+            d[1] = 0.0
+            norm = np.linalg.norm(d)
+            if norm < 1e-8:
+                # Positions coincide (or nearly) -> keep existing rotation
+                desired_xyzw = episode.start_rotation
+            else:
+                d /= norm  # unit heading in world: [dx, 0, dz]
+
+                # We want R_yaw to send local forward (0,0,-1) to d = [dx, 0, dz]
+                # Under yaw ψ about +Y, forward becomes (sinψ, 0, -cosψ),
+                # so: dx = sinψ, dz = -cosψ  ->  ψ = atan2(dx, -dz)
+                psi = atan2(d[0], -d[2])
+
+                # Quaternion for rotation about +Y by ψ:
+                # [w,x,y,z] = [cos(ψ/2), 0, sin(ψ/2), 0]
+                w = cos(psi * 0.5)
+                y = sin(psi * 0.5)
+
+                # Habitat commonly stores quats as [x,y,z,w]
+                desired_xyzw = [0.0, y, 0.0, w]
+
+            # Apply to episode/agent as needed:
+            episode.start_rotation = desired_xyzw
+            # or if setting a live agent state: sim.agents[0].state.rotation = desired_xyzw
             if episode.shortest_paths is not None:
                 for path in episode.shortest_paths:
                     for p_index, point in enumerate(path):
@@ -157,5 +189,6 @@ class ObjectNavDatasetV1(PointNavDatasetV1):
                             path[p_index] = ShortestPathPoint(**point)
                         except:
                             print("Shortest path issue, dont think it matters")
-
+            
             self.episodes.append(episode)  # type: ignore [attr-defined]
+            # break
