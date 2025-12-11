@@ -58,6 +58,7 @@ from habitat_sim.nav import NavMeshSettings
 from habitat_sim.physics import CollisionGroups, JointMotorSettings, MotionType
 from habitat_sim.sim import SimulatorBackend
 from habitat_sim.utils.common import quat_from_magnum
+from habitat.utils.visualizations import maps
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -577,6 +578,33 @@ class RearrangeSim(HabitatSim):
         ), f"The snap position is NaN. scene_id: {self.ep_info.scene_id}, new position: {new_pos}, original position: {pos}"
 
         return new_pos
+
+    def pixel_to_world_coordinate(
+        self, pixel_x: int, pixel_y: int, grid_resolution: Tuple[int, int]
+    ) -> np.ndarray:
+        """
+        Convert pixel coordinates from top_down_map to world frame coordinates.
+
+        Args:
+            pixel_x: Column coordinate (x direction) in the top_down_map
+            pixel_y: Row coordinate (y direction) in the top_down_map
+            grid_resolution: (height, width) of the top_down_map
+
+        Returns:
+            world_pos_3d: numpy array [x, y, z] representing 3D coordinates in world frame.
+                         Note: realworld_x from from_grid corresponds to z-axis,
+                         realworld_y corresponds to x-axis in world frame.
+        """
+        realworld_x, realworld_y = maps.from_grid(
+            grid_x=pixel_x,
+            grid_y=pixel_y,
+            grid_resolution=grid_resolution,
+            pathfinder=self.pathfinder,
+        )
+
+        # Return 3D coordinate [x, y, z]
+        # Note: realworld_x -> z axis, realworld_y -> x axis
+        return np.array([realworld_y, 0.0, realworld_x], dtype=np.float32)
 
     @add_perf_timing_func()
     def _add_objs(

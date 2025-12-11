@@ -54,6 +54,7 @@ defaults:
     - humanoid_joint_sensor
     - humanoid_detector_sensor
     - has_finished_oracle_nav
+    - imagegoal_sensor
   - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_0_goal_to_agent_gps_compass: nav_goal_sensor
   - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_1_agents_within_threshold: agents_within_threshold
   - _self_
@@ -197,8 +198,8 @@ habitat:
       agent_1:
         sim_sensors:
           third_rgb_sensor:
-            height: 512
-            width: 512
+            height: 128
+            width: 128
           head_rgb_sensor:
             height: 512
             width: 512

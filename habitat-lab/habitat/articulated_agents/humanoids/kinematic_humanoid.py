@@ -205,7 +205,7 @@ class KinematicHumanoid(MobileManipulator):
                         door_start = self._sim.ep_info.info['door_start']
                         door_end = self._sim.ep_info.info['door_end']
                         door_middle_3d = (np.array(door_start)+np.array(door_end))/2
-                        pos = mn.Vector3(door_middle_3d[0], 2.0, door_middle_3d[2])
+                        pos = mn.Vector3(door_middle_3d[0], 20.0, door_middle_3d[2])
                         ori = mn.Vector3(-1.57,0.,0.)
                         Mt = mn.Matrix4.translation(pos)
                         Mz = mn.Matrix4.rotation_z(mn.Rad(ori[2]))

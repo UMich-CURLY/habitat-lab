@@ -6,15 +6,17 @@
 
 
 from collections import defaultdict, deque
+from typing import Any, Optional
 
 import numpy as np
 from gym import spaces
+from omegaconf import DictConfig
 
 from habitat.articulated_agents.humanoids import KinematicHumanoid
 from habitat.core.embodied_task import Measure
 from habitat.core.registry import registry
-from habitat.core.simulator import Sensor, SensorTypes
-from habitat.tasks.nav.nav import PointGoalSensor
+from habitat.core.simulator import RGBSensor, Sensor, SensorTypes, Simulator
+from habitat.tasks.nav.nav import NavigationEpisode, PointGoalSensor
 from habitat.tasks.rearrange.rearrange_sim import RearrangeSim
 from habitat.tasks.rearrange.utils import (
     CollisionDetails,
@@ -26,7 +28,9 @@ from habitat.tasks.rearrange.utils import (
     rearrange_logger,
 )
 from habitat.tasks.utils import cartesian_to_polar
-
+import magnum as mn
+from IPython import embed
+from habitat_sim.utils.common import orthonormalize_rotation_shear
 
 class MultiObjSensor(PointGoalSensor):
     """
@@ -175,6 +179,170 @@ class AbsTargetStartSensor(MultiObjSensor):
         pos = self._sim.get_target_objs_start()
         return pos.reshape(-1)
 
+@registry.register_sensor
+class ImageGoalSensor(Sensor):
+    r"""Sensor for ImageGoal observations which are used in ImageGoal Navigation.
+
+    RGBSensor needs to be one of the Simulator sensors.
+    This sensor return the rgb image taken from the goal position to reach with
+    random rotation.
+
+    Args:
+        sim: reference to the simulator for calculating task observations.
+        config: config for the ImageGoal sensor.
+    """
+    cls_uuid: str = "full_top_down"
+
+    def __init__(
+        self, *args: Any, sim: Simulator, config: "DictConfig", **kwargs: Any
+    ):
+        self._sim = sim
+        sensors = self._sim.sensor_suite.sensors
+        rgb_sensor_uuids = [
+            uuid
+            for uuid, sensor in sensors.items()
+            if isinstance(sensor, RGBSensor)
+        ]
+        # embed()
+        
+        # Handle multiple RGB sensors (e.g., in multi-agent scenarios)
+        # Prefer third_rgb_sensor for topdown view, otherwise use the first one
+        if len(rgb_sensor_uuids) == 0:
+            raise ValueError(
+                f"ImageGoalNav requires at least one RGB sensor, none detected"
+            )
+        elif len(rgb_sensor_uuids) == 1:
+            self._rgb_sensor_uuid = rgb_sensor_uuids[2]
+        else:
+            # Multiple RGB sensors found - use rgb_sensor_uuids[0] (agent_0_third_rgb) for topdown view
+            # This is explicitly set to use the first sensor in the list
+            self._rgb_sensor_uuid = rgb_sensor_uuids[2]
+            print(f"Multiple RGB sensors detected ({len(rgb_sensor_uuids)}). Using {self._rgb_sensor_uuid} (rgb_sensor_uuids[0]) for topdown view.")
+        self._current_episode_id: Optional[str] = None
+        self._current_image_goal = None
+        # embed()
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.COLOR
+
+    def _get_observation_space(self, *args: Any, **kwargs: Any):
+        return self._sim.sensor_suite.observation_spaces.spaces[
+            self._rgb_sensor_uuid
+        ]
+
+    def _get_pointnav_episode_image_goal(self, episode: NavigationEpisode):
+        # # Original code: use goal position from episode
+        # # goal_position = np.array(episode.goals[0].position, dtype=np.float32)
+        # # embed()
+        # # # to be sure that the rotation is the same for the same episode_id
+        # # # since the task is currently using pointnav Dataset.
+        # # seed = abs(hash(episode.episode_id)) % (2**32)
+        # # rng = np.random.RandomState(seed)
+        # # angle = rng.uniform(0, 2 * np.pi)
+        # # source_rotation = [0, np.sin(angle / 2), 0, np.cos(angle / 2)]
+        
+        # # NEW: Fixed position for topdown view: [x=4, y=2.79, z=-7]
+        # # Based on bounds: lower_bound=[-10.24, 0, -16.28], upper_bound=[14.38, 2.8, 1.58]
+        # # Position [4, 2.79, -7] is within bounds (y接近上限2.8，提供足够高度)
+        # fixed_position = np.array([-1.0117, 30 , -12.1064], dtype=np.float32)
+        # p1 = [-1.0117, 30 , -12.1064]
+        # p2 = [-1.0117, 30 , -13.1064]
+        # agent_node = self._sim._default_agent.scene_node
+        # inv_T = agent_node.transformation.inverted()
+        # door_middle_3d = (np.array(p1)+np.array(p2))/2
+        # pos = mn.Vector3(door_middle_3d[0], 20.0, door_middle_3d[2])
+        # ori = mn.Vector3(-1.57,0.,0.)
+        # Mt = mn.Matrix4.translation(pos)
+        # Mz = mn.Matrix4.rotation_z(mn.Rad(ori[2]))
+        # My = mn.Matrix4.rotation_y(mn.Rad(ori[1]))
+        # Mx = mn.Matrix4.rotation_x(mn.Rad(ori[0]))
+        # cam_transform = Mt @ Mz @ My @ Mx
+        # cam_transform = inv_T @ cam_transform
+        # a = self._sim.get_agent(0)
+        # cam = a._sensors['agent_1_third_rgb']
+        # # embed()
+        # cam.node.transformation = (
+        #                     orthonormalize_rotation_shear(cam_transform)
+        #                 )
+        # yaw   = 0     # 左右转
+        # pitch = 0    # 低头/抬头
+        # roll  = 0   # 歪头
+        
+        # # Convert degrees to radians
+        # yaw_rad   = np.radians(yaw)
+        # pitch_rad = np.radians(pitch)
+        # roll_rad  = np.radians(roll)
+        
+        # # Half angles for quaternion conversion
+        # cy = np.cos(yaw_rad   * 0.5)
+        # sy = np.sin(yaw_rad   * 0.5)
+        # cp = np.cos(pitch_rad * 0.5)
+        # sp = np.sin(pitch_rad * 0.5)
+        # cr = np.cos(roll_rad  * 0.5)
+        # sr = np.sin(roll_rad  * 0.5)
+        
+        # # Euler to quaternion conversion (ZYX order: roll, pitch, yaw)
+        # qx = sr * cp * cy - cr * sp * sy
+        # qy = cr * sp * cy + sr * cp * sy
+        # qz = cr * cp * sy - sr * sp * cy
+        # qw = cr * cp * cy + sr * sp * sy
+        
+        # # Normalize quaternion to ensure unit length
+        # quat_norm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        # if quat_norm > 1e-6:  # Avoid division by zero
+        #     qx = qx / quat_norm
+        #     qy = qy / quat_norm
+        #     qz = qz / quat_norm
+        #     qw = qw / quat_norm
+        
+        # source_rotation = [qx, qy, qz, qw]
+
+
+
+        # theta = np.radians(-45)
+        # source_rotation = [np.sin(theta/2), 0, 0, np.cos(theta/2)]
+
+        # source_rotation = [0, 0, 0, 1]
+        # agent_node = self._sim._default_agent.scene_node
+        # inv_T = agent_node.transformation.inverted()
+        # ori = mn.Vector3(-1.57,0.,0.)
+        # Mt = mn.Matrix4.translation(fixed_position)
+        # Mz = mn.Matrix4.rotation_z(mn.Rad(ori[2]))
+        # My = mn.Matrix4.rotation_y(mn.Rad(ori[1]))
+        # Mx = mn.Matrix4.rotation_x(mn.Rad(ori[0]))
+        # cam_transform = Mt @ Mz @ My @ Mx
+        # cam_transform = inv_T @ cam_transform
+        
+        # goal_observation = self._sim.get_observations_at(
+        #     # position=goal_position.tolist(), rotation=source_rotation
+        #     position=fixed_position.tolist(), rotation=source_rotation
+        # )
+        goal_observation = self._sim.get_sensor_observations()
+        return goal_observation[self._rgb_sensor_uuid]
+
+    def get_observation(
+        self,
+        *args: Any,
+        observations,
+        episode: NavigationEpisode,
+        **kwargs: Any,
+    ):
+        # episode_uniq_id = f"{episode.scene_id} {episode.episode_id}"
+        # if episode_uniq_id == self._current_episode_id:
+        #     return self._current_image_goal
+
+        # self._current_image_goal = self._get_pointnav_episode_image_goal(
+        #     episode
+        # )
+        # self._current_episode_id = episode_uniq_id
+
+        return self._get_pointnav_episode_image_goal(episode)
+
+
 
 @registry.register_sensor
 class GoalSensor(UsesArticulatedAgentInterface, MultiObjSensor):
@@ -189,7 +357,7 @@ class GoalSensor(UsesArticulatedAgentInterface, MultiObjSensor):
             self.agent_id
         ).articulated_agent.ee_transform()
         T_inv = global_T.inverted()
-
+        # embed()
         _, pos = self._sim.get_targets()
         return batch_transform_point(pos, T_inv, np.float32).reshape(-1)
 
