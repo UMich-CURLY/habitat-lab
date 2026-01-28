@@ -1,0 +1,42 @@
+# Minimal PDDL problem for two-agent social navigation.
+# Goal: both robot_0 and robot_1 reach their respective target positions.
+# This problem is intentionally small: it assumes the domain (e.g., 'fp')
+# defines navigation actions (nav_to_obj / nav_to_goal) that map to the
+# existing navigation subtasks (NavToObjTask-v0).
+
+objects:
+  - name: robot_0
+    expr_type: robot_entity_type
+  - name: robot_1
+    expr_type: robot_entity_type
+  # Targets are named generically; PddlProblem will bind TARGET_* names to
+  # simulator target indices (see PddlProblem.target_ids mapping).
+  - name: TARGET_robot_0_goal
+    expr_type: goal_entity_type
+  - name: TARGET_robot_1_goal
+    expr_type: goal_entity_type
+
+goal:
+  expr_type: AND
+  sub_exprs:
+    - robot_at(TARGET_robot_0_goal, robot_0)
+    - robot_at(TARGET_robot_1_goal, robot_1)
+
+stage_goals:
+  stage_1:
+    expr_type: AND
+    sub_exprs:
+      - robot_at(TARGET_robot_0_goal, robot_0)
+  stage_2:
+    expr_type: AND
+    sub_exprs:
+      - robot_at(TARGET_robot_1_goal, robot_1)
+
+
+# Optional: provide a canonical solution sequence. This is one possible
+# ordering of the navigation actions; the planner may choose a different
+# ordering when solving. Keep the solution here for reproducibility and to
+# support code paths that expect a concrete solution list.
+solution:
+  - nav_to_obj(TARGET_robot_0_goal, robot_0)
+  - nav_to_obj(TARGET_robot_1_goal, robot_1)

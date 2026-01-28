@@ -18,7 +18,10 @@ def find_action_range(
 
     start_idx = 0
     found = False
-    end_idx = get_num_actions(action_space[search_key])
+    try:
+        end_idx = get_num_actions(action_space[search_key])
+    except KeyError:
+        import pdb; pdb.set_trace()
     for k in action_space:
         if k == search_key:
             found = True

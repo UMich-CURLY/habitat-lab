@@ -8,7 +8,8 @@ import inspect
 import os.path as osp
 from typing import Optional
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+from omegaconf import open_dict
 
 from habitat.config.default import get_config as _habitat_get_config
 from habitat.config.default_structured_configs import register_hydra_plugin
@@ -39,5 +40,34 @@ def get_config(
     """
     register_hydra_plugin(HabitatBaselinesConfigPlugin)
     cfg = _habitat_get_config(config_path, overrides, configs_dir)
+    # Some config files live in a group (e.g. "social_nav/social_nav_twoagent")
+    # and their YAML may place keys under a top-level mapping named after
+    # the group (e.g. `social_nav:`). That results in Hydra composing the
+    # file under `cfg.social_nav.*` which can surprise code that expects
+    # `cfg.habitat_baselines` at the job top-level. To be permissive and
+    # match the behavior of other configs in this repo, if the composed
+    # config contains a single group node matching the group name and that
+    # node contains `habitat_baselines`, promote it to the top-level so
+    # callers can access `cfg.habitat_baselines` directly.
+    try:
+        # Extract group name if config_path is like 'group/name'
+        group_name = config_path.split(
+            "," if "," in config_path else "/"
+        )[0]
+    except Exception:
+        group_name = None
+
+    if group_name and isinstance(cfg, DictConfig):
+        # Only promote if habitat_baselines does not already exist top-level
+        if "habitat_baselines" not in cfg and group_name in cfg:
+            try:
+                inner = cfg[group_name]
+                if inner is not None and "habitat_baselines" in inner:
+                    # Temporarily allow writing new keys on the structured cfg
+                    with open_dict(cfg):
+                        cfg["habitat_baselines"] = inner["habitat_baselines"]
+            except Exception:
+                # Be conservative: if anything goes wrong, leave cfg as-is
+                pass
 
     return cfg

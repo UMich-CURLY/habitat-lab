@@ -34,8 +34,10 @@ def main(cfg: "DictConfig"):
     cfg = patch_config(cfg)
     OmegaConf.set_struct(cfg, False)
     OmegaConf.set_readonly(cfg, False)
-    if not "habitat_baselines" in cfg:
+    if not "habitat_baselines" in cfg and "objectnav" in cfg:
         cfg.habitat_baselines = cfg.objectnav.habitat_baselines   # For backwards compatibility with objectnav configs, TRIBHIs!!!
+    if not "habitat_baselines" in cfg and "social_nav" in cfg:
+        cfg.habitat_baselines = cfg.social_nav.habitat_baselines   # For backwards compatibility with social_nav configs, TRIBHIs!!!
     execute_exp(cfg, "eval" if cfg.habitat_baselines.evaluate else "train")
 
 

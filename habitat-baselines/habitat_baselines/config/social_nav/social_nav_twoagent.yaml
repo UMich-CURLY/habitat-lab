@@ -15,6 +15,14 @@ defaults:
   - /habitat_baselines/rl/policy@habitat_baselines.rl.policy.agent_0: monolithic
   - /habitat_baselines/rl/policy@habitat_baselines.rl.policy.agent_1: hl_fixed
   - /habitat_baselines/rl/policy/hierarchical_policy/defined_skills@habitat_baselines.rl.policy.agent_1.hierarchical_policy.defined_skills: oracle_skills_human_multi_agent
+  # Ensure the task composes the special pddl_apply_action so skills can
+  # write postconditions into the action vector. This maps the structured
+  # node into the task actions for each agent.
+  - /habitat/task/actions@habitat.task.actions.agent_0_pddl_apply_action: pddl_apply_action
+  - /habitat/task/actions@habitat.task.actions.agent_1_pddl_apply_action: pddl_apply_action
+  # Ensure the oracle navigation action is available for both agents.
+  # - /habitat/task/actions@habitat.task.actions.agent_0_oracle_nav_action: oracle_nav_action
+  # - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_action: oracle_nav_action
   - _self_
 
 hydra:
@@ -29,11 +37,11 @@ habitat_baselines:
   torch_gpu_id: 0
   video_fps: 30
   eval_ckpt_path_dir: "data/checkpoints/latest.pth"
-  num_environments: 12
-  num_updates: -1
-  total_num_steps: 5.0e7
+  num_environments: 1
+  num_updates: 0
+  total_num_steps: -1
   log_interval: 10
-  num_checkpoints: 100
+  num_checkpoints: 1
   force_torch_single_threaded: True
   eval_keys_to_include_in_name: ['pddl_success']
   load_resume_state_config: False
@@ -74,23 +82,13 @@ habitat_baselines:
             add_arm_rest: False
             policy_input_keys:
               - "head_depth"
-              - "is_holding"
-              - "obj_start_gps_compass"
-              - "obj_goal_gps_compass"
               - "other_agent_gps"
-              - "obj_start_sensor"
-              - "obj_goal_sensor"
             allowed_actions:
               - nav_to_goal
-              - nav_to_obj
-              - pick
-              - place
-              - nav_to_receptacle_by_name
           # Override to use the oracle navigation skill (which will actually execute navigation).
           defined_skills:
             nav_to_randcoord:
-              skill_name: "OracleNavCoordPolicy"
-              obs_skill_inputs: ["obj_start_sensor", "abs_obj_start_sensor", "obj_goal_sensor", "abs_obj_goal_sensor"]
+              skill_name: "OracleNavPolicy"
               max_skill_steps: 1500
               ignore_grip: True
     ppo:

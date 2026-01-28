@@ -47,10 +47,12 @@ class OracleNavPolicy(NnSkillPolicy):
             filtered_action_space,
             batch_size,
         )
-
-        self._oracle_nav_ac_idx, _ = find_action_range(
-            action_space, "oracle_nav_action"
-        )
+        try:
+            self._oracle_nav_ac_idx, _ = find_action_range(
+                action_space, "oracle_nav_action"
+            )
+        except KeyError:
+            import pdb; pdb.set_trace()
 
     def set_pddl_problem(self, pddl_prob):
         super().set_pddl_problem(pddl_prob)
@@ -80,9 +82,18 @@ class OracleNavPolicy(NnSkillPolicy):
     def from_config(
         cls, config, observation_space, action_space, batch_size, full_config
     ):
-        filtered_action_space = ActionSpace(
-            {config.action_name: action_space[config.action_name]}
-        )
+        try:
+            filtered_action_space = ActionSpace(
+                {config.action_name: action_space[config.action_name]}
+            )
+        except KeyError as e:
+            try:
+                filtered_action_space = ActionSpace(
+                    {config.action_name: action_space["oracle_nav_action"][config.action_name]}
+                )
+            except KeyError:
+                import pdb; pdb.set_trace()
+           
         baselines_logger.debug(
             f"Loaded action space {filtered_action_space} for skill {config.skill_name}"
         )

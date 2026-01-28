@@ -21,7 +21,7 @@ from habitat.tasks.nav.nav import (
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from typing import TYPE_CHECKING, Union, cast
 
-import utils
+# import utils
 try:
     from habitat.datasets.object_nav.object_nav_dataset import (
         ObjectNavDatasetV1,

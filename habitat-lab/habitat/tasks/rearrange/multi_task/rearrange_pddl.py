@@ -224,7 +224,34 @@ class PddlSimInfo:
         if self.check_type_matches(
             entity, SimulatorObjectType.GOAL_ENTITY.value
         ):
-            idx = self.target_ids[ename]
+            # Typical case: the goal entity corresponds to a simulator target
+            # registered in `self.target_ids` (from sim.get_targets()).
+            # For some social-nav style episodes there may be no scene
+            # rearrange targets; instead the episode contains per-agent
+            # goal coordinates (e.g. episode.info['robot_goal']). In that
+            # case, fall back to episode.info to obtain the goal position
+            # rather than raising a KeyError.
+            try:
+                idx = self.target_ids[ename]
+            except KeyError:
+                # Fallback heuristics for common social-nav target names.
+                # If the PDDL name includes 'robot_0' use episode.info['robot_goal'].
+                # If it includes 'robot_1' treat it as the human and use
+                # episode.info['human_goal'] (or human_start as fallback).
+                if "robot_0" in ename:
+                    pos = self.episode.info.get(
+                        "robot_goal", self.episode.start_position
+                    )
+                    return np.array(pos)
+                if "robot_1" in ename:
+                    pos = self.episode.info.get(
+                        "human_goal", self.episode.info.get("human_start")
+                    )
+                    return np.array(pos)
+                # As a last resort, if no mapping exists, raise the original
+                # KeyError to preserve prior behavior for unexpected cases.
+                raise
+
             targ_idxs, pos_targs = self.sim.get_targets()
             rel_idx = targ_idxs.tolist().index(idx)
             return pos_targs[rel_idx]
@@ -266,7 +293,16 @@ class PddlSimInfo:
         elif self.check_type_matches(
             entity, SimulatorObjectType.GOAL_ENTITY.value
         ):
-            return self.target_ids[ename]
+            # If the target mapping exists (typical rearrange task), return
+            # the simulator target index. For social-nav episodes there may
+            # be no simulator targets registered; don't raise here — some
+            # PDDL entities represent goals defined in episode.info and
+            # will be handled by `get_entity_pos` fallback logic.
+            if ename in self.target_ids:
+                return self.target_ids[ename]
+            # Return the entity name (string) as a harmless placeholder so
+            # callers that only want existence don't fail with KeyError.
+            return ename
         elif self.check_type_matches(
             entity, SimulatorObjectType.MOVABLE_ENTITY.value
         ):

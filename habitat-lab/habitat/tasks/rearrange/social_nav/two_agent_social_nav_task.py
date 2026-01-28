@@ -4,77 +4,49 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import copy
 import numpy as np
-from collections import OrderedDict
 from typing import Optional, Any
 
 from habitat.core.dataset import Episode
 from habitat.core.registry import registry
-from habitat.core.simulator import Sensor, SensorSuite
-from habitat.tasks.nav.nav import NavigationTask
+from habitat.tasks.rearrange.multi_task.pddl_task import PddlTask
+
 from habitat.tasks.rearrange.sub_tasks.nav_to_obj_task import (
     NavToInfo,
     MyNavToInfo,
 )
-from habitat.tasks.rearrange.utils import UsesArticulatedAgentInterface
 
 
 @registry.register_task(name="TwoAgentSocialNavTask-v0")
-class TwoAgentSocialNavTask(NavigationTask):
+class TwoAgentSocialNavTask(PddlTask):
     """
     Minimal two-agent social navigation task.
 
     This task places two articulated agents (agent_0 robot, agent_1 human)
     according to the episode's start positions and exposes a navigation
-    goal for each agent from episode.info (robot_goal / human_goal). It
-    purposefully avoids PDDL/problem binding and object manipulation.
+    goal for each agent from episode.info (robot_goal / human_goal).
     """
 
     _nav_to_info: Optional[NavToInfo]
     my_nav_to_info: Optional[MyNavToInfo]
 
-    def _duplicate_sensor_suite(self, sensor_suite: SensorSuite) -> None:
-        """
-        Duplicate articulated-agent sensors between agents so that each
-        articulated agent has its own sensor instance in the task sensor
-        suite. Adapted from RearrangeTask._duplicate_sensor_suite.
-        """
-
-        task_new_sensors: dict = {}
-        task_obs_spaces = OrderedDict()
-        for agent_idx, agent_id in enumerate(self._sim.agents_mgr.agent_names):
-            for sensor_name, sensor in sensor_suite.sensors.items():
-                if isinstance(sensor, UsesArticulatedAgentInterface):
-                    new_sensor = copy.copy(sensor)
-                    new_sensor.agent_id = agent_idx
-                    full_name = f"{agent_id}_{sensor_name}"
-                    task_new_sensors[full_name] = new_sensor
-                    task_obs_spaces[full_name] = new_sensor.observation_space
-                else:
-                    task_new_sensors[sensor_name] = sensor
-                    task_obs_spaces[sensor_name] = sensor.observation_space
-
-        sensor_suite.sensors = task_new_sensors
-        sensor_suite.observation_spaces = SensorSuite(
-            list(task_new_sensors.values())
-        ).observation_spaces
-
     def __init__(self, config: Any, sim, dataset=None):
-        # Call NavigationTask initializer (this creates sensor_suite, actions, etc.)
+        # Call PddlTask initializer 
         super().__init__(config=config, sim=sim, dataset=dataset)
-
-        # If there are multiple articulated agents, duplicate per-agent sensors
-        try:
-            if len(self._sim.agents_mgr) > 1:
-                self._duplicate_sensor_suite(self.sensor_suite)
-        except Exception:
-            # Be conservative: if agents_mgr is not present or duplication fails,
-            # continue without duplication.
-            pass
-
+        
         self._min_start_distance = getattr(config, "min_start_distance", 0.0)
         self._nav_to_info = None
+        print("task.actions keys:", list(self.actions.keys()))
+        # Inspect PDDL problem and actions
+        pddl_prob = self.pddl_problem  # or task._pddl_problem depending on your Task impl
+        print("Available PDDL actions:", list(pddl_prob.actions.keys()))
+        # Examine the post-conditions for a named action (e.g., 'nav' or 'nav_to_receptacle_by_name')
+        # for a_name, a_obj in pddl_prob.actions.items():
+        #     print("Action:", a_name)
+        #     print("  preconds:", [p.compact_str for p in a_obj.pre_cond])
+        #     print("  postconds:", [p.compact_str for p in a_obj.post_cond])
+        #     print("  n_args:", a_obj.n_args)
+        
 
     def _generate_nav_start_goal(self, episode, agent_idx, force_idx=None) -> NavToInfo:
         """
@@ -90,7 +62,6 @@ class TwoAgentSocialNavTask(NavigationTask):
             try:
                 articulated_agent_angle = episode.start_rotation[2]
             except Exception:
-                # If rotation is stored differently, fall back to 0.
                 articulated_agent_angle = 0.0
             nav_to_pos = np.array(episode.info.get("robot_goal", episode.start_position))
         elif agent_idx == 1:  # human
@@ -111,10 +82,9 @@ class TwoAgentSocialNavTask(NavigationTask):
         )
 
     def reset(self, episode: Episode):
-        # Reset the sim without fetching observations (we'll return them later)
-        super().reset(episode, fetch_observations=False)
-
-        # Generate and set start/goal for each articulated agent
+        # Generate and set start/goal for each articulated agent before the
+        # task-level reset so the simulator and any downstream binders see the
+        # intended articulated-agent start poses.
         for agent_id in range(self._sim.num_articulated_agents):
             self._nav_to_info = self._generate_nav_start_goal(
                 episode, agent_id, force_idx=None
@@ -135,14 +105,19 @@ class TwoAgentSocialNavTask(NavigationTask):
         # Store combined info for convenience
         self.my_nav_to_info = MyNavToInfo(robot_info, human_info)
 
-        # Update simulator and return observations
+        # Now call the parent reset which will perform simulator reset steps,
+        # pddl binding (in PddlTask), and any other initialization. We don't
+        # pass fetch_observations here — the parent manages that internally.
+        super().reset(episode)
+
+        # Debug visualization of the goal position (if enabled)
         if self._sim.habitat_config.debug_render:
-            # Visualize robot goal position
             self._sim.viz_ids["nav_targ_pos"] = self._sim.visualize_position(
                 self.my_nav_to_info.robot_info.nav_goal_pos,
                 self._sim.viz_ids.get("nav_targ_pos"),
                 r=0.2,
             )
+       
 
         self._sim.maybe_update_articulated_agent()
 

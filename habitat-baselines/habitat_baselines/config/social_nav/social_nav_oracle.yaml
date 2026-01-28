@@ -1,0 +1,51 @@
+defaults:
+  - social_nav_twoagent
+
+habitat_baselines:
+  tensorboard_dir: "/habitat-lab/data/tensorboard/social_nav_oracle/"
+  evaluate: true        # optional: can also pass on CLI
+  rl:
+    policy:
+      agent_0:
+        name: HierarchicalPolicy
+        hierarchical_policy:
+          high_level_policy:
+            # Use the fixed high-level policy so we don't instantiate any
+            # neural/RNN encoders during initialization. This executes the
+            # PDDL solution plan and is suitable for scripted execution.
+            name: "FixedHighLevelPolicy"
+            # Restrict which PDDL actions the HL policy will consider. By
+            # default the domain exposes many primitive and composite
+            # actions; here we limit planning/execution to `nav_to_goal`.
+            allowed_actions:
+              - nav_to_obj
+            add_arm_rest: True
+            allow_other_place: False
+            termination_obs_name: "has_finished_oracle_nav"
+          defined_skills:
+            oracle_nav:
+              skill_name: "OracleNavPolicy"
+              pddl_action_names: ["nav_to_obj", "reset_arm"]
+              action_name: "agent_0_oracle_nav_action"
+              max_skill_steps: 1500
+              ignore_grip: true
+
+      agent_1:
+        name: HierarchicalPolicy
+        hierarchical_policy:
+          high_level_policy:
+            # Mirror agent_0 but use the fixed planner so no neural encoder
+            # is constructed for agent_1 either.
+            name: "FixedHighLevelPolicy"
+            # Restrict agent_1 to only plan nav_to_obj actions as well.
+            allowed_actions:
+              - nav_to_obj
+            allow_other_place: False
+            termination_obs_name: "has_finished_oracle_nav"
+          defined_skills:
+            oracle_nav:
+              skill_name: "OracleNavPolicy"
+              pddl_action_names: ["nav_to_obj", "reset_arm"]
+              action_name: "agent_1_oracle_nav_action"
+              max_skill_steps: 1500
+              ignore_grip: true

@@ -15,10 +15,11 @@ defaults:
   - /habitat/task/actions@habitat.task.actions.agent_1_base_velocity: base_velocity
   - /habitat/task/actions@habitat.task.actions.agent_1_rearrange_stop: rearrange_stop
   - /habitat/task/actions@habitat.task.actions.agent_0_rearrange_stop: rearrange_stop
+  - /habitat/task/actions@habitat.task.actions.agent_1_pddl_apply_action: pddl_apply_action
+  # Enable agent_0 oracle navigation action (in addition to agent_1)
   - /habitat/task/actions@habitat.task.actions.agent_0_oracle_nav_action: oracle_nav_action
   - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_action: oracle_nav_action
-  # - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_randcoord_action: oracle_nav_action
-  # - /habitat/task/actions@habitat.task.actions.agent_0_oracle_nav_randcoord_action: oracle_nav_action
+  # Optionally also enable a random-coord oracle for agent_0
   # Config agent sensor
   - /habitat/task/measurements:
     - articulated_agent_force
@@ -28,6 +29,7 @@ defaults:
     - num_agents_collide
     - force_terminate
     - social_nav_reward
+    - object_to_goal_distance
     - rot_dist_to_goal
     - dist_to_goal
     - nav_to_pos_succ
@@ -38,8 +40,16 @@ defaults:
     
   - /habitat/task/lab_sensors:
     - relative_resting_pos_sensor
+    - target_start_sensor
+    - goal_sensor
+    - joint_sensor
+    - is_holding_sensor
+    - end_effector_sensor
+    - target_start_gps_compass_sensor
+    - target_goal_gps_compass_sensor
     - localization_sensor
     - other_agent_gps
+    - humanoid_joint_sensor
     - humanoid_detector_sensor
     - has_finished_oracle_nav
   - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_0_goal_to_agent_gps_compass: nav_goal_sensor
@@ -47,9 +57,12 @@ defaults:
   - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_1_agents_within_threshold: agents_within_threshold
   - _self_
 
-# This yaml is a variant of the Spot-human social-nav benchmark focused on two-agent
-# social navigation only (collision avoidance and reaching a navigation goal).
-# Objects and object-manipulation observations are removed.
+# This yaml is designed specifically for learning a social nav policy for the Boston Dynamics Spot robot.
+# The major changes compared to the base yaml are the following:
+# (1) obs_keys: we ensure these observations can be obtained from the real robot (Spot)
+# (2) social_nav_reward: social nav reward considers collisions based on a kinematic simulation
+# (3) actions: Spot controls the base linear and angualr velocity
+# (4) simulator: we simulate the environment via the kinematic mode to facilitate sim2real transfer
 
 habitat:
   task:
@@ -60,48 +73,58 @@ habitat:
         agent_idx: 1
       agent_0_goal_to_agent_gps_compass:
         goal_is_human: False
-      # Define the human detector
+      # Defien the human detector
       humanoid_detector_sensor:
         # If the human detector function is image or binary flag
-        return_image: False
-        is_return_image_bbox: False
-
-    # Use the new minimal TwoAgentSocialNavTask that doesn't bind PDDL/problems
-    type: TwoAgentSocialNavTask-v0
+        return_image: True
+        is_return_image_bbox: True
+    type: RearrangePddlSocialNavTask-v0
     min_start_distance: 0.0
     reward_measure: social_nav_reward
+    # KL: success_measure: nav_seek_success
     success_measure: social_nav_to_pos_success
     success_reward: 10.0
-    slack_reward: -0.1
+    slack_reward: -0.1 # Tried 0.01 before 
     end_on_success: True
     task_spec_base_path: benchmark/multi_agent/
-    task_spec: pddl/multi_agent_social_nav_twoagent_minimal
+    task_spec: pddl/multi_agent_social_nav
     pddl_domain_def: fp
+    min_distance_start_agents: 0.0
     constraint_violation_ends_episode: False
-    constraint_violation_drops_object: False
+    constraint_violation_drops_object: True
 
     measurements:
+      # rearrange_cooperate_reward:
+      #   stage_sparse_reward: 5.0
+      #   end_on_collide: False
+      #   collide_penalty: 0.5
       force_terminate:
         max_accum_force: -1
         max_instant_force: -1
       social_nav_reward:
-        count_coll_pen: 0.01
-        max_count_colls: -1
-        count_coll_end_pen: 5.0
+        count_coll_pen: 0.01  # Tried 0.25 before slow 
+        max_count_colls: -1 # Tried 1000 before 
+        count_coll_end_pen: 5.0 # Tried 1 before 
         safe_dis_min: 0.2
 
     actions:
-      # agent_0_base_velocity:
-      #   lin_speed: 40.0
-      #   allow_dyn_slide: True
-      #   collision_threshold: 1e-5
-      #   navmesh_offset: [[0.0, 0.0], [0.225, 0.0]]
-      #   enable_lateral_move: False
-      #   longitudinal_lin_speed: 10.0
-      #   lateral_lin_speed: 5.0
-      #   ang_speed: 10.0
-      #   enable_rotation_check_for_dyn_slide: False
+      agent_0_base_velocity:
+        lin_speed: 40.0
+        allow_dyn_slide: True
+        # There is a collision if the difference between the clamped NavMesh position and target position
+        # is more than than collision_threshold for any point
+        collision_threshold: 1e-5
+        # The x and y locations of the clamped NavMesh position
+        navmesh_offset: [[0.0, 0.0], [0.225, 0.0]]
+        # If we allow the robot to move laterally
+        enable_lateral_move: False
+        # speed parameters
+        longitudinal_lin_speed: 10.0
+        lateral_lin_speed: 5.0
+        ang_speed: 10.0
+        enable_rotation_check_for_dyn_slide: False
 
+      # Enable agent_0 oracle navigation (deterministic target selection)
       agent_0_oracle_nav_action:
         type: OracleNavAction
         motion_control: base_velocity
@@ -110,23 +133,43 @@ habitat:
         lin_speed: 10.0
         ang_speed: 10.0
 
+      # Random coordinate oracle for agent_0 (optional)
+      agent_0_oracle_nav_randcoord_action:
+        type: OracleNavRandCoordAction
+        motion_control: base_velocity
+        lin_speed: 10.0  # Tried 5 before 
+        ang_speed: 10.0 # Tried 5 before 
 
-      agent_1_oracle_nav_action:
-        type: OracleNavAction
-        # motion_control: human_joints
-        # lin_speed: 10.0
-        # ang_speed: 10.0
+      # Human random walking action (agent_1)
+      # agent_1_oracle_nav_action:
+      #   type: OracleNavAction
+      #   motion_control: human_joints
+      #   spawn_max_dist_to_obj: -1.0
+      #   dist_thresh: 0.5
+      #   lin_speed: 10.0
+      #   ang_speed: 10.0
+
+      agent_1_oracle_nav_randcoord_action:
+        type: OracleNavRandCoordAction
+        motion_control: human_joints
+        lin_speed: 10.0  # Tried 5 before 
+        ang_speed: 10.0 # Tried 5 before 
 
     robot_at_thresh: 3.0
 
   gym:
-    # Remove object-related keys so the policy only receives social-nav observations
     obs_keys:
+      - agent_0_articulated_agent_arm_depth
       - agent_0_spot_head_stereo_depth_sensor
       - agent_0_humanoid_detector_sensor
-      - agent_0_has_finished_oracle_nav
       - agent_1_head_depth
       - agent_1_relative_resting_position
+      - agent_1_obj_start_sensor
+      - agent_1_obj_goal_sensor
+      - agent_1_obj_start_gps_compass
+      - agent_1_obj_goal_gps_compass
+      - agent_1_is_holding
+      - agent_1_ee_pos
       - agent_1_localization_sensor
       - agent_1_has_finished_oracle_nav
       - agent_1_other_agent_gps
@@ -139,8 +182,8 @@ habitat:
     seed: 100
     additional_object_paths:
       - "data/objects/ycb/configs/"
-      - "data/objects/amazon_berkeley/configs/"
-      - "data/objects/google_object_dataset/configs/"
+      # - "data/objects/amazon_berkeley/configs/"
+      # - "data/objects/google_object_dataset/configs/"
     concur_render: True
     auto_sleep: True
     agents_order:
@@ -149,6 +192,7 @@ habitat:
     agents:
       agent_0:
         joint_start_noise: 0.0
+    # We use the kinematic mode to train the real world social nav policy
     kinematic_mode: True
     ac_freq_ratio: 1
     step_physics: False
@@ -156,6 +200,5 @@ habitat:
     habitat_sim_v0:
       allow_sliding: True
       enable_physics: True
-
   dataset:
     data_path: /habitat-lab/data/social_nav_episode_0415_570.json.gz
