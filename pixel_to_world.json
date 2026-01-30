@@ -1,0 +1,33 @@
+{
+  "map_info": {
+    "grid_dimensions": {
+      "height": 714,
+      "width": 985
+    },
+    "pixel_range": {
+      "x": [
+        0,
+        984
+      ],
+      "y": [
+        0,
+        713
+      ]
+    }
+  },
+  "conversion_results": [
+    {
+      "pixel_x": 370,
+      "pixel_y": 167,
+      "world_x": -1.0117450952529907,
+      "world_y": 0.0,
+      "world_z": -12.106364250183105,
+      "valid": true
+    }
+  ],
+  "summary": {
+    "total": 1,
+    "valid": 1,
+    "invalid": 0
+  }
+}

@@ -186,7 +186,7 @@ class sim_env(threading.Thread):
     _y_axis = 1
     _z_axis = 2
     _dt = 0.00478
-    _sensor_rate = 10  # hz
+    _sensor_rate = 10
     
     _current_episode = 0
     _total_number_of_episodes = 0
@@ -195,11 +195,14 @@ class sim_env(threading.Thread):
     replan_counter = 0
     def __init__(self, config):
         threading.Thread.__init__(self)
-        # Initialize TensorBoard writer
-        self.writer = SummaryWriter('runs/habitat_visualization')
+        # Initialize TensorBoard writer（每个 episode 一个子目录，在 TensorBoard 里选不同 run 查看）
+        # 若 Images 滑块在高 step 时“一跳很大”，请用：tensorboard --logdir runs --samples_per_plugin images=0
+        self.writer = SummaryWriter('runs/habitat_visualization/episode_0')
+        # self.writer = SummaryWriter('runs/habitat_visualization')
         self.step = 0
         self.env = habitat.Env(config = config)
-        remove_ep_list = [0,1,2,8]
+        # remove_ep_list = [0,1,2,8]
+        remove_ep_list = [1,2,8]
         self.observations = self.env.reset()
         while self.env.current_episode.episode_id in remove_ep_list:
             self.observations = self.env.reset()
@@ -483,6 +486,17 @@ class sim_env(threading.Thread):
             init_states_array = np.array(self.full_init_state)
             np.save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".npy", init_states_array)
         self._current_episode += 1
+
+        # 每个 episode 单独一个 TensorBoard run，便于在 Images 里选 episode_0 / episode_1 / ... 查看
+        lock.acquire()
+        try:
+            self.writer.close()
+        except Exception:
+            pass
+        self.writer = SummaryWriter(f'runs/habitat_visualization/episode_{self._current_episode}')
+        self.step = 0
+        lock.release()
+
         self.initial_state = []
         for i in range(self.number_of_agents):
             agent_pos = self.env.sim.agents_mgr[i].articulated_agent.base_pos
@@ -506,6 +520,7 @@ class sim_env(threading.Thread):
         self.cheating_point = None
         self.waiting_for_traj = True
         self.counter_deadlock = 0
+        # self.step = 0  # 每 episode 重置，避免 TensorBoard Images 滑块在高 step 时“一跳很大”
         self.robot_moved = []
         self.human_moved = []
         self.human_num_steps = 0
@@ -1224,6 +1239,133 @@ class sim_env(threading.Thread):
             grid_resolution=self.grid_dimensions
         )
         return world_pos_3d
+    
+    def generate_episodes_from_door_pixels(self, door_pixel_pairs=None, distance=2.7, episodes_per_door=3):
+        """
+        使用多组pixel点生成episodes
+        
+        使用方法:
+            # 在代码中直接设置多组pixel点
+            door_pixel_pairs = [
+                [[300, 231], [300, 243]],  # 第一组：门起点和终点
+                [[400, 200], [400, 250]],  # 第二组：门起点和终点
+                # 可以添加更多组...
+            ]
+            my_env.generate_episodes_from_door_pixels(door_pixel_pairs)
+            
+            # 或者使用custom_topdown_pixel_points（只支持一组）
+            my_env.generate_episodes_from_door_pixels()
+        
+        Args:
+            door_pixel_pairs: 多组pixel点的列表，格式: [[[pixel_x1, pixel_y1], [pixel_x2, pixel_y2]], ...]
+                            如果为None，则使用custom_topdown_pixel_points（只支持一组）
+            distance: 距离门中点的距离（米），默认2.7
+            episodes_per_door: 每个门生成多少个episode，默认3
+        """
+        import sys
+        import os
+        
+        # 如果没有提供pixel点对，使用custom_topdown_pixel_points
+        if door_pixel_pairs is None:
+            if self.custom_topdown_pixel_points is None or len(self.custom_topdown_pixel_points) < 2:
+                print("错误: 需要提供door_pixel_pairs，或者设置custom_topdown_pixel_points")
+                return
+            door_pixel_pairs = [self.custom_topdown_pixel_points]
+        
+        # 确保door_pixel_pairs是列表的列表
+        if not isinstance(door_pixel_pairs[0][0], list):
+            # 如果只有一组，转换为列表的列表
+            door_pixel_pairs = [door_pixel_pairs]
+        
+        print(f"准备生成episodes，共 {len(door_pixel_pairs)} 组门，每组生成 {episodes_per_door} 个episode")
+        
+        # 导入生成函数
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        generate_script_path = os.path.join(script_dir, '..', 'generate_episodes_from_doors.py')
+        generate_script_path = os.path.abspath(generate_script_path)
+        
+        # 动态导入生成模块
+        sys.path.insert(0, os.path.dirname(generate_script_path))
+        try:
+            import generate_episodes_from_doors as gen_module
+        except ImportError:
+            print(f"错误: 无法导入generate_episodes_from_doors模块")
+            return
+        
+        # 加载原始JSON和配置
+        input_json = os.path.join(script_dir, '..', 'scene_wise', 'test_dataset15_finalest_only_8.json.gz')
+        input_json = os.path.abspath(input_json)
+        base_data = gen_module.load_json_dataset(input_json)
+        if len(base_data['episodes']) == 0:
+            print("错误: 原始JSON中没有episode")
+            return
+        
+        base_episode = base_data['episodes'][0]
+        
+        # 直接使用已有的环境，避免配置问题
+        # 使用self.env而不是创建新环境
+        pathfinder = self.env._sim.pathfinder
+        
+        # 设置输出路径 - 保存到 habitat-lab/data/data_xinyuan 目录
+        # 获取habitat-lab的根目录
+        habitat_lab_root = os.path.join(script_dir, '..')
+        habitat_lab_root = os.path.abspath(habitat_lab_root)
+        output_dir = os.path.join(habitat_lab_root, 'data', 'data_xinyuan')
+        os.makedirs(output_dir, exist_ok=True)
+        output_json = os.path.join(output_dir, 'test_dataset15_generated.json.gz')
+        print(f"输出目录: {output_dir}")
+        print(f"输出文件: {output_json}")
+        
+        # 生成所有episodes
+        all_episodes = []
+        next_episode_id = 0
+        
+        for group_idx, (pixel_point1, pixel_point2) in enumerate(door_pixel_pairs):
+            print(f"\n处理第 {group_idx + 1}/{len(door_pixel_pairs)} 组门:")
+            print(f"  门起点像素: {pixel_point1}")
+            print(f"  门终点像素: {pixel_point2}")
+            
+            # 转换pixel到world坐标
+            door_start_world = self.convert_pixel_to_world(pixel_point1[0], pixel_point1[1])
+            door_end_world = self.convert_pixel_to_world(pixel_point2[0], pixel_point2[1])
+            door_start = door_start_world.tolist()
+            door_end = door_end_world.tolist()
+            print(f"  门起点world: {door_start}")
+            print(f"  门终点world: {door_end}")
+            
+            # 为这组门生成episodes
+            for ep_idx in range(episodes_per_door):
+                print(f"  生成episode {ep_idx + 1}/{episodes_per_door}...")
+                new_episode = gen_module.generate_episode_from_door(
+                    base_episode,
+                    door_start,
+                    door_end,
+                    pathfinder,
+                    next_episode_id,
+                    distance
+                )
+                all_episodes.append(new_episode)
+                next_episode_id += 1
+                
+                print(f"    Episode {new_episode['episode_id']}:")
+                print(f"      机器人起始: {new_episode['start_position']}")
+                print(f"      机器人目标: {new_episode['info']['robot_goal']}")
+                print(f"      人起始: {new_episode['info']['human_start']}")
+                print(f"      人目标: {new_episode['info']['human_goal']}")
+        
+        # 创建新的数据集
+        new_data = {
+            'config': base_data.get('config'),
+            'episodes': all_episodes
+        }
+        
+        # 保存新JSON
+        print(f"\n保存新JSON到: {output_json}")
+        gen_module.save_json_dataset(new_data, output_json)
+        
+        print(f"\n完成! 共生成了 {len(all_episodes)} 个episodes ({len(door_pixel_pairs)} 组门 × {episodes_per_door} 个episode/组)")
+        
+        # 不需要关闭环境，因为使用的是已有的self.env
 
     def set_topdown_camera_from_pixel_points(self, pixel_point1, pixel_point2, height=20.0):
         """
@@ -1378,117 +1520,117 @@ class sim_env(threading.Thread):
         
         return world_pos
 
-    def batch_convert_pixels_to_world(self, pixel_coords, output_json_path="pixel_to_world.json"):
-        """
-        批量转换pixel坐标到world frame坐标，并导出为JSON文件
+    # def batch_convert_pixels_to_world(self, pixel_coords, output_json_path="pixel_to_world.json"):
+    #     """
+    #     批量转换pixel坐标到world frame坐标，并导出为JSON文件
         
-        使用方法:
-            # 方法1: 直接在代码中传入坐标列表
-            pixel_coords = [
-                [370, 167],
-                [400, 200],
-                [500, 300]
-            ]
-            my_env.batch_convert_pixels_to_world(pixel_coords)
+    #     使用方法:
+    #         # 方法1: 直接在代码中传入坐标列表
+    #         pixel_coords = [
+    #             [370, 167],
+    #             [400, 200],
+    #             [500, 300]
+    #         ]
+    #         my_env.batch_convert_pixels_to_world(pixel_coords)
             
-            # 方法2: 从CSV文件读取（CSV格式：pixel_x,pixel_y）
-            import csv
-            pixel_coords = []
-            with open('pixels.csv', 'r') as f:
-                reader = csv.reader(f)
-                next(reader)  # 跳过标题行（如果有）
-                for row in reader:
-                    pixel_coords.append([int(row[0]), int(row[1])])
-            my_env.batch_convert_pixels_to_world(pixel_coords, "output.json")
+    #         # 方法2: 从CSV文件读取（CSV格式：pixel_x,pixel_y）
+    #         import csv
+    #         pixel_coords = []
+    #         with open('pixels.csv', 'r') as f:
+    #             reader = csv.reader(f)
+    #             next(reader)  # 跳过标题行（如果有）
+    #             for row in reader:
+    #                 pixel_coords.append([int(row[0]), int(row[1])])
+    #         my_env.batch_convert_pixels_to_world(pixel_coords, "output.json")
         
-        Args:
-            pixel_coords: 列表，每个元素是[pixel_x, pixel_y]
-            output_json_path: 输出JSON文件路径
-        """
-        results = []
-        valid_count = 0
-        invalid_count = 0
+    #     Args:
+    #         pixel_coords: 列表，每个元素是[pixel_x, pixel_y]
+    #         output_json_path: 输出JSON文件路径
+    #     """
+    #     results = []
+    #     valid_count = 0
+    #     invalid_count = 0
         
-        print(f"\n[批量转换] 开始处理 {len(pixel_coords)} 个pixel坐标...")
+    #     print(f"\n[批量转换] 开始处理 {len(pixel_coords)} 个pixel坐标...")
         
-        for i, (pixel_x, pixel_y) in enumerate(pixel_coords):
-            # 验证坐标范围
-            if not (0 <= pixel_x < self.grid_dimensions[1]):
-                print(f"[批量转换] 第{i+1}个坐标无效: pixel_x ({pixel_x}) 超出范围 [0, {self.grid_dimensions[1]-1}]")
-                invalid_count += 1
-                results.append({
-                    "pixel_x": pixel_x,
-                    "pixel_y": pixel_y,
-                    "world_x": None,
-                    "world_y": None,
-                    "world_z": None,
-                    "valid": False,
-                    "error": f"pixel_x超出范围"
-                })
-                continue
-            if not (0 <= pixel_y < self.grid_dimensions[0]):
-                print(f"[批量转换] 第{i+1}个坐标无效: pixel_y ({pixel_y}) 超出范围 [0, {self.grid_dimensions[0]-1}]")
-                invalid_count += 1
-                results.append({
-                    "pixel_x": pixel_x,
-                    "pixel_y": pixel_y,
-                    "world_x": None,
-                    "world_y": None,
-                    "world_z": None,
-                    "valid": False,
-                    "error": f"pixel_y超出范围"
-                })
-                continue
+    #     for i, (pixel_x, pixel_y) in enumerate(pixel_coords):
+    #         # 验证坐标范围
+    #         if not (0 <= pixel_x < self.grid_dimensions[1]):
+    #             print(f"[批量转换] 第{i+1}个坐标无效: pixel_x ({pixel_x}) 超出范围 [0, {self.grid_dimensions[1]-1}]")
+    #             invalid_count += 1
+    #             results.append({
+    #                 "pixel_x": pixel_x,
+    #                 "pixel_y": pixel_y,
+    #                 "world_x": None,
+    #                 "world_y": None,
+    #                 "world_z": None,
+    #                 "valid": False,
+    #                 "error": f"pixel_x超出范围"
+    #             })
+    #             continue
+    #         if not (0 <= pixel_y < self.grid_dimensions[0]):
+    #             print(f"[批量转换] 第{i+1}个坐标无效: pixel_y ({pixel_y}) 超出范围 [0, {self.grid_dimensions[0]-1}]")
+    #             invalid_count += 1
+    #             results.append({
+    #                 "pixel_x": pixel_x,
+    #                 "pixel_y": pixel_y,
+    #                 "world_x": None,
+    #                 "world_y": None,
+    #                 "world_z": None,
+    #                 "valid": False,
+    #                 "error": f"pixel_y超出范围"
+    #             })
+    #             continue
             
-            # 转换坐标
-            world_pos = self.convert_pixel_to_world(pixel_x, pixel_y)
-            valid_count += 1
+    #         # 转换坐标
+    #         world_pos = self.convert_pixel_to_world(pixel_x, pixel_y)
+    #         valid_count += 1
             
-            result = {
-                "pixel_x": pixel_x,
-                "pixel_y": pixel_y,
-                "world_x": float(world_pos[0]),
-                "world_y": float(world_pos[1]),
-                "world_z": float(world_pos[2]),
-                "valid": True
-            }
-            results.append(result)
+    #         result = {
+    #             "pixel_x": pixel_x,
+    #             "pixel_y": pixel_y,
+    #             "world_x": float(world_pos[0]),
+    #             "world_y": float(world_pos[1]),
+    #             "world_z": float(world_pos[2]),
+    #             "valid": True
+    #         }
+    #         results.append(result)
             
-            # 在终端输出
-            print(f"[批量转换] {i+1}/{len(pixel_coords)}: Pixel({pixel_x}, {pixel_y}) -> World[{world_pos[0]:.4f}, {world_pos[1]:.4f}, {world_pos[2]:.4f}]")
+    #         # 在终端输出
+    #         print(f"[批量转换] {i+1}/{len(pixel_coords)}: Pixel({pixel_x}, {pixel_y}) -> World[{world_pos[0]:.4f}, {world_pos[1]:.4f}, {world_pos[2]:.4f}]")
         
-        # 保存为JSON文件
-        output_data = {
-            "map_info": {
-                "grid_dimensions": {
-                    "height": int(self.grid_dimensions[0]),
-                    "width": int(self.grid_dimensions[1])
-                },
-                "pixel_range": {
-                    "x": [0, int(self.grid_dimensions[1]-1)],
-                    "y": [0, int(self.grid_dimensions[0]-1)]
-                }
-            },
-            "conversion_results": results,
-            "summary": {
-                "total": len(pixel_coords),
-                "valid": valid_count,
-                "invalid": invalid_count
-            }
-        }
+    #     # 保存为JSON文件
+    #     output_data = {
+    #         "map_info": {
+    #             "grid_dimensions": {
+    #                 "height": int(self.grid_dimensions[0]),
+    #                 "width": int(self.grid_dimensions[1])
+    #             },
+    #             "pixel_range": {
+    #                 "x": [0, int(self.grid_dimensions[1]-1)],
+    #                 "y": [0, int(self.grid_dimensions[0]-1)]
+    #             }
+    #         },
+    #         "conversion_results": results,
+    #         "summary": {
+    #             "total": len(pixel_coords),
+    #             "valid": valid_count,
+    #             "invalid": invalid_count
+    #         }
+    #     }
         
-        # 获取绝对路径
-        abs_output_path = os.path.abspath(output_json_path)
+    #     # 获取绝对路径
+    #     abs_output_path = os.path.abspath(output_json_path)
         
-        with open(abs_output_path, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
+    #     with open(abs_output_path, 'w', encoding='utf-8') as f:
+    #         json.dump(output_data, f, indent=2, ensure_ascii=False)
         
-        print(f"\n[批量转换] 完成！")
-        print(f"  有效转换: {valid_count}/{len(pixel_coords)}")
-        print(f"  无效坐标: {invalid_count}/{len(pixel_coords)}")
-        print(f"  结果已保存到: {abs_output_path}")
+    #     print(f"\n[批量转换] 完成！")
+    #     print(f"  有效转换: {valid_count}/{len(pixel_coords)}")
+    #     print(f"  无效坐标: {invalid_count}/{len(pixel_coords)}")
+    #     print(f"  结果已保存到: {abs_output_path}")
         
-        return output_data
+    #     return output_data
 
     def point_callback(self, msg):
         point_map = [msg.point.x, msg.point.y, msg.point.z]
@@ -1761,33 +1903,20 @@ if __name__ == "__main__":
     my_env = sim_env(config)
     
     # ============================================================
-    # 批量转换pixel坐标到world frame坐标
+    # 使用pixel点生成episodes
     # ============================================================
-    # 方法1: 直接在代码中输入坐标列表
-    PIXEL_COORDS = [
-        [370, 167],  # [pixel_x, pixel_y]
-        # 在这里添加更多坐标，例如:
-        # [400, 200],
-        # [500, 300],
+    # 直接在代码中设置多组pixel点，每组生成3个episode
+    # 格式: [[[门起点pixel], [门终点pixel]], ...]
+    
+    DOOR_PIXEL_PAIRS = [
+        [[668, 231], [668, 243]],  # 第一组门
+        # [[400, 200], [400, 250]],  # 第二组门（取消注释来添加）
+        # [[500, 300], [500, 350]],  # 第三组门（取消注释来添加）
+        # 可以添加更多组...
     ]
     
-    # 方法2: 从CSV文件读取（取消下面的注释来使用）
-    # import csv
-    # PIXEL_COORDS = []
-    # with open('pixels.csv', 'r') as f:
-    #     reader = csv.reader(f)
-    #     next(reader)  # 跳过标题行（如果有）
-    #     for row in reader:
-    #         PIXEL_COORDS.append([int(row[0]), int(row[1])])
-    
-    # 执行批量转换并导出JSON
-    # 输出路径：默认是当前目录下的 "pixel_to_world.json"
-    # 可以修改为其他路径，例如: "/path/to/output.json"
-    OUTPUT_JSON_PATH = "pixel_to_world.json"  # 修改这里可以改变输出路径
-    my_env.batch_convert_pixels_to_world(PIXEL_COORDS, OUTPUT_JSON_PATH)
-    
-    # 如果需要单个转换（不批量），可以使用：
-    my_env.convert_pixel_to_world_test(370, 167)  # 只输出到终端，不保存文件
+    # # 生成episodes
+    # my_env.generate_episodes_from_door_pixels(DOOR_PIXEL_PAIRS)
     
     my_env.start()
     rospy.Subscriber("/cmd_vel", Twist, callback, (my_env), queue_size=1)

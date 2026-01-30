@@ -218,3 +218,4 @@ habitat:
     data_path: /habitat-lab/data/social_nav_episode_0415_samples.json.gz
     # data_path: data/social_nav_episode_mp3d.json.gz
     # data_path: /habitat-lab/data/versioned_data/hab3_episodes/{split}/social_rearrange.json.gz
+    # data_path: /habitat-lab/data/social_nav_episode_0415_570.json.gz
