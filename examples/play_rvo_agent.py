@@ -195,17 +195,35 @@ class sim_env(threading.Thread):
     replan_counter = 0
     def __init__(self, config):
         threading.Thread.__init__(self)
-        # Initialize TensorBoard writer（每个 episode 一个子目录，在 TensorBoard 里选不同 run 查看）
+        # TensorBoard writer 在选定首个 episode 后创建，run 名用数据集的 episode_id
         # 若 Images 滑块在高 step 时“一跳很大”，请用：tensorboard --logdir runs --samples_per_plugin images=0
-        self.writer = SummaryWriter('runs/habitat_visualization/episode_0')
-        # self.writer = SummaryWriter('runs/habitat_visualization')
         self.step = 0
         self.env = habitat.Env(config = config)
-        # remove_ep_list = [0,1,2,8]
-        remove_ep_list = [1,2,8]
+        # # remove_ep_list = [0,1,2,8]
+        # remove_ep_list = [1,2,8]
+        # episode_cycle=0 表示不跳过，严格按数据集顺序跑；>0 时只跑 (episode_id-1)%cycle==0 的
+        self.episode_cycle = 10  # 0=按顺序跑每一个；>0 时只跑（如 1,41,81...）
+        self.start_episode_id = 1  # 从 dataset 的哪个 episode_id 开始（0 即从 0 开始）
+        self.max_steps_per_episode = 5  # 临时：0=不限制；>0 时跑满该步数就停（调试用）
+        # 让迭代器从 start_episode_id 开始，再 reset 才会加载该 episode
+        try:
+            from habitat.core.dataset import EpisodeIterator
+            if isinstance(self.env.episode_iterator, EpisodeIterator):
+                # dataset 里 episode_id 可能是 str 或 int，两种都试
+                for eid in (self.start_episode_id, str(self.start_episode_id)):
+                    try:
+                        self.env.episode_iterator.set_next_episode_by_id(eid)
+                        break
+                    except ValueError:
+                        continue
+        except Exception:
+            pass
         self.observations = self.env.reset()
-        while self.env.current_episode.episode_id in remove_ep_list:
-            self.observations = self.env.reset()
+        if self.episode_cycle > 0:
+            while (int(self.env.current_episode.episode_id) - 1) % self.episode_cycle != 0:
+                self.observations = self.env.reset()
+        print(f"[Episode] 正在跑 dataset episode_id={self.env.current_episode.episode_id}（与 TensorBoard run 名一致）")
+        self.writer = SummaryWriter(f'runs/habitat_visualization/episode_{self.env.current_episode.episode_id}')
         meters_per_pixel =0.025
         map_name = "sample_map"
         hablab_topdown_map = maps.get_topdown_map(
@@ -454,6 +472,10 @@ class sim_env(threading.Thread):
             self.env.sim.agents_mgr[0].articulated_agent.base_pos = self.env.sim.pathfinder.get_random_navigable_point()
 
         self.observations = self.env.reset()
+        if self.episode_cycle > 0:
+            while (int(self.env.current_episode.episode_id) - 1) % self.episode_cycle != 0:
+                self.observations = self.env.reset()
+        print(f"[Episode] 正在跑 dataset episode_id={self.env.current_episode.episode_id}（与 TensorBoard run 名一致）")
         meters_per_pixel =0.025
         map_name = "sample_map"
         hablab_topdown_map = maps.get_topdown_map(
@@ -463,6 +485,7 @@ class sim_env(threading.Thread):
             [[255, 255, 255], [128, 128, 128], [0, 0, 0]], dtype=np.uint8
         )
         hablab_topdown_map = recolor_map[hablab_topdown_map]
+        self.new_img = np.asarray(hablab_topdown_map)  # 使 TensorBoard 的 top_down_map 随 episode 更新
         floor_y = 0.0
         self.top_down_map = maps.get_topdown_map(
             self.env._sim.pathfinder, height=floor_y, meters_per_pixel=0.025
@@ -487,13 +510,13 @@ class sim_env(threading.Thread):
             np.save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".npy", init_states_array)
         self._current_episode += 1
 
-        # 每个 episode 单独一个 TensorBoard run，便于在 Images 里选 episode_0 / episode_1 / ... 查看
+        # 每个 episode 单独一个 TensorBoard run，名称等于数据集的 episode_id
         lock.acquire()
         try:
             self.writer.close()
         except Exception:
             pass
-        self.writer = SummaryWriter(f'runs/habitat_visualization/episode_{self._current_episode}')
+        self.writer = SummaryWriter(f'runs/habitat_visualization/episode_{self.env.current_episode.episode_id}')
         self.step = 0
         lock.release()
 
@@ -915,6 +938,10 @@ class sim_env(threading.Thread):
                 self.reset()
                 return
             self.actual_num_steps +=1
+            if self.max_steps_per_episode > 0 and self.actual_num_steps >= self.max_steps_per_episode:
+                print(f"[临时] 已跑满 {self.max_steps_per_episode} 步，停止并重置")
+                self.reset()
+                return
             human_final_goal = self.env.current_episode.info['human_goal']
             dist_to_goal_human = np.linalg.norm((np.array(human_final_goal)-np.array(self.objs[1].base_pos))[[0, 2]])
             # print("Distance to human goal is!!!! ", dist_to_goal_human)
@@ -1240,7 +1267,7 @@ class sim_env(threading.Thread):
         )
         return world_pos_3d
     
-    def generate_episodes_from_door_pixels(self, door_pixel_pairs=None, distance=2.7, episodes_per_door=3):
+    def generate_episodes_from_door_pixels(self, door_pixel_pairs=None, distance=None, episodes_per_door=10):
         """
         使用多组pixel点生成episodes
         
@@ -1259,8 +1286,8 @@ class sim_env(threading.Thread):
         Args:
             door_pixel_pairs: 多组pixel点的列表，格式: [[[pixel_x1, pixel_y1], [pixel_x2, pixel_y2]], ...]
                             如果为None，则使用custom_topdown_pixel_points（只支持一组）
-            distance: 距离门中点的距离（米），默认2.7
-            episodes_per_door: 每个门生成多少个episode，默认3
+            distance: 距离门中点的距离（米）。None 表示每个 episode 在 1–3 米内随机
+            episodes_per_door: 每个门生成多少个 episode，默认 10
         """
         import sys
         import os
@@ -1852,6 +1879,9 @@ if __name__ == "__main__":
         env_config = config.habitat.environment
         sim_config = config.habitat.simulator
         task_config = config.habitat.task
+
+        # 关闭 episode 打乱，使每次启动都从数据集第一个 episode 开始（否则会从 shuffle 后的“第一个”开始，看起来像接着上次）
+        env_config.iterator_options.shuffle = False
 
         if not args.same_task:
             sim_config.debug_render = True

@@ -150,7 +150,7 @@ def generate_episode_from_door(
     door_end: List[float],
     pathfinder,
     episode_id: int,
-    distance: float = 1.0,
+    distance: Optional[float] = None,
     height: float = 0.16441
 ) -> dict:
     """
@@ -162,12 +162,18 @@ def generate_episode_from_door(
         door_end: 门终点 [x, y, z]
         pathfinder: habitat pathfinder对象
         episode_id: episode ID
-        distance: 距离门中点的距离（米），默认2.7
+        distance: 距离门中点的距离（米）。None 表示在 [1, 3] 米内随机
         height: 高度，默认0.16441
     
     Returns:
         新的episode字典
     """
+    # 使用 episode_id 做种子，保证可重复
+    np.random.seed(episode_id * 1000)
+    # 距离：未指定时在 1–3 米随机
+    if distance is None:
+        distance = float(np.random.uniform(1.0, 3.0))
+
     # 计算门的中点
     door_middle = get_door_middle(door_start, door_end)
     door_direction = get_door_direction(door_start, door_end)
@@ -176,10 +182,7 @@ def generate_episode_from_door(
     perp_vec = np.array([-door_direction[2], 0, door_direction[0]])  # 旋转90度
     perp_vec = perp_vec / np.linalg.norm(perp_vec)  # 归一化
     
-    # ========== 新方法：圆形生成 ==========
-    # 使用随机种子确保可重复性
-    np.random.seed(episode_id * 1000)
-    
+    # ========== 新方法：圆形生成（半径已在上方随机为 1–3 米）==========
     # 判断点在门的哪一边：计算点到门中点的向量与perp_vec的点积
     # 正数表示在perp_vec方向，负数表示在-perp_vec方向
     
@@ -285,60 +288,9 @@ def generate_episode_from_door(
         human_goal = pathfinder.get_random_navigable_point()
         print(f"  警告: 无法找到合法的人的目标位置，使用随机点")
     
-    # ========== 旧方法：直线生成（已注释保留） ==========
-    # # 生成3个不同的配置（每个episode使用不同的偏移）
-    # # 在垂直于门方向的直线上，人和机器人稍微错开
-    # offsets = [
-    #     (-0.3, 0.3),   # episode 0: 机器人稍微左，人稍微右
-    #     (-0.5, 0.5),   # episode 1: 机器人更左，人更右
-    #     (-0.2, 0.2),   # episode 2: 机器人稍微左，人稍微右
-    # ]
-    # 
-    # offset_idx = episode_id % 3
-    # robot_offset, human_offset = offsets[offset_idx]
-    # 
-    # # 在门的一边生成起始位置（使用正距离，即perp_vec方向）
-    # # 先找到基础位置，然后添加小偏移
-    # base_start_pos = door_middle + distance * perp_vec
-    # base_start_pos[1] = height  # 设置高度
-    # base_start_pos = pathfinder.snap_point(base_start_pos)
-    # 
-    # # 添加沿着门方向的小偏移，使人和机器人稍微错开
-    # robot_start = base_start_pos + robot_offset * door_direction
-    # robot_start = pathfinder.snap_point(robot_start)
-    # 
-    # human_start = base_start_pos + human_offset * door_direction
-    # human_start = pathfinder.snap_point(human_start)
-    # 
-    # # 在门的另一边生成目标位置（使用负距离，即-perp_vec方向）
-    # base_goal_pos = door_middle - distance * perp_vec
-    # base_goal_pos[1] = height  # 设置高度
-    # base_goal_pos = pathfinder.snap_point(base_goal_pos)
-    # 
-    # robot_goal = base_goal_pos + robot_offset * door_direction
-    # robot_goal = pathfinder.snap_point(robot_goal)
-    # 
-    # human_goal = base_goal_pos + human_offset * door_direction
-    # human_goal = pathfinder.snap_point(human_goal)
-    # 
-    # # 验证位置是否可导航
-    # if not pathfinder.is_navigable(robot_start):
-    #     robot_start = pathfinder.get_random_navigable_point()
-    #     print(f"  警告: 机器人起始位置不可导航，使用随机点")
-    # if not pathfinder.is_navigable(human_start):
-    #     human_start = pathfinder.get_random_navigable_point()
-    #     print(f"  警告: 人的起始位置不可导航，使用随机点")
-    # if not pathfinder.is_navigable(robot_goal):
-    #     robot_goal = pathfinder.get_random_navigable_point()
-    #     print(f"  警告: 机器人目标位置不可导航，使用随机点")
-    # if not pathfinder.is_navigable(human_goal):
-    #     human_goal = pathfinder.get_random_navigable_point()
-    #     print(f"  警告: 人的目标位置不可导航，使用随机点")
-    
     # 生成随机旋转（前两个值为0，后两个值随机）
     # 旋转格式: [x, y, z, w] (quaternion)
-    # 我们只随机化z轴旋转（yaw角）
-    np.random.seed(episode_id * 1000)  # 使用episode_id作为种子，确保可重复
+    # 我们只随机化z轴旋转（yaw角）（种子已在函数开头设置，此处沿用同一随机序列）
     z_angle = np.random.uniform(0, 2 * math.pi)
     robot_rot = [0.0, 0.0, math.sin(z_angle / 2), math.cos(z_angle / 2)]
     

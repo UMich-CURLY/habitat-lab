@@ -215,7 +215,7 @@ class KinematicHumanoid(MobileManipulator):
                         cam_transform = inv_T @ cam_transform
                         # 正交投影：对角元 = 2/视口半宽，越小看到的范围越大。
                         # 原 0.3 对应视高约 6.7，显得很低；改为 0.1 对应视高 20，俯视范围与高度一致。
-                        ortho_view_size = 20.0  # 期望可见的世界范围（约等于相机高度时的俯视半径）
+                        ortho_view_size = 30.0  # 期望可见的世界范围（约等于相机高度时的俯视半径）
                         ortho_scale = 2.0 / ortho_view_size  # 0.1
                         sens_obj.render_camera.projection_matrix = mn.Matrix4([
                             [ortho_scale, 0, 0, 0],
