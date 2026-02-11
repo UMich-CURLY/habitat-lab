@@ -1916,7 +1916,7 @@ if __name__ == "__main__":
     ]
     
     # # 生成episodes
-    # my_env.generate_episodes_from_door_pixels(DOOR_PIXEL_PAIRS)
+    my_env.generate_episodes_from_door_pixels(DOOR_PIXEL_PAIRS)
     
     my_env.start()
     rospy.Subscriber("/cmd_vel", Twist, callback, (my_env), queue_size=1)

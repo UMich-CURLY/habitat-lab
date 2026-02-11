@@ -47,13 +47,13 @@ class KinematicHumanoid(MobileManipulator):
                 #     attached_link_id=-2,
                 # ),
                 "third": ArticulatedAgentCameraParams(
-                    cam_offset_pos=mn.Vector3(-9.0559,3.39,8.9988),
+                    cam_offset_pos=mn.Vector3(-9.0559,23.39,8.9988),
                     cam_look_at_pos=mn.Vector3(0.0, 0.0, 0.0),
                     cam_orientation=mn.Vector3(-1.59,0.,0.),
-                    attached_link_id=-3,
+                    attached_link_id=-2,
                 ),
                 "head": ArticulatedAgentCameraParams(
-                    cam_offset_pos=mn.Vector3(-9.0559,3.39,8.9988),
+                    cam_offset_pos=mn.Vector3(-9.0559,23.39,8.9988),
                     cam_look_at_pos=mn.Vector3(0.0, 0.0, 0.0),
                     cam_orientation=mn.Vector3(-1.59,0.,0.),
                     attached_link_id=-3,
@@ -205,7 +205,7 @@ class KinematicHumanoid(MobileManipulator):
                         door_start = self._sim.ep_info.info['door_start']
                         door_end = self._sim.ep_info.info['door_end']
                         door_middle_3d = (np.array(door_start)+np.array(door_end))/2
-                        pos = mn.Vector3(door_middle_3d[0], 20.0, door_middle_3d[2])
+                        pos = mn.Vector3(door_middle_3d[0], 20, door_middle_3d[2])
                         ori = mn.Vector3(-1.57,0.,0.)
                         Mt = mn.Matrix4.translation(pos)
                         Mz = mn.Matrix4.rotation_z(mn.Rad(ori[2]))
@@ -213,12 +213,15 @@ class KinematicHumanoid(MobileManipulator):
                         Mx = mn.Matrix4.rotation_x(mn.Rad(ori[0]))
                         cam_transform = Mt @ Mz @ My @ Mx
                         cam_transform = inv_T @ cam_transform
-                        
+                        # 正交投影：对角元 = 2/视口半宽，越小看到的范围越大。
+                        # 原 0.3 对应视高约 6.7，显得很低；改为 0.1 对应视高 20，俯视范围与高度一致。
+                        ortho_view_size = 20.0  # 期望可见的世界范围（约等于相机高度时的俯视半径）
+                        ortho_scale = 2.0 / ortho_view_size  # 0.1
                         sens_obj.render_camera.projection_matrix = mn.Matrix4([
-                            [0.3000000059604645, 0, 0, 0],
-                            [0, 0.3000000059604645, 0, 0],
-                            [0, 0, -0.002000020118430257, 0],
-                            [0, 0, -1.0000200271606445, 1]
+                            [ortho_scale, 0, 0, 0],
+                            [0, ortho_scale, 0, 0],
+                            [0, 0, -0.02000020118430257, 0],
+                            [0, 0, -1.0000200271606445, 1],
                         ])
                         # if cam_info.cam_look_at_pos == mn.Vector3(0, 0, 0):
                         #     pos = cam_info.cam_offset_pos
