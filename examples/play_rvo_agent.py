@@ -438,6 +438,13 @@ class sim_env(threading.Thread):
         # self.sfm.get_velocity(self.initial_state, filename = MAP_DIR+"run_rvo2", save_anim = True)
 
     def reset(self):
+        # 上一集跑完后把是否碰撞写回 current_episode.info（第一次 reset 时还没跑过，不写）
+        if getattr(self, "_reset_count", 0) > 0 and self.env.current_episode is not None:
+            m = self.env.get_metrics()
+            if self.env.current_episode.info is None:
+                self.env.current_episode.info = {}
+            self.env.current_episode.info["collision"] = (m.get("num_agents_collide", 0) > 0)
+        self._reset_count = getattr(self, "_reset_count", 0) + 1
         #### Save the results of the previous episode ####
         if SAVE_DATA:
             metrics = self.env.get_metrics()
@@ -1802,6 +1809,27 @@ def callback(vel, my_env):
     my_env.linear_velocity = np.array([(1.0 * vel.linear.y), 0.0, (1.0 * vel.linear.x)])
     my_env.angular_velocity = np.array([0, vel.angular.z, 0])
 
+
+def _save_dataset_with_collision(env, path, habitat_lab_root):
+    """退出时把当前 dataset（含 info.collision）保存为新 JSON。path 可为相对 habitat_lab_root 或绝对路径。"""
+    if env is None or getattr(env, "_dataset", None) is None:
+        return
+    if not os.path.isabs(path):
+        path = os.path.join(habitat_lab_root, path)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    json_str = env._dataset.to_json()
+    if path.endswith(".gz"):
+        import gzip
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write(json_str)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json_str)
+    print(f"[保存] 带 collision 的 dataset 已写入: {path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-render", action="store_true", default=True)
@@ -1963,7 +1991,15 @@ if __name__ == "__main__":
             output_path=output_path
         )
         sys.exit(0)
+    # 正常跑时：每集最多跑多少步（0=不限制），从 generate_episodes_config 读
+    my_env.max_steps_per_episode = getattr(_config_mod, "MAX_STEPS_PER_EPISODE", 0)
     my_env.start()
+    # 正常跑 dataset 时：每集结束在 reset() 里已写 current_episode.info["collision"]；退出时保存为新 dataset
+    import atexit
+    out_coll_path = getattr(_config_mod, "OUTPUT_DATASET_WITH_COLLISION_PATH", None)
+    if out_coll_path:
+        _habitat_lab_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        atexit.register(_save_dataset_with_collision, my_env.env, out_coll_path, _habitat_lab_root)
     rospy.Subscriber("/cmd_vel", Twist, callback, (my_env), queue_size=1)
     while not rospy.is_shutdown():
    

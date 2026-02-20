@@ -1,19 +1,26 @@
 # 生成 episodes 的配置（只改本文件即可，无需改 play_rvo_agent.py）
 # GENERATE_ONLY: True = 只生成数据集并退出（不跑 step）；False = 不生成，直接跑 step
-GENERATE_ONLY = True
+GENERATE_ONLY = False
 
-# 模板数据集路径（用于取 episode 作模板）。相对 habitat-lab 根目录，或绝对路径。None = 默认 scene_wise/test_dataset15_finalest_only_8.json.gz
-TEMPLATE_DATASET_PATH = "data/social_nav_episode_0415_570.json.gz"
+# 模板数据集路径（用于取 episode 作模板）。相对 habitat-lab 根目录，或绝对路径。None = 默认 data/social_nav_episode_0415_570.json.gz
+TEMPLATE_DATASET_PATH = "data/data_xinyuan/test_0220.json.gz"
 
 # 采样方式: "circle" = 在门两侧的圆上随机采样（原方法）；"perpendicular" = 人/机器人起始点连线与门连线垂直
 SAMPLE_METHOD = "circle"
 
 # 距离门中点的半径范围（米），本 episode 内统一在该范围内随机一个半径。原为 1.5–2.5，现改为 1.5–2
-RADIUS_MIN = 1
-RADIUS_MAX = 1.5
+RADIUS_MIN = 0.5
+RADIUS_MAX = 1
 
 # 生成数据集的输出路径。相对 habitat-lab 根目录，或绝对路径。None = 默认 data/data_xinyuan/test_dataset15_generated.json.gz
 OUTPUT_PATH = "data/data_xinyuan/test_0220.json.gz"
+
+
+# 正常跑 dataset 时，退出时把带 info.collision 的 dataset 保存到此路径。None = 不保存
+OUTPUT_DATASET_WITH_COLLISION_PATH = "data/data_xinyuan/dataset_with_collision_0220.json.gz"
+
+# 正常跑 dataset 时，每个 episode 最多跑多少步就停（早停）。0 = 不限制，跑完为止；例如 500 = 跑 500 步就停并记 collision
+MAX_STEPS_PER_EPISODE = 300
 
 # 每项：template_episode_index（读入文件中第几号 episode，下标从 0 开始）+ door_pixel_pairs（该模版下的多组门）
 # 格式：每组门为 [[门起点 pixel], [门终点 pixel]]，即 [[x1,y1], [x2,y2]]
