@@ -110,6 +110,8 @@ HUMAN_HEAD_START = 0       #60
 CSV_PATH = "/habitat-lab/data/vids/Test_data_finalest/Only8/exp_8.12/results.csv"
 
 USE_TOPO_MAP = True
+# TensorBoard 日志目录；保留已有 run 时下次 run 改此处为新目录即可，如 "runs/habitat_visualization_2"
+TENSORBOARD_RUNS_DIR = "runs/habitat_visualization_0211"
 USE_RL_CONTROL = False
 USE_CLICKED_POINT = True
 HUMAN_RVO = True
@@ -202,9 +204,9 @@ class sim_env(threading.Thread):
         # # remove_ep_list = [0,1,2,8]
         # remove_ep_list = [1,2,8]
         # episode_cycle=0 表示不跳过，严格按数据集顺序跑；>0 时只跑 (episode_id-1)%cycle==0 的
-        self.episode_cycle = 10  # 0=按顺序跑每一个；>0 时只跑（如 1,41,81...）
+        self.episode_cycle = 0  # 0=按顺序跑每一个；>0 时只跑（如 1,41,81...）
         self.start_episode_id = 1  # 从 dataset 的哪个 episode_id 开始（0 即从 0 开始）
-        self.max_steps_per_episode = 5  # 临时：0=不限制；>0 时跑满该步数就停（调试用）
+        self.max_steps_per_episode = 0  # 临时：0=不限制；>0 时跑满该步数就停（调试用）
         # 让迭代器从 start_episode_id 开始，再 reset 才会加载该 episode
         try:
             from habitat.core.dataset import EpisodeIterator
@@ -223,7 +225,7 @@ class sim_env(threading.Thread):
             while (int(self.env.current_episode.episode_id) - 1) % self.episode_cycle != 0:
                 self.observations = self.env.reset()
         print(f"[Episode] 正在跑 dataset episode_id={self.env.current_episode.episode_id}（与 TensorBoard run 名一致）")
-        self.writer = SummaryWriter(f'runs/habitat_visualization/episode_{self.env.current_episode.episode_id}')
+        self.writer = SummaryWriter(f'{TENSORBOARD_RUNS_DIR}/episode_{self.env.current_episode.episode_id}')
         meters_per_pixel =0.025
         map_name = "sample_map"
         hablab_topdown_map = maps.get_topdown_map(
@@ -504,7 +506,8 @@ class sim_env(threading.Thread):
         
         self.start_ep = False
         if SAVE_DATA:
-            self.im_array[0].save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".gif", save_all=True, append_images=self.im_array[1:], duration=100, loop=0)
+            if len(self.im_array) > 0:
+                self.im_array[0].save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".gif", save_all=True, append_images=self.im_array[1:], duration=100, loop=0)
             self.im_array = []
             init_states_array = np.array(self.full_init_state)
             np.save(SAVE_VIDEO_DIR + "/episode_" + str(self._current_episode) + ".npy", init_states_array)
@@ -516,7 +519,7 @@ class sim_env(threading.Thread):
             self.writer.close()
         except Exception:
             pass
-        self.writer = SummaryWriter(f'runs/habitat_visualization/episode_{self.env.current_episode.episode_id}')
+        self.writer = SummaryWriter(f'{TENSORBOARD_RUNS_DIR}/episode_{self.env.current_episode.episode_id}')
         self.step = 0
         lock.release()
 
@@ -1267,51 +1270,54 @@ class sim_env(threading.Thread):
         )
         return world_pos_3d
     
-    def generate_episodes_from_door_pixels(self, door_pixel_pairs=None, distance=None, episodes_per_door=10):
+    def generate_episodes_from_door_pixels(self, door_pixel_pairs=None, distance=None, episodes_per_door=10, template_episode_index=0, generate_config_list=None, sample_method="circle", radius_min=1.5, radius_max=2.0, output_path=None):
         """
         使用多组pixel点生成episodes
         
-        使用方法:
-            # 在代码中直接设置多组pixel点
-            door_pixel_pairs = [
-                [[300, 231], [300, 243]],  # 第一组：门起点和终点
-                [[400, 200], [400, 250]],  # 第二组：门起点和终点
-                # 可以添加更多组...
-            ]
-            my_env.generate_episodes_from_door_pixels(door_pixel_pairs)
-            
-            # 或者使用custom_topdown_pixel_points（只支持一组）
-            my_env.generate_episodes_from_door_pixels()
+        支持两种用法:
+        1) 多组「模版+门」：传入 generate_config_list，每项为 {"template_episode_index": i, "door_pixel_pairs": [...]}，先跑完第一个模版的所有门，再跑第二个模版的所有门…
+        2) 单模版多门：传入 door_pixel_pairs 与 template_episode_index（generate_config_list 为 None）
         
         Args:
-            door_pixel_pairs: 多组pixel点的列表，格式: [[[pixel_x1, pixel_y1], [pixel_x2, pixel_y2]], ...]
-                            如果为None，则使用custom_topdown_pixel_points（只支持一组）
-            distance: 距离门中点的距离（米）。None 表示每个 episode 在 1–3 米内随机
-            episodes_per_door: 每个门生成多少个 episode，默认 10
+            door_pixel_pairs: 多组门的 pixel 列表（单模版模式用）
+            distance: 距离门中点的距离（米）。None 表示在 radius_min–radius_max 随机
+            episodes_per_door: 每组门生成多少个 episode，默认 10
+            template_episode_index: 单模版模式下用作模板的 episode 下标
+            generate_config_list: 多模版配置列表，每项 {"template_episode_index": int, "door_pixel_pairs": [...]}；非 None 时忽略 door_pixel_pairs 与 template_episode_index
+            sample_method: "circle" 圆上采样 / "perpendicular" 人机连线与门垂直
+            radius_min, radius_max: 半径范围（米），默认 1.5–2.0
+            output_path: 输出 .json.gz 路径，相对 habitat-lab 根目录或绝对路径。None = 默认 data/data_xinyuan/test_dataset15_generated.json.gz
         """
         import sys
         import os
         
-        # 如果没有提供pixel点对，使用custom_topdown_pixel_points
-        if door_pixel_pairs is None:
-            if self.custom_topdown_pixel_points is None or len(self.custom_topdown_pixel_points) < 2:
-                print("错误: 需要提供door_pixel_pairs，或者设置custom_topdown_pixel_points")
-                return
-            door_pixel_pairs = [self.custom_topdown_pixel_points]
-        
-        # 确保door_pixel_pairs是列表的列表
-        if not isinstance(door_pixel_pairs[0][0], list):
-            # 如果只有一组，转换为列表的列表
-            door_pixel_pairs = [door_pixel_pairs]
-        
-        print(f"准备生成episodes，共 {len(door_pixel_pairs)} 组门，每组生成 {episodes_per_door} 个episode")
+        # 多模版模式：展开为 (template_episode_index, door_pixel_pairs) 列表，统一后面循环
+        if generate_config_list is not None and len(generate_config_list) > 0:
+            config_entries = []
+            for c in generate_config_list:
+                dp = c["door_pixel_pairs"]
+                if not isinstance(dp[0][0], list):
+                    dp = [dp]
+                config_entries.append((c["template_episode_index"], dp))
+            total_doors = sum(len(dp) for _, dp in config_entries)
+            print(f"准备生成episodes（多模版），共 {len(config_entries)} 个模版、{total_doors} 组门，每组生成 {episodes_per_door} 个episode")
+        else:
+            # 单模版
+            if door_pixel_pairs is None:
+                if self.custom_topdown_pixel_points is None or len(self.custom_topdown_pixel_points) < 2:
+                    print("错误: 需要提供door_pixel_pairs、generate_config_list，或设置custom_topdown_pixel_points")
+                    return
+                door_pixel_pairs = [self.custom_topdown_pixel_points]
+            if not isinstance(door_pixel_pairs[0][0], list):
+                door_pixel_pairs = [door_pixel_pairs]
+            config_entries = [(template_episode_index, door_pixel_pairs)]
+            print(f"准备生成episodes，共 {len(door_pixel_pairs)} 组门，每组生成 {episodes_per_door} 个episode")
         
         # 导入生成函数
         script_dir = os.path.dirname(os.path.abspath(__file__))
         generate_script_path = os.path.join(script_dir, '..', 'generate_episodes_from_doors.py')
         generate_script_path = os.path.abspath(generate_script_path)
         
-        # 动态导入生成模块
         sys.path.insert(0, os.path.dirname(generate_script_path))
         try:
             import generate_episodes_from_doors as gen_module
@@ -1319,80 +1325,83 @@ class sim_env(threading.Thread):
             print(f"错误: 无法导入generate_episodes_from_doors模块")
             return
         
-        # 加载原始JSON和配置
-        input_json = os.path.join(script_dir, '..', 'scene_wise', 'test_dataset15_finalest_only_8.json.gz')
+        template_path = getattr(_config_mod, 'TEMPLATE_DATASET_PATH', None)
+        if template_path is None:
+            input_json = os.path.join(script_dir, '..', 'scene_wise', 'test_dataset15_finalest_only_8.json.gz')
+        else:
+            input_json = os.path.join(script_dir, '..', template_path) if not os.path.isabs(template_path) else template_path
         input_json = os.path.abspath(input_json)
+        print(f"读入模板数据集: {input_json}")
         base_data = gen_module.load_json_dataset(input_json)
         if len(base_data['episodes']) == 0:
             print("错误: 原始JSON中没有episode")
             return
         
-        base_episode = base_data['episodes'][0]
+        for tidx, _ in config_entries:
+            if not (0 <= tidx < len(base_data['episodes'])):
+                print(f"错误: template_episode_index={tidx} 越界，读入文件共有 {len(base_data['episodes'])} 个 episode（下标 0~{len(base_data['episodes'])-1}）")
+                return
         
-        # 直接使用已有的环境，避免配置问题
-        # 使用self.env而不是创建新环境
         pathfinder = self.env._sim.pathfinder
-        
-        # 设置输出路径 - 保存到 habitat-lab/data/data_xinyuan 目录
-        # 获取habitat-lab的根目录
         habitat_lab_root = os.path.join(script_dir, '..')
         habitat_lab_root = os.path.abspath(habitat_lab_root)
-        output_dir = os.path.join(habitat_lab_root, 'data', 'data_xinyuan')
+        if output_path:
+            output_json = output_path if os.path.isabs(output_path) else os.path.join(habitat_lab_root, output_path)
+        else:
+            output_json = os.path.join(habitat_lab_root, 'data', 'data_xinyuan', 'test_dataset15_generated.json.gz')
+        output_dir = os.path.dirname(output_json)
         os.makedirs(output_dir, exist_ok=True)
-        output_json = os.path.join(output_dir, 'test_dataset15_generated.json.gz')
         print(f"输出目录: {output_dir}")
         print(f"输出文件: {output_json}")
         
-        # 生成所有episodes
         all_episodes = []
         next_episode_id = 0
         
-        for group_idx, (pixel_point1, pixel_point2) in enumerate(door_pixel_pairs):
-            print(f"\n处理第 {group_idx + 1}/{len(door_pixel_pairs)} 组门:")
-            print(f"  门起点像素: {pixel_point1}")
-            print(f"  门终点像素: {pixel_point2}")
-            
-            # 转换pixel到world坐标
-            door_start_world = self.convert_pixel_to_world(pixel_point1[0], pixel_point1[1])
-            door_end_world = self.convert_pixel_to_world(pixel_point2[0], pixel_point2[1])
-            door_start = door_start_world.tolist()
-            door_end = door_end_world.tolist()
-            print(f"  门起点world: {door_start}")
-            print(f"  门终点world: {door_end}")
-            
-            # 为这组门生成episodes
-            for ep_idx in range(episodes_per_door):
-                print(f"  生成episode {ep_idx + 1}/{episodes_per_door}...")
-                new_episode = gen_module.generate_episode_from_door(
-                    base_episode,
-                    door_start,
-                    door_end,
-                    pathfinder,
-                    next_episode_id,
-                    distance
-                )
-                all_episodes.append(new_episode)
-                next_episode_id += 1
+        for template_idx, door_pixel_pairs in config_entries:
+            base_episode = base_data['episodes'][template_idx]
+            print(f"\n>>> 使用第 {template_idx} 号 episode 作为模板，本模版下 {len(door_pixel_pairs)} 组门")
+            for group_idx, (pixel_point1, pixel_point2) in enumerate(door_pixel_pairs):
+                print(f"\n处理第 {group_idx + 1}/{len(door_pixel_pairs)} 组门:")
+                print(f"  门起点像素: {pixel_point1}")
+                print(f"  门终点像素: {pixel_point2}")
                 
-                print(f"    Episode {new_episode['episode_id']}:")
-                print(f"      机器人起始: {new_episode['start_position']}")
-                print(f"      机器人目标: {new_episode['info']['robot_goal']}")
-                print(f"      人起始: {new_episode['info']['human_start']}")
-                print(f"      人目标: {new_episode['info']['human_goal']}")
+                door_start_world = self.convert_pixel_to_world(pixel_point1[0], pixel_point1[1])
+                door_end_world = self.convert_pixel_to_world(pixel_point2[0], pixel_point2[1])
+                door_start = door_start_world.tolist()
+                door_end = door_end_world.tolist()
+                print(f"  门起点world: {door_start}")
+                print(f"  门终点world: {door_end}")
+                
+                for ep_idx in range(episodes_per_door):
+                    print(f"  生成episode {ep_idx + 1}/{episodes_per_door}...")
+                    new_episode = gen_module.generate_episode_from_door(
+                        base_episode,
+                        door_start,
+                        door_end,
+                        pathfinder,
+                        next_episode_id,
+                        distance,
+                        sample_method=sample_method,
+                        radius_min=radius_min,
+                        radius_max=radius_max
+                    )
+                    all_episodes.append(new_episode)
+                    next_episode_id += 1
+                    
+                    print(f"    Episode {new_episode['episode_id']}:")
+                    print(f"      机器人起始: {new_episode['start_position']}")
+                    print(f"      机器人目标: {new_episode['info']['robot_goal']}")
+                    print(f"      人起始: {new_episode['info']['human_start']}")
+                    print(f"      人目标: {new_episode['info']['human_goal']}")
         
-        # 创建新的数据集
         new_data = {
             'config': base_data.get('config'),
             'episodes': all_episodes
         }
-        
-        # 保存新JSON
         print(f"\n保存新JSON到: {output_json}")
         gen_module.save_json_dataset(new_data, output_json)
-        
-        print(f"\n完成! 共生成了 {len(all_episodes)} 个episodes ({len(door_pixel_pairs)} 组门 × {episodes_per_door} 个episode/组)")
-        
-        # 不需要关闭环境，因为使用的是已有的self.env
+        total_doors = sum(len(dp) for _, dp in config_entries)
+        print(f"\n完成! 共生成了 {len(all_episodes)} 个episodes（{len(config_entries)} 个模版、{total_doors} 组门 × {episodes_per_door} 个/组）")
 
     def set_topdown_camera_from_pixel_points(self, pixel_point1, pixel_point2, height=20.0):
         """
@@ -1933,21 +1942,27 @@ if __name__ == "__main__":
     my_env = sim_env(config)
     
     # ============================================================
-    # 使用pixel点生成episodes
+    # 生成 episodes：配置在 examples/generate_episodes_config.py
+    # GENERATE_ONLY=True 时只生成数据集并退出；False 时不生成、直接跑 step
     # ============================================================
-    # 直接在代码中设置多组pixel点，每组生成3个episode
-    # 格式: [[[门起点pixel], [门终点pixel]], ...]
-    
-    DOOR_PIXEL_PAIRS = [
-        [[668, 231], [668, 243]],  # 第一组门
-        # [[400, 200], [400, 250]],  # 第二组门（取消注释来添加）
-        # [[500, 300], [500, 350]],  # 第三组门（取消注释来添加）
-        # 可以添加更多组...
-    ]
-    
-    # # 生成episodes
-    my_env.generate_episodes_from_door_pixels(DOOR_PIXEL_PAIRS)
-    
+    import importlib.util
+    _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_episodes_config.py")
+    _spec = importlib.util.spec_from_file_location("generate_episodes_config", _config_path)
+    _config_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_config_mod)
+    if _config_mod.GENERATE_ONLY:
+        sample_method = getattr(_config_mod, "SAMPLE_METHOD", "circle")
+        radius_min = getattr(_config_mod, "RADIUS_MIN", 1.5)
+        radius_max = getattr(_config_mod, "RADIUS_MAX", 2.0)
+        output_path = getattr(_config_mod, "OUTPUT_PATH", None)
+        my_env.generate_episodes_from_door_pixels(
+            generate_config_list=_config_mod.GENERATE_CONFIG,
+            sample_method=sample_method,
+            radius_min=radius_min,
+            radius_max=radius_max,
+            output_path=output_path
+        )
+        sys.exit(0)
     my_env.start()
     rospy.Subscriber("/cmd_vel", Twist, callback, (my_env), queue_size=1)
     while not rospy.is_shutdown():

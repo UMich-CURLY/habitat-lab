@@ -18,6 +18,13 @@ try:
 except ImportError:
     HAS_MAGNUM = False
 
+# 用于路径存在性校验（规避生成无法寻路的 episode）
+try:
+    import habitat_sim
+    HAS_HABITAT_SIM = True
+except ImportError:
+    HAS_HABITAT_SIM = False
+
 
 def load_json_dataset(json_path: str) -> dict:
     """加载JSON数据集"""
@@ -90,6 +97,35 @@ def to_list(pos):
         return pos
 
 
+def find_valid_position_along_perp(
+    pathfinder,
+    center: np.ndarray,
+    distance: float,
+    perp_sign: float,
+    perp_vec: np.ndarray,
+    door_direction: np.ndarray,
+    door_offset: float = 0.0,
+    height: float = 0.16441,
+    max_attempts: int = 50
+) -> Optional[np.ndarray]:
+    """
+    在「垂直于门」的直线上找一个合法位置：center + distance * (perp_sign * perp_vec) + door_offset * door_direction。
+    用于 perpendicular 采样：人/机器人起始点连线与门垂直。
+    perp_sign: +1 或 -1，表示在门的哪一侧。
+    door_offset: 沿门方向的偏移（米），用于在同一垂直线上多点尝试。
+    """
+    for attempt in range(max_attempts):
+        offset = distance * (perp_sign * perp_vec) + door_offset * door_direction
+        pos = np.array([center[0] + offset[0], height, center[2] + offset[2]])
+        snapped = pathfinder.snap_point(pos)
+        if pathfinder.is_navigable(snapped):
+            dist_actual = np.linalg.norm(np.array([snapped[0], snapped[2]]) - np.array([center[0], center[2]]))
+            if abs(dist_actual - distance) < 0.3:
+                return snapped
+        door_offset += (attempt + 1) * 0.05 * (1 if attempt % 2 == 0 else -1)
+    return None
+
+
 def find_valid_position_on_circle(
     pathfinder,
     center: np.ndarray,
@@ -144,6 +180,26 @@ def find_valid_position_on_circle(
     return None
 
 
+def path_exists(pathfinder, start, end) -> bool:
+    """
+    检查两点之间是否存在可行走路径。
+    用于生成 episode 时规避「起点/终点可站立但无路径」的情况（避免运行时 find_path 失败）。
+    """
+    if not HAS_HABITAT_SIM:
+        return True  # 未安装 habitat_sim 时跳过校验
+    try:
+        start_arr = np.array(start, dtype=np.float32)
+        end_arr = np.array(end, dtype=np.float32)
+        if start_arr.size != 3 or end_arr.size != 3:
+            return False
+        path = habitat_sim.ShortestPath()
+        path.requested_start = start_arr.reshape(3)
+        path.requested_end = end_arr.reshape(3)
+        return pathfinder.find_path(path)
+    except Exception:
+        return False
+
+
 def generate_episode_from_door(
     base_episode: dict,
     door_start: List[float],
@@ -151,7 +207,10 @@ def generate_episode_from_door(
     pathfinder,
     episode_id: int,
     distance: Optional[float] = None,
-    height: float = 0.16441
+    height: float = 0.16441,
+    sample_method: str = "circle",
+    radius_min: float = 1.5,
+    radius_max: float = 2.0
 ) -> dict:
     """
     基于门的位置生成一个episode
@@ -162,118 +221,118 @@ def generate_episode_from_door(
         door_end: 门终点 [x, y, z]
         pathfinder: habitat pathfinder对象
         episode_id: episode ID
-        distance: 距离门中点的距离（米）。None 表示在 [1, 3] 米内随机
+        distance: 距离门中点的距离（米）。None 表示在 radius_min–radius_max 之间随机，本 episode 内统一
         height: 高度，默认0.16441
+        sample_method: "circle" = 在门两侧圆上随机采样；"perpendicular" = 人/机器人起始点连线与门垂直
+        radius_min, radius_max: 半径范围（米），distance 为 None 时使用。默认 1.5–2.0
     
     Returns:
         新的episode字典
     """
-    # 使用 episode_id 做种子，保证可重复
     np.random.seed(episode_id * 1000)
-    # 距离：未指定时在 1–3 米随机
     if distance is None:
-        distance = float(np.random.uniform(1.0, 3.0))
+        distance = float(np.random.uniform(radius_min, radius_max))
 
-    # 计算门的中点
     door_middle = get_door_middle(door_start, door_end)
     door_direction = get_door_direction(door_start, door_end)
-    
-    # 计算垂直于门方向的向量（用于在门的两边生成位置）
-    perp_vec = np.array([-door_direction[2], 0, door_direction[0]])  # 旋转90度
-    perp_vec = perp_vec / np.linalg.norm(perp_vec)  # 归一化
-    
-    # ========== 新方法：圆形生成（半径已在上方随机为 1–3 米）==========
-    # 判断点在门的哪一边：计算点到门中点的向量与perp_vec的点积
-    # 正数表示在perp_vec方向，负数表示在-perp_vec方向
-    
-    # 生成起始位置（在门的一边）
-    max_start_attempts = 100
+    perp_vec = np.array([-door_direction[2], 0, door_direction[0]])
+    perp_vec = perp_vec / np.linalg.norm(perp_vec)
+    perp_vec_2d = np.array([perp_vec[0], perp_vec[2]])
+
     robot_start = None
     human_start = None
-    
-    for attempt in range(max_start_attempts):
-        # 随机生成角度
-        angle_robot = np.random.uniform(0, 2 * math.pi)
-        angle_human = np.random.uniform(0, 2 * math.pi)
-        
-        # 在圆上生成位置
-        robot_start_candidate = find_valid_position_on_circle(
-            pathfinder, door_middle, distance, angle_robot, perp_vec, door_direction, height
-        )
-        human_start_candidate = find_valid_position_on_circle(
-            pathfinder, door_middle, distance, angle_human, perp_vec, door_direction, height
-        )
-        
-        if robot_start_candidate is None or human_start_candidate is None:
-            continue
-        
-        # 检查是否在门的同一侧（通过点积判断）
-        # 只使用x和z坐标（忽略y高度）
-        robot_vec = np.array([robot_start_candidate[0] - door_middle[0], robot_start_candidate[2] - door_middle[2]])
-        human_vec = np.array([human_start_candidate[0] - door_middle[0], human_start_candidate[2] - door_middle[2]])
-        perp_vec_2d = np.array([perp_vec[0], perp_vec[2]])  # 只取x和z分量
-        
-        robot_side = np.dot(robot_vec, perp_vec_2d)  # 正数表示在perp_vec方向
-        human_side = np.dot(human_vec, perp_vec_2d)
-        
-        # 确保在门的两边（起始位置）：robot_side和human_side符号相反
-        if robot_side * human_side < 0:  # 符号相反表示在门的两边
-            # 检查距离是否相近（差别小于0.3米）
-            robot_dist = np.linalg.norm(robot_vec)
-            human_dist = np.linalg.norm(human_vec)
-            if abs(robot_dist - human_dist) <= 0.3:
+    robot_goal = None
+    human_goal = None
+
+    if sample_method == "perpendicular":
+        # ========== 垂直采样：人/机器人起始点连线与门垂直 ==========
+        max_start_attempts = 100
+        for attempt in range(max_start_attempts):
+            door_offset = np.random.uniform(-0.3, 0.3)
+            robot_start_candidate = find_valid_position_along_perp(
+                pathfinder, door_middle, distance, 1.0, perp_vec, door_direction, door_offset, height
+            )
+            human_start_candidate = find_valid_position_along_perp(
+                pathfinder, door_middle, distance, -1.0, perp_vec, door_direction, door_offset, height
+            )
+            if robot_start_candidate is not None and human_start_candidate is not None:
                 robot_start = robot_start_candidate
                 human_start = human_start_candidate
                 break
-    
-    # 生成目标位置（在门的另一边）
-    max_goal_attempts = 100
-    robot_goal = None
-    human_goal = None
-    
-    for attempt in range(max_goal_attempts):
-        # 随机生成角度
-        angle_robot = np.random.uniform(0, 2 * math.pi)
-        angle_human = np.random.uniform(0, 2 * math.pi)
-        
-        # 在圆上生成位置
-        robot_goal_candidate = find_valid_position_on_circle(
-            pathfinder, door_middle, distance, angle_robot, perp_vec, door_direction, height
-        )
-        human_goal_candidate = find_valid_position_on_circle(
-            pathfinder, door_middle, distance, angle_human, perp_vec, door_direction, height
-        )
-        
-        if robot_goal_candidate is None or human_goal_candidate is None:
-            continue
-        
-        # 检查是否在门的另一侧（与起始位置相反）
-        # 只使用x和z坐标（忽略y高度）
-        robot_vec = np.array([robot_goal_candidate[0] - door_middle[0], robot_goal_candidate[2] - door_middle[2]])
-        human_vec = np.array([human_goal_candidate[0] - door_middle[0], human_goal_candidate[2] - door_middle[2]])
-        perp_vec_2d = np.array([perp_vec[0], perp_vec[2]])  # 只取x和z分量
-        
-        robot_side = np.dot(robot_vec, perp_vec_2d)  # 正数表示在perp_vec方向
-        human_side = np.dot(human_vec, perp_vec_2d)
-        
-        # 确保在门的两边（目标位置）：robot_side和human_side符号相反
-        # 且与起始位置在不同侧（如果起始位置已确定）
-        if robot_side * human_side < 0:  # 符号相反表示在门的两边
-            # 如果起始位置已确定，确保目标位置与起始位置在不同侧
-            if robot_start is not None and human_start is not None:
-                robot_start_vec = np.array([robot_start[0] - door_middle[0], robot_start[2] - door_middle[2]])
-                robot_start_side = np.dot(robot_start_vec, perp_vec_2d)
-                # 确保机器人目标与起始在不同侧
-                if robot_side * robot_start_side > 0:
-                    continue  # 在同一侧，跳过
-            # 检查距离是否相近（差别小于0.3米）
-            robot_dist = np.linalg.norm(robot_vec)
-            human_dist = np.linalg.norm(human_vec)
-            if abs(robot_dist - human_dist) <= 0.3:
-                robot_goal = robot_goal_candidate
-                human_goal = human_goal_candidate
+
+        max_goal_attempts = 100
+        for attempt in range(max_goal_attempts):
+            door_offset = np.random.uniform(-0.3, 0.3)
+            robot_goal_candidate = find_valid_position_along_perp(
+                pathfinder, door_middle, distance, -1.0, perp_vec, door_direction, door_offset, height
+            )
+            human_goal_candidate = find_valid_position_along_perp(
+                pathfinder, door_middle, distance, 1.0, perp_vec, door_direction, door_offset, height
+            )
+            if robot_goal_candidate is None or human_goal_candidate is None:
+                continue
+            if not path_exists(pathfinder, robot_start, robot_goal_candidate):
+                continue
+            if not path_exists(pathfinder, human_start, human_goal_candidate):
+                continue
+            robot_goal = robot_goal_candidate
+            human_goal = human_goal_candidate
+            break
+
+    else:
+        # ========== 圆形生成（原方法）==========
+        max_start_attempts = 100
+        for attempt in range(max_start_attempts):
+            angle_robot = np.random.uniform(0, 2 * math.pi)
+            angle_human = np.random.uniform(0, 2 * math.pi)
+            robot_start_candidate = find_valid_position_on_circle(
+                pathfinder, door_middle, distance, angle_robot, perp_vec, door_direction, height
+            )
+            human_start_candidate = find_valid_position_on_circle(
+                pathfinder, door_middle, distance, angle_human, perp_vec, door_direction, height
+            )
+            if robot_start_candidate is None or human_start_candidate is None:
+                continue
+            robot_vec = np.array([robot_start_candidate[0] - door_middle[0], robot_start_candidate[2] - door_middle[2]])
+            human_vec = np.array([human_start_candidate[0] - door_middle[0], human_start_candidate[2] - door_middle[2]])
+            robot_side = np.dot(robot_vec, perp_vec_2d)
+            human_side = np.dot(human_vec, perp_vec_2d)
+            if robot_side * human_side < 0 and abs(np.linalg.norm(robot_vec) - np.linalg.norm(human_vec)) <= 0.3:
+                robot_start = robot_start_candidate
+                human_start = human_start_candidate
                 break
-    
+
+        max_goal_attempts = 100
+        for attempt in range(max_goal_attempts):
+            angle_robot = np.random.uniform(0, 2 * math.pi)
+            angle_human = np.random.uniform(0, 2 * math.pi)
+            robot_goal_candidate = find_valid_position_on_circle(
+                pathfinder, door_middle, distance, angle_robot, perp_vec, door_direction, height
+            )
+            human_goal_candidate = find_valid_position_on_circle(
+                pathfinder, door_middle, distance, angle_human, perp_vec, door_direction, height
+            )
+            if robot_goal_candidate is None or human_goal_candidate is None:
+                continue
+            robot_vec = np.array([robot_goal_candidate[0] - door_middle[0], robot_goal_candidate[2] - door_middle[2]])
+            human_vec = np.array([human_goal_candidate[0] - door_middle[0], human_goal_candidate[2] - door_middle[2]])
+            robot_side = np.dot(robot_vec, perp_vec_2d)
+            human_side = np.dot(human_vec, perp_vec_2d)
+            if robot_side * human_side < 0:
+                if robot_start is not None and human_start is not None:
+                    robot_start_vec = np.array([robot_start[0] - door_middle[0], robot_start[2] - door_middle[2]])
+                    robot_start_side = np.dot(robot_start_vec, perp_vec_2d)
+                    if robot_side * robot_start_side > 0:
+                        continue
+                if abs(np.linalg.norm(robot_vec) - np.linalg.norm(human_vec)) <= 0.3:
+                    if not path_exists(pathfinder, robot_start, robot_goal_candidate):
+                        continue
+                    if not path_exists(pathfinder, human_start, human_goal_candidate):
+                        continue
+                    robot_goal = robot_goal_candidate
+                    human_goal = human_goal_candidate
+                    break
+
     # 如果找不到合法位置，使用随机可导航点
     if robot_start is None:
         robot_start = pathfinder.get_random_navigable_point()

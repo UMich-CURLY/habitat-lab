@@ -228,6 +228,6 @@ habitat:
   dataset:
     # data_path: /habitat-lab/data/scene_wise/test_dataset15_finalest.json.gz
     # data_path: /habitat-lab/data/scene_wise/test_dataset15_finalest_only_8.json.gz  # 原始dataset
-    # data_path: /habitat-lab/data/data_xinyuan/test_dataset15_generated.json.gz  # 新生成的dataset
-    data_path: /habitat-lab/data/social_nav_episode_0415_570.json.gz
+    data_path: /habitat-lab/data/data_xinyuan/test_dataset15_generated.json.gz  # 新生成的dataset
+    # data_path: /habitat-lab/data/social_nav_episode_0415_570.json.gz
 
