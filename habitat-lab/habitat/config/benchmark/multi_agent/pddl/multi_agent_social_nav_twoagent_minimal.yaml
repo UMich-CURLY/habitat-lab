@@ -38,5 +38,6 @@ stage_goals:
 # ordering when solving. Keep the solution here for reproducibility and to
 # support code paths that expect a concrete solution list.
 solution:
-  - nav_to_obj(TARGET_robot_0_goal, robot_0)
-  - nav_to_obj(TARGET_robot_1_goal, robot_1)
+  - nav_to_goal_social(TARGET_robot_0_goal, robot_0)
+  - back_off(robot_0)
+  - nav_to_goal_social(TARGET_robot_1_goal, robot_1)

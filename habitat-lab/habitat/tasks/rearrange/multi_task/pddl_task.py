@@ -14,6 +14,9 @@ from habitat.tasks.rearrange.multi_task.pddl_domain import PddlProblem
 from habitat.tasks.rearrange.rearrange_task import RearrangeTask
 
 from IPython import embed
+import numpy as np
+import magnum as mn
+import habitat_sim
 
 
 @registry.register_task(name="RearrangePddlTask-v0")

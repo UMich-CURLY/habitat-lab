@@ -15,7 +15,7 @@ from habitat.tasks.rearrange.sub_tasks.nav_to_obj_task import (
     NavToInfo,
     MyNavToInfo,
 )
-
+from IPython import embed
 
 @registry.register_task(name="TwoAgentSocialNavTask-v0")
 class TwoAgentSocialNavTask(PddlTask):
@@ -40,6 +40,7 @@ class TwoAgentSocialNavTask(PddlTask):
         # Inspect PDDL problem and actions
         pddl_prob = self.pddl_problem  # or task._pddl_problem depending on your Task impl
         print("Available PDDL actions:", list(pddl_prob.actions.keys()))
+        
         # Examine the post-conditions for a named action (e.g., 'nav' or 'nav_to_receptacle_by_name')
         # for a_name, a_obj in pddl_prob.actions.items():
         #     print("Action:", a_name)
@@ -120,5 +121,5 @@ class TwoAgentSocialNavTask(PddlTask):
        
 
         self._sim.maybe_update_articulated_agent()
-
+        # embed()
         return self._get_observations(episode)

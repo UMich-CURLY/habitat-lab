@@ -3,3 +3,4 @@
 # LICENSE file in the root directory of this source tree.
 
 from . import two_agent_social_nav_task  # noqa: F401  (registers TwoAgentSocialNavTask)
+from . import nav_to_obj_social_task  # noqa: F401  (registers NavToObjSocialTask)

@@ -2,7 +2,7 @@ defaults:
   - social_nav_twoagent
 
 habitat_baselines:
-  tensorboard_dir: "/habitat-lab/data/tensorboard/social_nav_oracle/"
+  tensorboard_dir: "/habitat-lab/data/tensorboard/social_nav_rvo/"
   evaluate: true        # optional: can also pass on CLI
   rl:
     policy:
@@ -18,17 +18,39 @@ habitat_baselines:
             # default the domain exposes many primitive and composite
             # actions; here we limit planning/execution to `nav_to_goal`.
             allowed_actions:
-              - nav_to_obj
-            add_arm_rest: True
+              - nav_to_goal
+              - nav_to_goal_social
+            add_arm_rest: False
             allow_other_place: False
+            
             termination_obs_name: "has_finished_oracle_nav"
           defined_skills:
             oracle_nav:
               skill_name: "OracleNavPolicy"
-              pddl_action_names: ["nav_to_obj", "reset_arm"]
+              pddl_action_names: ["nav_to_goal_social"]
               action_name: "agent_0_oracle_nav_action"
               max_skill_steps: 1500
               ignore_grip: true
+            back_off:
+              skill_name: "BackOffSkillPolicy"
+              pddl_action_names: ["back_off"]
+              max_skill_steps: 20
+              ignore_grip: True
+            wait:
+              skill_name: "WaitSkillPolicy"
+              pddl_action_names: ["wait"]
+              max_skill_steps: -1
+              force_end_on_timeout: False
+          # Some default skill sets include NN skills (e.g. `nav_to_obj` -> NavSkillPolicy)
+          # which assume a manipulator/IsHoldingSensor. This oracle config is
+          # navigation-only; explicitly ignore those default skills so only the
+          # scripted/oracle skills defined above are instantiated.
+          ignore_skills: ["nav_to_obj", "nav_to_goal", "nav_to_randcoord"]
+            # wait:
+            #   skill_name: "WaitSkillPolicy"
+            #   pddl_action_names: ["wait"]
+            #   max_skill_steps: -1
+            #   force_end_on_timeout: False
 
       agent_1:
         name: HierarchicalPolicy
@@ -37,15 +59,26 @@ habitat_baselines:
             # Mirror agent_0 but use the fixed planner so no neural encoder
             # is constructed for agent_1 either.
             name: "FixedHighLevelPolicy"
-            # Restrict agent_1 to only plan nav_to_obj actions as well.
-            allowed_actions:
-              - nav_to_obj
             allow_other_place: False
+            add_arm_rest: False
             termination_obs_name: "has_finished_oracle_nav"
           defined_skills:
             oracle_nav:
               skill_name: "OracleNavPolicy"
-              pddl_action_names: ["nav_to_obj", "reset_arm"]
+              pddl_action_names: ["nav_to_goal_social"]
               action_name: "agent_1_oracle_nav_action"
               max_skill_steps: 1500
               ignore_grip: true
+            # reset_arm:
+            #   skill_name: "ResetArmSkill"
+            #   pddl_action_names: ["reset_arm"]
+            #   max_skill_steps: 50
+            #   force_end_on_timeout: False
+            #   reset_joint_state: [-4.50e-01, -1.07e00, 9.95e-02, 9.38e-01, -7.88e-04, 1.57e00, 4.62e-03]
+            wait:
+              skill_name: "WaitSkillPolicy"
+              pddl_action_names: ["wait"]
+              max_skill_steps: -1
+              force_end_on_timeout: False
+          # Mirror the ignore list for agent_1 as well.
+          ignore_skills: ["nav_to_obj", "nav_to_goal", "nav_to_randcoord"]

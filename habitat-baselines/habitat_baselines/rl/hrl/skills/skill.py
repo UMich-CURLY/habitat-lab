@@ -67,7 +67,19 @@ class SkillPolicy(Policy):
                 found_grip = True
                 break
         if not found_grip and not self.should_ignore_grip:
-            raise ValueError(f"Could not find grip action in {action_space}")
+            # If the action space simply does not expose an `arm_action`
+            # (common for non-manipulation / navigation-only tasks), treat
+            # the grip action as intentionally absent and fall back to
+            # ignoring grip instead of raising an error. This keeps skill
+            # construction robust across different task types.
+            try:
+                has_arm_action = "arm_action" in list(action_space.keys())
+            except Exception:
+                has_arm_action = False
+            if not has_arm_action:
+                self.should_ignore_grip = True
+            else:
+                raise ValueError(f"Could not find grip action in {action_space}")
 
         self._stop_action_idx, _ = find_action_range(
             action_space, "rearrange_stop"
@@ -116,6 +128,7 @@ class SkillPolicy(Policy):
         """
         Modifies the actions according to the postconditions set in self._pddl_problem.actions[skill_name]
         """
+        import pdb; pdb.set_trace()
         skill_args = self._raw_skill_args[env_i]
         action = self._pddl_problem.actions[skill_name]
 
@@ -225,6 +238,8 @@ class SkillPolicy(Policy):
                 baselines_logger.debug(
                     f"Entering skill {self} with arguments {skill_arg[i]}"
                 )
+            if skill_arg[i] == '0':
+                import pdb; pdb.set_trace()
             self._cur_skill_args[batch_idx] = self._parse_skill_arg(
                 skill_name[i], skill_arg[i]
             )
@@ -243,7 +258,35 @@ class SkillPolicy(Policy):
     def from_config(
         cls, config, observation_space, action_space, batch_size, full_config
     ):
-        return cls(config, action_space, batch_size)
+        # Only enable keeping the holding state if the observation space
+        # actually contains the IsHoldingSensor. This prevents skills that
+        # don't use the manipulator (navigation-only skills) from trying to
+        # index `is_holding` and raising KeyError.
+        should_keep_hold_state = False
+        try:
+            # observation_space is usually a gym.spaces.Dict
+            if hasattr(observation_space, "spaces") and (
+                IsHoldingSensor.cls_uuid in observation_space.spaces
+            ):
+                should_keep_hold_state = True
+        except Exception:
+            # Be conservative: if we can't determine it, leave it disabled.
+            should_keep_hold_state = False
+
+        # Instantiate without forcing a specific __init__ signature so
+        # subclasses that don't accept `should_keep_hold_state` won't fail.
+        inst = cls(config, action_space, batch_size)
+
+        # Set the flag on the instance when appropriate. This is safe even
+        # if the subclass also handled it in its own __init__.
+        try:
+            inst._should_keep_hold_state = should_keep_hold_state
+        except Exception:
+            # If the instance doesn't expose that attribute for some reason,
+            # ignore and return the instance as-is.
+            pass
+
+        return inst
 
     def act(
         self,

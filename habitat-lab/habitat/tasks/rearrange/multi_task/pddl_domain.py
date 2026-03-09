@@ -142,6 +142,14 @@ class PddlDomain:
             action = PddlAction(
                 action_d["name"], parameters, pre_cond, post_cond
             )
+            # Preserve optional task info from the domain file (e.g., which
+            # underlying task to run for this PDDL action). This is used by
+            # PddlTask to bind runtime behaviour (like enabling RVO) to
+            # specific actions such as `nav_to_goal_social`.
+            try:
+                action._task_info = action_d.get("task_info", None)
+            except Exception:
+                action._task_info = None
             self._orig_actions[action.name] = action
         self._actions = dict(self._orig_actions)
 

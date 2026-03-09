@@ -561,7 +561,14 @@ class BaseVelNonCylinderAction(ArticulatedAgentAction):
         self._longitudinal_lin_speed = self._config.longitudinal_lin_speed
         self._lateral_lin_speed = self._config.lateral_lin_speed
         self._ang_speed = self._config.ang_speed
-        self._navmesh_offset = self._config.navmesh_offset
+        # Ensure _navmesh_offset is a list-like value. Some configs may
+        # omit `navmesh_offset` (None); treat that as an empty list so
+        # collision checks that iterate over offsets are safe.
+        self._navmesh_offset = (
+            self._config.navmesh_offset
+            if getattr(self._config, "navmesh_offset", None) is not None
+            else []
+        )
         self._enable_lateral_move = self._config.enable_lateral_move
 
     @property

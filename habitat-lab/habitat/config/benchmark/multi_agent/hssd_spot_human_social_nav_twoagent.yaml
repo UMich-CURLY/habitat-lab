@@ -10,6 +10,9 @@ defaults:
   - /habitat/simulator/agents@habitat.simulator.agents.agent_1: human
   # Config agent hssd data
   - /habitat/dataset/rearrangement: hssd
+  
+  # Ensure agent_1 has an arm action available so ResetArmSkill can be used.
+  - /habitat/task/actions@habitat.task.actions.agent_1_arm_action: arm_action
   # Config agent action
   - /habitat/task/actions@habitat.task.actions.agent_0_base_velocity: base_velocity_non_cylinder
   - /habitat/task/actions@habitat.task.actions.agent_1_base_velocity: base_velocity
@@ -25,14 +28,14 @@ defaults:
     - articulated_agent_colls
     - num_steps
     - did_agents_collide
-    - num_agents_collide
+    # - num_agents_collide
     - force_terminate
     - social_nav_reward
-    - rot_dist_to_goal
-    - dist_to_goal
-    - nav_to_pos_succ
+    # - rot_dist_to_goal
+    # - dist_to_goal
+    # - nav_to_pos_succ
     - social_dist_to_goal
-    - social_nav_seek_success
+    # - social_nav_seek_success
     - social_nav_stats
     - social_nav_to_pos_succ
     
@@ -65,6 +68,7 @@ habitat:
         # If the human detector function is image or binary flag
         return_image: False
         is_return_image_bbox: False
+       
 
     # Use the new minimal TwoAgentSocialNavTask that doesn't bind PDDL/problems
     type: TwoAgentSocialNavTask-v0
@@ -105,17 +109,27 @@ habitat:
       agent_0_oracle_nav_action:
         type: OracleNavAction
         motion_control: base_velocity
-        spawn_max_dist_to_obj: -1.0
+        # Sample approach points around the object to avoid symmetric collisions
+        spawn_max_dist_to_obj: 1.5
+        # spawn_max_dist_to_obj_delta: 0.1
         dist_thresh: 0.5
-        lin_speed: 10.0
-        ang_speed: 10.0
+        lin_speed: 8.0
+        ang_speed: 8.0
 
 
       agent_1_oracle_nav_action:
         type: OracleNavAction
-        # motion_control: human_joints
-        # lin_speed: 10.0
-        # ang_speed: 10.0
+        motion_control: human_joints
+        # Sample approach points for humanoid as well
+        spawn_max_dist_to_obj: 1.5
+        # spawn_max_dist_to_obj_delta: 0.1
+        dist_thresh: 0.5
+        lin_speed: 6.0
+        ang_speed: 6.0
+
+      # Arm action for agent_1 (humanoid) so ResetArmSkill has an arm_action
+      agent_1_arm_action:
+        grip_controller: MagicGraspAction
 
     robot_at_thresh: 3.0
 
@@ -125,11 +139,8 @@ habitat:
       - agent_0_spot_head_stereo_depth_sensor
       - agent_0_humanoid_detector_sensor
       - agent_0_has_finished_oracle_nav
-      - agent_1_head_depth
-      - agent_1_relative_resting_position
-      - agent_1_localization_sensor
       - agent_1_has_finished_oracle_nav
-      - agent_1_other_agent_gps
+
 
   environment:
     max_episode_steps: 750

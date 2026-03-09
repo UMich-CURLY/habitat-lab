@@ -69,18 +69,35 @@ actions:
   - name: nav_to_goal
     parameters:
       - name: obj
-        expr_type: movable_entity_type
+        expr_type: goal_entity_type
       - name: robot
         expr_type: robot_entity_type
-    precondition:
-      # The robot cannot be holding the object that it wants to navigate to.
-      expr_type: NAND
-      sub_exprs:
-        - holding(obj, robot)
+    # For goal-target navigation we don't require a holding precondition
+    # (goal markers are not manipulable objects), keep precondition null.
+    precondition: null
     postcondition:
       - robot_at(obj, robot)
     task_info:
-      task: NavToObjTask-v0
+      task: NavToObjSocialTask-v0
+      task_def: "nav_to_obj"
+      config_args:
+        task.force_regenerate: True
+        task.should_save_to_cache: False
+
+  - name: nav_to_goal_social
+    parameters:
+      - name: obj
+        expr_type: goal_entity_type
+      - name: robot
+        expr_type: robot_entity_type
+    precondition: null
+    postcondition:
+      - robot_at(obj, robot)
+    # Use the same underlying task for now; this separate action lets us
+    # later customize social-nav-specific behavior or configs without
+    # touching the original nav_to_goal primitive.
+    task_info:
+      task: NavToObjSocialTask-v0
       task_def: "nav_to_obj"
       config_args:
         task.force_regenerate: True
@@ -227,3 +244,31 @@ actions:
       config_args:
         task.force_regenerate: True
         task.should_save_to_cache: False
+
+  - name: back_off
+    parameters:
+      - name: robot
+        expr_type: robot_entity_type
+    precondition: null
+    postcondition: []
+
+  - name: approach_human
+    parameters:
+      - name: human
+        expr_type: static_obj_type
+      - name: robot
+        expr_type: robot_entity_type
+    precondition: null
+    postcondition:
+      - robot_at(human, robot)
+    task_info:
+      task: NavToObjTask-v0
+      task_def: "nav_to_obj"
+      config_args:
+        task.force_regenerate: True
+        task.should_save_to_cache: False
+
+  - name: wait
+    parameters: []
+    precondition: null
+    postcondition: []

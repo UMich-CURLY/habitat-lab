@@ -138,6 +138,7 @@ class OracleNavPolicy(NnSkillPolicy):
             raise ValueError(
                 f"Unexpected number of skill arguments in {skill_arg}"
             )
+            
 
         target = self._pddl_problem.get_entity(search_target)
         if target is None:

@@ -171,7 +171,6 @@ class HabitatEvaluator(Evaluator):
                 ]
             else:
                 step_data = [a.item() for a in action_data.env_actions.cpu()]
-            print(action_data.env_actions.cpu())
             outputs = envs.step(step_data)
 
             observations, rewards_l, dones, infos = [

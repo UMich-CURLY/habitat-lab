@@ -271,8 +271,25 @@ class HierarchicalPolicy(nn.Module, Policy):
             for dat_k, dat in sel_dat.items():
                 if dat_k == "observations":
                     # Reduce the slicing required by only extracting what the
-                    # skills will actually need.
-                    dat = dat.slice_keys(*self._skills[k].required_obs_keys)
+                    # skills will actually need. Be defensive: some skills may
+                    # declare sensors (e.g. `is_holding`) that are not present
+                    # in navigation-only tasks. Instead of erroring, intersect
+                    # the required keys with the available keys.
+                    try:
+                        req_keys = self._skills[k].required_obs_keys
+                    except Exception:
+                        req_keys = []
+                    if req_keys:
+                        # dat.keys() may be the available observation keys
+                        available_keys = [kk for kk in req_keys if kk in dat]
+                        if len(available_keys) > 0:
+                            dat = dat.slice_keys(*available_keys)
+                        else:
+                            # No required keys available; leave dat as-is
+                            pass
+                    else:
+                        # Skill doesn't declare required keys; nothing to slice
+                        pass
                 skill_dat[dat_k] = dat[v]
             grouped_skills[k] = (v, skill_dat)
         return grouped_skills
