@@ -8,7 +8,7 @@ import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HABITAT_LAB_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 DATASET_PATH = os.path.join(HABITAT_LAB_ROOT, "data/data_xinyuan/dataset_with_collision_0220.json.gz")
-NUM_EPISODES = 11
+NUM_EPISODES = 10
 
 
 def load_dataset(path):

@@ -123,6 +123,10 @@ USE_CLICKED_POINT_IRL = False
 RANDOM_AGENT = False
 ALLOW_BACKOFF = False
 NO_ROBOT = False
+# 卡住即碰撞：连续 N 步内机器人与人类位移都很小则视为发生碰撞（不用内置物理碰撞）
+STUCK_COLLISION_STEPS = 100
+STUCK_DISPLACEMENT_THRESHOLD_M = 0.15  # 该步数内两人总位移都小于此（米）则标记为 collide
+METERS_PER_GRID = 0.025  # 与 topdown map 一致，用于把 grid 位移换算成米
 lock = threading.Lock()
 
 def to_grid(pathfinder, points, grid_dimensions):
@@ -411,6 +415,8 @@ class sim_env(threading.Thread):
         self.prev_query_time = rospy.Time.now()
         self.got_sem_cloud = False
         self.cloud_wait_counter = 0
+        self.head_start_attempts = 0  # 给 human 领先时的尝试次数，超过上限则不再等待，避免死循环
+        self.robot_wait_attempts = 0  # 等待 robot 轨迹的尝试次数，超过上限则直接用 robot_goal，避免卡死
         print("Starting the work now")
         self.im_array = []
         self._current_episode = 0
@@ -420,6 +426,7 @@ class sim_env(threading.Thread):
         self.backoff_mode = False
         self.robot_moved = []
         self.human_moved = []
+        self._stuck_collision_this_episode = False  # 由 100 步无位移检测置为 True，写 episode.info["collision"]
         self.human_num_steps = 0
         self.full_init_state = []
         self.hack_to_save = None
@@ -437,20 +444,33 @@ class sim_env(threading.Thread):
 
         # self.sfm.get_velocity(self.initial_state, filename = MAP_DIR+"run_rvo2", save_anim = True)
 
-    def reset(self):
-        # 上一集跑完后把是否碰撞写回 current_episode.info（第一次 reset 时还没跑过，不写）
-        if getattr(self, "_reset_count", 0) > 0 and self.env.current_episode is not None:
-            m = self.env.get_metrics()
+    def _write_collision_then_reset(self):
+        """本集刚结束、尚未调用 env.reset 时调用：把 collision（卡住检测）写回 current_episode.info 再 reset。"""
+        if self.env.current_episode is not None:
             if self.env.current_episode.info is None:
                 self.env.current_episode.info = {}
-            self.env.current_episode.info["collision"] = (m.get("num_agents_collide", 0) > 0)
+            self.env.current_episode.info["collision"] = getattr(
+                self, "_stuck_collision_this_episode", False
+            )
+        self.reset()
+
+    def reset(self):
+        # 上一集跑完后把是否碰撞（卡住检测）写回 current_episode.info（第一次 reset 时还没跑过，不写）
+        if getattr(self, "_reset_count", 0) > 0 and self.env.current_episode is not None:
+            if self.env.current_episode.info is None:
+                self.env.current_episode.info = {}
+            self.env.current_episode.info["collision"] = getattr(
+                self, "_stuck_collision_this_episode", False
+            )
         self._reset_count = getattr(self, "_reset_count", 0) + 1
         #### Save the results of the previous episode ####
         if SAVE_DATA:
             metrics = self.env.get_metrics()
             results_dict = {}
             results_dict["num_steps"] = metrics["num_steps"]
-            results_dict["did_collide"] = metrics["did_collide"]
+            results_dict["did_collide"] = getattr(
+                self, "_stuck_collision_this_episode", False
+            )
             results_dict["robot_scene_collision"] = metrics["robot_collisions"]["robot_scene_colls"]
             results_dict["social_nav_to_pos_success"] = metrics["social_nav_to_pos_success"]
             results_dict["social_dist_to_goal"] = metrics["social_dist_to_goal"]
@@ -552,10 +572,12 @@ class sim_env(threading.Thread):
         self.backoff_mode = False
         self.cheating_point = None
         self.waiting_for_traj = True
+        self.robot_wait_attempts = 0
         self.counter_deadlock = 0
         # self.step = 0  # 每 episode 重置，避免 TensorBoard Images 滑块在高 step 时“一跳很大”
         self.robot_moved = []
         self.human_moved = []
+        self._stuck_collision_this_episode = False
         self.human_num_steps = 0
         self.full_init_state = []
         self._reload_map_server.publish(True)
@@ -711,7 +733,7 @@ class sim_env(threading.Thread):
     def update_agent_pos_vel(self):
         if (self.env._episode_over):
             print("Done with episode and starting a new one")
-            self.reset()
+            self._write_collision_then_reset()
             return
 
         dist_human_moved = np.linalg.norm(self.objs[1].base_pos -  self.env.current_episode.info['human_start'])
@@ -738,16 +760,25 @@ class sim_env(threading.Thread):
             # self.observations.update(self.env.step({"action": 'agent_0_base_velocity', "action_args":{"agent_0_base_vel":base_vel}}))
             return
         self.wait_counter +=1
-        while (dist_human_moved<0.2):
-            self._pub_start_ep.publish(False)
-            print("Giving the human a head start")
-            k = 'agent_1_oracle_nav_randcoord_action'
-            for i in range(1):
-                self.observations.update(self.env.step({"action":k, "action_args":{}}))
-                
-            dist_human_moved = np.linalg.norm(self.objs[1].base_pos -  self.env.current_episode.info['human_start'])
-            self.waiting_for_traj = True
-            return
+        # 人类移动不足 0.2 时先给 human 几步“领先”；超过最大尝试次数则不再等待，避免卡死
+        HEAD_START_MAX_ATTEMPTS = 200
+        if dist_human_moved < 0.2:
+            self.head_start_attempts += 1
+            if self.head_start_attempts > HEAD_START_MAX_ATTEMPTS:
+                print("Head start attempts exceeded {}, proceeding anyway (human moved {})".format(HEAD_START_MAX_ATTEMPTS, dist_human_moved))
+                self.head_start_attempts = 0
+                # 不 return，继续往下执行
+            else:
+                self._pub_start_ep.publish(False)
+                print("Giving the human a head start")
+                k = 'agent_1_oracle_nav_randcoord_action'
+                for i in range(1):
+                    self.observations.update(self.env.step({"action":k, "action_args":{}}))
+                dist_human_moved = np.linalg.norm(self.objs[1].base_pos -  self.env.current_episode.info['human_start'])
+                self.waiting_for_traj = True
+                return
+        else:
+            self.head_start_attempts = 0
         # computed_velocity = self.sfm.get_velocity(np.array(self.initial_state))
         
         path = habitat_sim.ShortestPath()
@@ -755,12 +786,24 @@ class sim_env(threading.Thread):
         path.requested_end = self.env.current_episode.info['human_goal']
         pathfinder = self.env._sim.pathfinder
         found_path = pathfinder.find_path(path)
-        if found_path:
-            for points in path.points:
-                dist_between_human_and_point = np.linalg.norm(points - self.objs[1].base_pos)
+
+        # 如果没找到路径，或者路径里没有点，就直接用 human_goal 作为 fallback，
+        # 保证不会因为 points 未定义而报错 / 卡住。
+        target_point = None
+        if found_path and len(path.points) > 0:
+            for p in path.points:
+                dist_between_human_and_point = np.linalg.norm(p - self.objs[1].base_pos)
                 if dist_between_human_and_point > 0.5:
+                    target_point = p
                     break
-        self.initial_state[1][4:6] = to_grid(self.env._sim.pathfinder, points, self.grid_dimensions)
+            if target_point is None:
+                # 如果所有点都离当前 human 太近，就用路径的最后一个点
+                target_point = path.points[-1]
+        else:
+            # 找不到路径时 fallback：直接把 human_goal 当目标点
+            target_point = np.array(self.env.current_episode.info['human_goal'])
+
+        self.initial_state[1][4:6] = to_grid(self.env._sim.pathfinder, target_point, self.grid_dimensions)
         # print("Human goal in 2d update in play agent is ", self.initial_state[1][4:6])
     
         self._pub_start_ep.publish(True)
@@ -786,29 +829,33 @@ class sim_env(threading.Thread):
             if dist_to_goal <=1.3:
                 self.current_point = robot_final_goal
                 self.waiting_for_traj = False
+            # 等待 robot 轨迹（cheating_point）或 waiting_for_traj 变为 False；超过最大尝试次数则直接用 robot_goal 继续，避免卡死
+            ROBOT_WAIT_MAX_ATTEMPTS = 100
             while self.cheating_point is None or self.waiting_for_traj:
                 # base_vel = [0.0, 0.0]
                 wait_time = (rospy.Time.now()-self.prev_query_time).to_sec()
                 if wait_time > 0.5 and self.waiting_for_traj:
+                    self.robot_wait_attempts += 1
+                    if self.robot_wait_attempts > ROBOT_WAIT_MAX_ATTEMPTS:
+                        print("Robot wait for traj exceeded {} attempts, proceeding with robot_goal".format(ROBOT_WAIT_MAX_ATTEMPTS))
+                        self.current_point = robot_final_goal
+                        self.waiting_for_traj = False
+                        self.robot_wait_attempts = 0
+                        break
                     print("Time between queries is ", (rospy.Time.now()-self.prev_query_time).to_sec())
                     self._pub_get_traj.publish(True)
                     self.prev_query_time = rospy.Time.now()
-                    self.drift_counter +=1
-                    # dist_to_goal_human = np.linalg.norm((np.array(self.env.current_episode.info['human_goal'])-np.array(self.objs[1].base_pos))[[0,2]])
-                    # if dist_to_goal_human <= 0.3:
-                    #     self.current_point = self.env.current_episode.info['robot_goal']
-                    #     self.waiting_for_traj = False
-                    #     print("Setting to robot final goal")
-                    #     break
+                    self.drift_counter += 1
                     return
-                if self.drift_counter >20:
+                if self.drift_counter > 20:
                     print("Not sure what to do now")
-
                     # self._reload_map_server.publish(True)
                     self.drift_counter = 0
-                if self.drift_counter >100000:
-                    self.reset()
+                if self.drift_counter > 100000:
+                    self._write_collision_then_reset()
                     return
+            # 正常等到轨迹后重置计数，供下一轮等待使用
+            self.robot_wait_attempts = 0
         if USE_TOPO_MAP:
             path = habitat_sim.ShortestPath()
             path.requested_start = self.objs[0].base_pos
@@ -945,12 +992,12 @@ class sim_env(threading.Thread):
         for i in range(1):
             if (self.env._episode_over):
                 print("Done with episode and starting a new one")
-                self.reset()
+                self._write_collision_then_reset()
                 return
             self.actual_num_steps +=1
             if self.max_steps_per_episode > 0 and self.actual_num_steps >= self.max_steps_per_episode:
                 print(f"[临时] 已跑满 {self.max_steps_per_episode} 步，停止并重置")
-                self.reset()
+                self._write_collision_then_reset()
                 return
             human_final_goal = self.env.current_episode.info['human_goal']
             dist_to_goal_human = np.linalg.norm((np.array(human_final_goal)-np.array(self.objs[1].base_pos))[[0, 2]])
@@ -979,7 +1026,7 @@ class sim_env(threading.Thread):
             # print("Agent currently at ", self.env.sim.agents_mgr[0].articulated_agent.base_pos)
             if (self.env._episode_over):
                 print("Done with episode and starting a new one")
-                self.reset()
+                self._write_collision_then_reset()
                 return
             if not NO_ROBOT:
                 self.observations.update(self.env.step({"action":k, "action_args":{"agent_0_oracle_nav_randcoord_action":coord_nav}}))
@@ -1003,6 +1050,14 @@ class sim_env(threading.Thread):
         print("Robot moved ", dist_moved_robot, " and human moved ", dist_moved_human)
         self.robot_moved.append(dist_moved_robot)
         self.human_moved.append(dist_moved_human)
+        # 卡住即碰撞：最近 STUCK_COLLISION_STEPS 步内两人位移都很小则标记本集有 collision
+        if len(self.robot_moved) >= STUCK_COLLISION_STEPS:
+            robot_disp_grid = np.sum(self.robot_moved[-STUCK_COLLISION_STEPS:], axis=0)
+            human_disp_grid = np.sum(self.human_moved[-STUCK_COLLISION_STEPS:], axis=0)
+            robot_disp_m = np.linalg.norm(robot_disp_grid) * METERS_PER_GRID
+            human_disp_m = np.linalg.norm(human_disp_grid) * METERS_PER_GRID
+            if robot_disp_m < STUCK_DISPLACEMENT_THRESHOLD_M and human_disp_m < STUCK_DISPLACEMENT_THRESHOLD_M:
+                self._stuck_collision_this_episode = True
         self.initial_state[0][2:4] = dist_moved_robot*self.control_frequency
         self.initial_state[1][2:4] = dist_moved_human*self.control_frequency
         self.initial_state[0][0:2] = positions_now[0]
