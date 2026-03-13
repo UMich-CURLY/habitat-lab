@@ -79,7 +79,7 @@ actions:
       - robot_at(obj, robot)
     task_info:
       task: NavToObjSocialTask-v0
-      task_def: "nav_to_obj"
+      task_def: "nav_to_goal"
       config_args:
         task.force_regenerate: True
         task.should_save_to_cache: False
@@ -98,7 +98,7 @@ actions:
     # touching the original nav_to_goal primitive.
     task_info:
       task: NavToObjSocialTask-v0
-      task_def: "nav_to_obj"
+      task_def: "nav_to_goal_social"
       config_args:
         task.force_regenerate: True
         task.should_save_to_cache: False

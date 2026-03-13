@@ -172,7 +172,8 @@ class HabitatEvaluator(Evaluator):
             else:
                 step_data = [a.item() for a in action_data.env_actions.cpu()]
             outputs = envs.step(step_data)
-
+            print("Taking actions ", step_data)
+            # import pdb; pdb.set_trace()
             observations, rewards_l, dones, infos = [
                 list(x) for x in zip(*outputs)
             ]
