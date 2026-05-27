@@ -16,6 +16,7 @@ from habitat.tasks.rearrange.multi_task.pddl_task import PddlTask
 
 from habitat.tasks.rearrange.social_nav.rvo_manager import (
     RVOManager,
+    save_rvo_navmesh_obstacle_debug_figure,
     static_obstacles_from_sim_topdown,
 )
 from habitat.tasks.rearrange.sub_tasks.nav_to_obj_task import (
@@ -63,11 +64,9 @@ class TwoAgentSocialNavTask(PddlTask):
         self._rvo_static_map_enabled: bool = bool(
             getattr(config, "rvo_static_map_enabled", True)
         )
-        # Not a TaskConfig field (kept out to avoid extending the structured
-        # config); override per-task via a subclass or runtime call to
-        # ``enable_rvo(controlled_agents=...)``. Default: both agents, so
-        # neither one ignores the other when computing avoidance moves.
-        self._rvo_default_controlled: List[int] = [0, 1]
+        self._rvo_default_controlled: List[int] = list(
+            getattr(config, "rvo_controlled_agents", [0])
+        )
         self._rvo_radius: float = float(
             getattr(config, "rvo_agent_radius", 0.4)
         )
@@ -112,9 +111,25 @@ class TwoAgentSocialNavTask(PddlTask):
             0: getattr(config, "rvo_agent_0_max_speed", None),
             1: getattr(config, "rvo_agent_1_max_speed", None),
         }
+        self._rvo_debug_save_obstacle_figure: bool = bool(
+            getattr(config, "rvo_debug_save_obstacle_figure", False)
+        )
+        self._rvo_debug_obstacle_figure_dir: str = str(
+            getattr(
+                config,
+                "rvo_debug_obstacle_figure_dir",
+                "video_dir/rvo_static_obstacles",
+            )
+        )
+        self._rvo_debug_episode_id: Optional[str] = None
+        self._rvo_debug_step_trail: Dict[str, List[Tuple[float, float]]] = {}
+        self._rvo_debug_agent_paths: Dict[str, Dict[str, Any]] = {}
+        self._rvo_debug_static_obs: List[Any] = []
         # Cache last applied (vx, vz) per agent so sync_agent_pose keeps ORCA
         # warm-started even though Habitat doesn't expose a base velocity.
         self._rvo_last_vel: Dict[str, Tuple[float, float]] = {}
+        self._rvo_last_pref: Dict[str, Tuple[float, float]] = {}
+        self._rvo_last_goal_dist: Dict[int, float] = {}
         print(
             f"[RVO][init] auto_enable={self._rvo_auto_enable} "
             f"static_map={self._rvo_static_map_enabled} "
@@ -187,6 +202,12 @@ class TwoAgentSocialNavTask(PddlTask):
         # Store combined info for convenience
         self.my_nav_to_info = MyNavToInfo(robot_info, human_info)
 
+        if self._rvo_debug_save_obstacle_figure and self._rvo_debug_episode_id is not None:
+            try:
+                self._save_rvo_waypoint_debug_figure()
+            except Exception as e:  # pragma: no cover
+                print(f"[RVO] waypoint debug PNG flush failed: {e}")
+
         # Now call the parent reset which will perform simulator reset steps,
         # pddl binding (in PddlTask), and any other initialization. We don't
         # pass fetch_observations here — the parent manages that internally.
@@ -207,7 +228,7 @@ class TwoAgentSocialNavTask(PddlTask):
         self.disable_rvo()
         self._rvo_step_counter = 0
         if self._rvo_auto_enable:
-            self.enable_rvo(self._rvo_default_controlled)
+            self.enable_rvo(self._rvo_default_controlled, episode=episode)
 
         # embed()
         return self._get_observations(episode)
@@ -215,7 +236,10 @@ class TwoAgentSocialNavTask(PddlTask):
     # ------------------------------------------------------------------ RVO
 
     def enable_rvo(
-        self, controlled_agents: Optional[Sequence[int]] = None
+        self,
+        controlled_agents: Optional[Sequence[int]] = None,
+        *,
+        episode: Optional[Episode] = None,
     ) -> None:
         """Lazily build a keyed RVOManager with the current scene's static obstacles.
 
@@ -228,7 +252,10 @@ class TwoAgentSocialNavTask(PddlTask):
         controlled_agents
             Indices of articulated agents whose base transform should be
             overwritten by the ORCA velocity each :meth:`step`. If ``None``,
-            uses ``rvo_controlled_agents`` from config (defaults to ``[1]``).
+            uses ``rvo_controlled_agents`` from config (defaults to ``[0]``).
+        episode
+            Current episode; when ``rvo_debug_save_obstacle_figure`` is enabled,
+            used to name the dumped obstacle PNG.
         """
         if self._rvo_enabled and self._rvo_manager is not None:
             return
@@ -333,14 +360,107 @@ class TwoAgentSocialNavTask(PddlTask):
             f"max_neighbors={self._rvo_max_neighbors}"
         )
 
+        if self._rvo_debug_save_obstacle_figure and episode is not None:
+            self._rvo_debug_static_obs = list(static_obs) if static_obs else []
+            self._rvo_debug_episode_id = str(episode.episode_id)
+            self._rvo_debug_step_trail = {f"agent_{aid}": [] for aid in range(n_agents)}
+            self._rvo_debug_agent_paths = {}
+            for aid in range(n_agents):
+                agent_data = self._sim.get_agent_data(aid)
+                pos3 = np.asarray(agent_data.articulated_agent.base_pos, dtype=float)
+                start_xz = (float(pos3[0]), float(pos3[2]))
+                goal_xz = self._rvo_goal_xz_for_agent(aid)
+                key = f"agent_{aid}"
+                path_xz: Optional[List[Tuple[float, float]]] = None
+                status = "no_goal"
+                if goal_xz is not None:
+                    goal3 = np.array(
+                        [goal_xz[0], float(pos3[1]), goal_xz[1]], dtype=float
+                    )
+                    path_xz, status = self._navmesh_path_xz(pos3, goal3)
+                    self._log_navmesh_waypoints_for_agent(
+                        aid,
+                        str(episode.episode_id),
+                        start_xz,
+                        goal_xz,
+                        path_xz,
+                        status,
+                    )
+                else:
+                    self._log_navmesh_waypoints_for_agent(
+                        aid,
+                        str(episode.episode_id),
+                        start_xz,
+                        None,
+                        None,
+                        "no_goal",
+                    )
+                self._rvo_debug_agent_paths[key] = {
+                    "start": start_xz,
+                    "goal": goal_xz,
+                    "path": path_xz,
+                    "step_trail": [],
+                    "status": status if goal_xz is not None else "no_goal",
+                }
+
     def disable_rvo(self) -> None:
+        # Debug PNG is flushed at the start of the next reset(), not here, so a
+        # mid-episode disable (e.g. back_off) does not write an empty step_trail.
+
         self._rvo_enabled = False
         self._rvo_manager = None
         self._rvo_agent_keys = []
         self._rvo_controlled_agents = []
         self._rvo_last_vel = {}
+        self._rvo_last_pref = {}
+        self._rvo_last_goal_dist = {}
         self._rvo_debug_tick = 0
         self._rvo_warned_snapshot = False
+        self._rvo_debug_episode_id = None
+        self._rvo_debug_step_trail = {}
+        self._rvo_debug_agent_paths = {}
+        self._rvo_debug_static_obs = []
+
+    def _save_rvo_waypoint_debug_figure(self) -> None:
+        """Write one PNG for the current debug episode (navmesh path + per-step trail)."""
+        if self._rvo_debug_episode_id is None:
+            return
+        from pathlib import Path as _Path
+
+        out_dir = _Path(self._rvo_debug_obstacle_figure_dir)
+        stem = "".join(
+            c if c.isalnum() or c in "-_." else "_"
+            for c in str(self._rvo_debug_episode_id)
+        )
+        waypoint_png = out_dir / f"rvo_waypoints_ep_{stem}.png"
+        agent_paths: Dict[str, Dict[str, Any]] = {}
+        for key, base in self._rvo_debug_agent_paths.items():
+            entry = dict(base)
+            entry["step_trail"] = list(self._rvo_debug_step_trail.get(key, []))
+            agent_paths[key] = entry
+
+        trail_lens = {
+            k: len(self._rvo_debug_step_trail.get(k, []))
+            for k in agent_paths
+        }
+        print(
+            f"[RVO] flushing waypoint PNG episode={self._rvo_debug_episode_id} "
+            f"step_trail_lens={trail_lens}"
+        )
+        save_rvo_navmesh_obstacle_debug_figure(
+            self._sim,
+            waypoint_png,
+            map_resolution=self._rvo_map_resolution,
+            meters_per_pixel=self._rvo_meters_per_pixel,
+            static_obstacles=self._rvo_debug_static_obs,
+            agent_paths=agent_paths,
+            title=(
+                f"episode={self._rvo_debug_episode_id} | obstacles={len(self._rvo_debug_static_obs)} "
+                f"| step_trail = per-tick RVO pref target (final goal)"
+            ),
+        )
+        print(f"[RVO] waypoint debug PNG -> {waypoint_png.resolve()}")
+        self._rvo_debug_episode_id = None
 
     def _rvo_goal_xz_for_agent(self, aid: int) -> Optional[Tuple[float, float]]:
         """Return the (x, z) navigation goal for agent ``aid`` if one is known."""
@@ -358,39 +478,60 @@ class TwoAgentSocialNavTask(PddlTask):
             return None
         return (float(g[0]), float(g[2]))
 
-    def _navmesh_waypoint(
+    def _navmesh_path_xz(
         self,
         start_xyz: np.ndarray,
         goal_xyz: np.ndarray,
-        look_ahead: float = 0.8,
-    ) -> Optional[Tuple[float, float]]:
-        """Return the (x, z) of the first navmesh waypoint beyond ``look_ahead``.
-
-        Falls back to ``None`` when the simulator's pathfinder is unavailable
-        or a path cannot be found, so callers can use the raw goal direction.
-        """
+    ) -> Tuple[Optional[List[Tuple[float, float]]], str]:
+        """Return full navmesh shortest-path as ``[(x, z), ...]`` and a status string."""
         pathfinder = getattr(self._sim, "pathfinder", None)
         if pathfinder is None or not getattr(pathfinder, "is_loaded", True):
-            return None
+            return None, "no_pathfinder"
         try:
             sp = habitat_sim.ShortestPath()
             sp.requested_start = np.asarray(start_xyz, dtype=np.float32)
             sp.requested_end = np.asarray(goal_xyz, dtype=np.float32)
             if not pathfinder.find_path(sp):
-                return None
+                return None, "find_path_failed"
             pts = list(sp.points)
             if len(pts) < 2:
-                return None
-            sx, sz = float(start_xyz[0]), float(start_xyz[2])
-            for p in pts[1:]:
-                dx = float(p[0]) - sx
-                dz = float(p[2]) - sz
-                if np.hypot(dx, dz) > look_ahead:
-                    return (float(p[0]), float(p[2]))
-            last = pts[-1]
-            return (float(last[0]), float(last[2]))
-        except Exception:
-            return None
+                return None, "too_few_points"
+            path_xz = [(float(p[0]), float(p[2])) for p in pts]
+            return path_xz, "ok"
+        except Exception as e:
+            return None, f"exception:{e}"
+
+    def _log_navmesh_waypoints_for_agent(
+        self,
+        aid: int,
+        episode_id: str,
+        start_xz: Tuple[float, float],
+        goal_xz: Optional[Tuple[float, float]],
+        path_xz: Optional[List[Tuple[float, float]]],
+        status: str,
+    ) -> None:
+        """Print navmesh shortest path at reset (debug)."""
+        ep = episode_id
+        if goal_xz is None:
+            print(
+                f"[RVO][waypoints] agent_{aid} episode={ep} status=no_goal "
+                "(no waypoints)"
+            )
+            return
+        if path_xz is None or status != "ok":
+            print(
+                f"[RVO][waypoints] agent_{aid} episode={ep} status={status} "
+                "(no waypoints)"
+            )
+            return
+        print(
+            f"[RVO][waypoints] agent_{aid} episode={ep} status=ok "
+            f"n_sparse={len(path_xz)}"
+        )
+        for i, (px, pz) in enumerate(path_xz):
+            label = "start" if i == 0 else ("goal" if i == len(path_xz) - 1 else "")
+            extra = f" ({label})" if label else ""
+            print(f"  sparse[{i}] (x={px:.4f}, z={pz:.4f}){extra}")
 
     def _snapshot_pre_step_state(self) -> Dict[int, np.ndarray]:
         """Record every controlled agent's pre-step (x, y, z) base position.
@@ -426,6 +567,14 @@ class TwoAgentSocialNavTask(PddlTask):
         as dynamic obstacles.
         """
         if not self._rvo_enabled or self._rvo_manager is None:
+            self._rvo_step_counter = getattr(self, "_rvo_step_counter", 0) + 1
+            ctrl_freq = int(getattr(self._sim, "ctrl_freq", 30))
+            if ctrl_freq > 0 and self._rvo_step_counter % max(1, ctrl_freq) == 0:
+                print(
+                    f"[RVO][skip step {self._rvo_step_counter}] "
+                    f"enabled={self._rvo_enabled} manager="
+                    f"{self._rvo_manager is not None}"
+                )
             return
 
         dt = 1.0 / float(getattr(self._sim, "ctrl_freq", 30))
@@ -446,8 +595,7 @@ class TwoAgentSocialNavTask(PddlTask):
                 self._rvo_last_vel.get(key, (0.0, 0.0)),
             )
 
-        # 2) Preferred velocities, routed through the navmesh so ORCA does not
-        #    slow down against symmetric walls.
+        # 2) Preferred velocities toward each agent's final nav goal.
         for aid, key in enumerate(self._rvo_agent_keys):
             if aid in controlled_set and aid in pre_step_pos:
                 pos3 = pre_step_pos[aid]
@@ -458,24 +606,28 @@ class TwoAgentSocialNavTask(PddlTask):
                 )
             goal_xz = self._rvo_goal_xz_for_agent(aid)
             if goal_xz is None:
-                self._rvo_manager.set_pref_velocity(key, (0.0, 0.0))
+                pref = (0.0, 0.0)
+                self._rvo_manager.set_pref_velocity(key, pref)
+                self._rvo_last_pref[key] = pref
                 continue
             goal_dist = float(
                 np.hypot(goal_xz[0] - pos3[0], goal_xz[1] - pos3[2])
             )
+            if aid in controlled_set:
+                self._rvo_last_goal_dist[aid] = goal_dist
             if goal_dist < self._rvo_goal_stop_radius:
-                self._rvo_manager.set_pref_velocity(key, (0.0, 0.0))
+                pref = (0.0, 0.0)
+                self._rvo_manager.set_pref_velocity(key, pref)
+                self._rvo_last_pref[key] = pref
                 continue
-            goal3 = np.array(
-                [goal_xz[0], float(pos3[1]), goal_xz[1]], dtype=float
-            )
-            wp = self._navmesh_waypoint(pos3, goal3)
-            tx, tz = wp if wp is not None else goal_xz
+            tx, tz = float(goal_xz[0]), float(goal_xz[1])
             dx = tx - float(pos3[0])
             dz = tz - float(pos3[2])
             dist = float(np.hypot(dx, dz))
             if dist < 1e-6:
-                self._rvo_manager.set_pref_velocity(key, (0.0, 0.0))
+                pref = (0.0, 0.0)
+                self._rvo_manager.set_pref_velocity(key, pref)
+                self._rvo_last_pref[key] = pref
                 continue
             override_ms = self._rvo_agent_max_speed.get(aid)
             max_speed = (
@@ -484,7 +636,16 @@ class TwoAgentSocialNavTask(PddlTask):
                 else self._rvo_max_speed
             )
             inv = max_speed / dist
-            self._rvo_manager.set_pref_velocity(key, (dx * inv, dz * inv))
+            pref = (dx * inv, dz * inv)
+            self._rvo_manager.set_pref_velocity(key, pref)
+            self._rvo_last_pref[key] = pref
+
+            if (
+                self._rvo_debug_save_obstacle_figure
+                and self._rvo_debug_episode_id is not None
+            ):
+                trail = self._rvo_debug_step_trail.setdefault(key, [])
+                trail.append((float(tx), float(tz)))
 
         # 3) Advance ORCA by dt and cache the solved velocities.
         self._rvo_manager.step()
@@ -650,9 +811,18 @@ class TwoAgentSocialNavTask(PddlTask):
                         k: (round(v[0], 3), round(v[1], 3))
                         for k, v in self._rvo_last_vel.items()
                     }
+                    pref0 = self._rvo_last_pref.get("agent_0")
+                    dg0 = self._rvo_last_goal_dist.get(0)
+                    extra = ""
+                    if pref0 is not None:
+                        extra = (
+                            f" agent_0 pref={tuple(round(x, 3) for x in pref0)}"
+                            f" dist2goal={round(dg0, 3) if dg0 is not None else None}"
+                            f" goal_stop={self._rvo_goal_stop_radius}"
+                        )
                     print(
                         f"[RVO][step {self._rvo_step_counter}] "
-                        f"controlled={self._rvo_controlled_agents} vel={preview}"
+                        f"controlled={self._rvo_controlled_agents} vel={preview}{extra}"
                     )
             except Exception as e:  # pragma: no cover - defensive
                 print(f"[RVO] step failed, skipping overlay: {e}")

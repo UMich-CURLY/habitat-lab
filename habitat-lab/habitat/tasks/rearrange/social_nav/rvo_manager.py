@@ -1116,6 +1116,208 @@ def save_trajectory_initial_figure(
     plt.close(fig)
 
 
+def save_rvo_navmesh_obstacle_debug_figure(
+    sim: Any,
+    out_path: Union[str, Path],
+    *,
+    map_resolution: int = 512,
+    meters_per_pixel: Optional[float] = None,
+    agent_id: int = 0,
+    static_obstacles: Optional[List[ObstaclePolygon]] = None,
+    max_polygons_to_draw: int = 8000,
+    title: str = "",
+    agent_paths: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
+    """Save PNG: habitat navmesh top-down slice used by ``static_obstacles_from_sim_topdown``.
+
+    Overlays faint red outlines for merged axis-aligned quads handed to ORCA ``addObstacle``.
+    Optionally overlays navmesh shortest-path waypoints per agent (see ``agent_paths``).
+
+    Polygon vertices are Habitat ``(x, z)`` with ``z`` plotted on the vertical axis.
+
+    ``agent_paths`` maps keys like ``agent_0`` to dicts with:
+    ``start`` ``goal`` ``path`` ``step_trail``.
+    """
+    from habitat.utils.visualizations import maps
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if sim is None or getattr(sim, "pathfinder", None) is None:
+        return
+    pathfinder = sim.pathfinder
+    if not getattr(pathfinder, "is_loaded", True):
+        return
+    try:
+        lower, upper = pathfinder.get_bounds()
+    except Exception:
+        return
+
+    x0, x1 = float(lower[0]), float(upper[0])
+    z0, z1 = float(lower[2]), float(upper[2])
+
+    try:
+        td = maps.get_topdown_map_from_sim(
+            sim,
+            map_resolution=int(map_resolution),
+            draw_border=False,
+            meters_per_pixel=meters_per_pixel,
+            agent_id=agent_id,
+        )
+        rgb = maps.colorize_topdown_map(td)
+    except Exception:
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 11))
+    ax.imshow(
+        rgb,
+        extent=[x0, x1, z0, z1],
+        origin="lower",
+        aspect="equal",
+        interpolation="nearest",
+    )
+
+    polys = static_obstacles or []
+    drawn = 0
+    for poly in polys:
+        if drawn >= max_polygons_to_draw:
+            break
+        plist = list(poly)
+        if len(plist) < 2:
+            continue
+        xs = [float(p[0]) for p in plist] + [float(plist[0][0])]
+        zs = [float(p[1]) for p in plist] + [float(plist[0][1])]
+        ax.plot(xs, zs, color="red", linewidth=0.2, alpha=0.35)
+        drawn += 1
+
+    path_colors = {"agent_0": "C0", "agent_1": "C1"}
+    if agent_paths:
+        for key, info in agent_paths.items():
+            color = path_colors.get(key, "C2")
+            start = info.get("start")
+            goal = info.get("goal")
+            path = info.get("path")
+            la_idx = info.get("lookahead_idx")
+            lookahead_point = info.get("lookahead_point")
+            step_trail = info.get("step_trail") or []
+            if start is not None:
+                ax.plot(
+                    start[0],
+                    start[1],
+                    "o",
+                    color=color,
+                    markersize=8,
+                    markeredgecolor="black",
+                    markeredgewidth=0.8,
+                    label=f"{key} start",
+                )
+            if goal is not None:
+                ax.plot(
+                    goal[0],
+                    goal[1],
+                    "x",
+                    color=color,
+                    markersize=10,
+                    markeredgewidth=2.0,
+                    label=f"{key} goal",
+                )
+            if path and len(path) >= 2:
+                pxs = [p[0] for p in path]
+                pzs = [p[1] for p in path]
+                ax.plot(
+                    pxs,
+                    pzs,
+                    "-",
+                    color=color,
+                    linewidth=1.5,
+                    alpha=0.85,
+                    label=f"{key} path",
+                )
+                for i, (px, pz) in enumerate(path):
+                    ax.plot(px, pz, ".", color=color, markersize=4)
+                    ax.annotate(
+                        str(i),
+                        (px, pz),
+                        textcoords="offset points",
+                        xytext=(3, 3),
+                        fontsize=7,
+                        color=color,
+                    )
+                if step_trail and len(step_trail) >= 1:
+                    txs = [float(p[0]) for p in step_trail]
+                    tzs = [float(p[1]) for p in step_trail]
+                    ax.plot(
+                        txs,
+                        tzs,
+                        "-",
+                        color=color,
+                        linewidth=0.9,
+                        alpha=0.55,
+                        label=f"{key} step_trail",
+                    )
+                    ax.plot(
+                        txs,
+                        tzs,
+                        ".",
+                        color=color,
+                        markersize=3,
+                        alpha=0.7,
+                    )
+                if lookahead_point is not None:
+                    lx, lz = float(lookahead_point[0]), float(lookahead_point[1])
+                    ax.plot(
+                        lx,
+                        lz,
+                        "*",
+                        color=color,
+                        markersize=14,
+                        markeredgecolor="black",
+                        markeredgewidth=0.6,
+                        label=f"{key} lookahead",
+                    )
+                elif la_idx is not None and path and 0 <= la_idx < len(path):
+                    lx, lz = path[la_idx]
+                    ax.plot(
+                        lx,
+                        lz,
+                        "*",
+                        color=color,
+                        markersize=14,
+                        markeredgecolor="black",
+                        markeredgewidth=0.6,
+                        label=f"{key} lookahead",
+                    )
+
+    n_poly = len(polys)
+    extra = (
+        f" (red: {drawn}/{n_poly} polys)"
+        if n_poly > max_polygons_to_draw
+        else f" ({n_poly} polys)"
+    )
+    ax.set_xlabel("world x [m]")
+    ax.set_ylabel("world z [m]")
+    ax.set_title(
+        title
+        if title
+        else (
+            "RVO static obstacles: navmesh top-down + ORCA quads"
+            + extra
+        )
+    )
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(str(out), dpi=160)
+    plt.close(fig)
+
+
 def _main() -> None:
     from types import SimpleNamespace
 
@@ -1152,6 +1354,8 @@ def _main() -> None:
         enable_plotting=True,
         static_obstacles=demo_wall,
     )
+    # Demo: ORCA obstacle avoidance only — no grid A* waypoints (see _pick_waypoint).
+    mgr.use_path_planner = False
     init_png = Path(__file__).resolve().parent / "rvo_manager_demo_initial.png"
     save_trajectory_initial_figure(initial_state, demo_wall, init_png)
     print("Wrote", init_png)

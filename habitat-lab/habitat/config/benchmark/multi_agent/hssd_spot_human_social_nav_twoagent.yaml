@@ -73,9 +73,10 @@ habitat:
     # Use the new minimal TwoAgentSocialNavTask that doesn't bind PDDL/problems
     type: TwoAgentSocialNavTask-v0
     min_start_distance: 0.0
-    # ORCA: agents + static walls from NavMesh top-down raster (velocity-space avoidance)
+    # ORCA: both agents; no static polys; walls via step_filter; agent_1 capped at 0.1 m/s
     rvo_use_orca_nav: True
-    rvo_static_map_enabled: True
+    rvo_static_map_enabled: False
+    rvo_controlled_agents: [0, 1]
     rvo_map_resolution: 512
     reward_measure: social_nav_reward
     success_measure: social_nav_to_pos_success

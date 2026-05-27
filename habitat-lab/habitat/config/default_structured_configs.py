@@ -1512,13 +1512,15 @@ class TaskConfig(HabitatBaseConfig):
     # ORCA / RVO for :class:`TwoAgentSocialNavTask-v0` (optional; ignored by other tasks)
     rvo_use_orca_nav: bool = True
     rvo_static_map_enabled: bool = True
+    # Agent indices whose poses are overwritten by ORCA each step (others are dynamic obstacles only).
+    rvo_controlled_agents: List[int] = field(default_factory=lambda: [0])
     rvo_map_resolution: int = 512
     rvo_meters_per_pixel: Optional[float] = None
-    rvo_neighbor_dist: float = 1
+    rvo_neighbor_dist: float = 2.5
     rvo_max_neighbors: int = 10
-    rvo_time_horizon: float = 1
-    rvo_time_horizon_obst: float = 0.35
-    rvo_agent_radius: float = 0.18
+    rvo_time_horizon: float = 3
+    rvo_time_horizon_obst: float = 2.0
+    rvo_agent_radius: float = 0.2
     rvo_default_max_speed: float = 1.0
     rvo_lin_speed_scale: float = 1.0
     rvo_ang_speed_scale: float = 1.0
@@ -1527,6 +1529,9 @@ class TaskConfig(HabitatBaseConfig):
     rvo_agent_0_max_speed: Optional[float] = None
     # Cap agent_1 (often the faster) in ORCA to reduce doorway deadlocks vs agent_0.
     rvo_agent_1_max_speed: Optional[float] = 0.1
+    # Dump a PNG of navmesh-derived RVO obstacles when ``TwoAgentSocialNavTask`` builds ORCA static polys.
+    rvo_debug_save_obstacle_figure: bool = False
+    rvo_debug_obstacle_figure_dir: str = "video_dir/rvo_static_obstacles"
 
     # The minimum distance between the agents at start. If < 0
     # there is no minimal distance

@@ -93,10 +93,11 @@ class PddlApplyAction(ArticulatedAgentAction):
         )
         if not inputs_outside:
             self._apply_action(apply_pddl_action)
-        # If a PDDL action with an associated runtime task was selected,
-        # enable that task's RVO behavior; otherwise disable RVO. This lets
-        # ORCA run only while `nav_to_goal_social` (or other social-nav
-        # actions) are active.
+        # Toggle RVO only when a PDDL primitive is explicitly selected this step.
+        # Oracle skills often run for many steps without writing into the PDDL
+        # action vector; in that case leave RVO state unchanged (e.g. after
+        # reset's enable_rvo). Disable only for explicit non-social actions
+        # (back_off, wait, etc.).
         try:
             if self._prev_action is not None:
                 task_info = getattr(self._prev_action, "_task_info", None)
@@ -106,11 +107,10 @@ class PddlApplyAction(ArticulatedAgentAction):
                             self._task.enable_rvo()
                         except Exception:
                             pass
-                else:
-                    if hasattr(self._task, "disable_rvo"):
-                        try:
-                            self._task.disable_rvo()
-                        except Exception:
-                            pass
+                elif hasattr(self._task, "disable_rvo"):
+                    try:
+                        self._task.disable_rvo()
+                    except Exception:
+                        pass
         except Exception:
             pass
