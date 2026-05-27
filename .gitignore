@@ -113,5 +113,29 @@ navmeshes/
 cluster/
 robo_frames/
 test_irl/
-habitat-web-data/
-datasets/runs/
+habitat-web-data/datasets/
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+*.wmv
+
+# Large data/model files
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5
+checkpoints*/
+
+# Markdown files (except README and CLAUDE)
+*.md
+!README.md
+!CLAUDE.md

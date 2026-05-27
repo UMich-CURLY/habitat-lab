@@ -4,6 +4,7 @@
 
 from typing import Tuple
 
+from gym import spaces
 from habitat.core.spaces import ActionSpace
 from habitat_baselines.utils.common import get_num_actions
 
@@ -14,14 +15,20 @@ def find_action_range(
     """
     Returns the start and end indices of an action key in the action tensor. If
     the key is not found, a Value error will be thrown.
+    For Box spaces (single agent navigation), returns (0, num_actions).
     """
 
+    # Handle Box action space (single agent / navigation task)
+    if isinstance(action_space, spaces.Box):
+        return 0, get_num_actions(action_space)
+    
+    # Handle Dict action space (multi-task / manipulation)
     start_idx = 0
     found = False
     try:
         end_idx = get_num_actions(action_space[search_key])
     except KeyError:
-        import pdb; pdb.set_trace()
+        raise ValueError(f"Could not find {search_key} in {action_space}")
     for k in action_space:
         if k == search_key:
             found = True

@@ -137,6 +137,18 @@ class OracleNavAction(BaseVelAction, HumanoidJointAction):
                 True,
                 self.cur_articulated_agent,
             )
+            robot_pos = self.cur_articulated_agent.base_pos
+            dist_start_to_robot = np.linalg.norm(
+                (np.array(start_pos) - np.array(robot_pos))[[0, 2]]
+            )
+            print(
+                f"[OracleNavAction._get_target] prefix={self._action_arg_prefix!r} "
+                f"entity_idx={nav_to_target_idx} entity={nav_to_obj.name} "
+                f"obj_pos={np.array(obj_pos)[[0,2]].tolist()} "
+                f"approach_pos={np.array(start_pos)[[0,2]].tolist()} "
+                f"robot_pos={np.array(robot_pos)[[0,2]].tolist()} "
+                f"dist_approach_to_robot={dist_start_to_robot:.3f}m"
+            )
             if self.motion_type == "human_joints":
                 self.humanoid_controller.reset(
                     self.cur_articulated_agent.base_transformation
@@ -169,9 +181,13 @@ class OracleNavAction(BaseVelAction, HumanoidJointAction):
         nav_to_target_idx = kwargs[
             self._action_arg_prefix + "oracle_nav_action"
         ]
+        print(f"[OracleNavAction] prefix={self._action_arg_prefix!r} "
+              f"nav_to_target_idx={nav_to_target_idx} "
+              f"num_entities={len(self._poss_entities)}")
         if nav_to_target_idx <= 0 or nav_to_target_idx > len(
             self._poss_entities
         ):
+            print(f"[OracleNavAction] EARLY RETURN (idx out of range)")
             return
         nav_to_target_idx = int(nav_to_target_idx[0]) - 1
 
@@ -228,6 +244,14 @@ class OracleNavAction(BaseVelAction, HumanoidJointAction):
                 else:
                     vel = [0, 0]
                     self.skill_done = True
+                # One-time debug on first step for agent_0
+                if self._action_arg_prefix == "agent_0_" and not hasattr(self, "_dbg_step_printed"):
+                    self._dbg_step_printed = True
+                    print(
+                        f"[OracleNavAction.step] prefix={self._action_arg_prefix!r} "
+                        f"dist={dist_to_final_nav_targ:.3f} at_goal={at_goal} "
+                        f"angle_to_target={angle_to_target:.3f} vel={vel}"
+                    )
                 kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
                 BaseVelAction.step(self, *args, **kwargs)
                 return

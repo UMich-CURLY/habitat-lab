@@ -1,0 +1,149 @@
+# @package _global_
+
+# Skill testing config: cycles through all three skills to verify they work correctly.
+# Uses CyclingHighLevelPolicy to systematically exercise each skill.
+# Episodes are short (300 steps) with short skill timeouts (60 steps each) to ensure full cycle.
+
+defaults:
+  - /benchmark/multi_agent: hssd_spot_human_social_nav_twoagent
+  - /habitat_baselines: habitat_baselines_rl_config_base
+  - /habitat/simulator/sim_sensors@habitat_baselines.eval.extra_sim_sensors.third_rgb_sensor: third_rgb_sensor
+  - /habitat_baselines/rl/policy/obs_transforms@habitat_baselines.rl.policy.agent_0.obs_transforms.add_virtual_keys:
+    - add_virtual_keys_base
+  - /habitat_baselines/rl/policy/obs_transforms@habitat_baselines.rl.policy.agent_1.obs_transforms.add_virtual_keys:
+    - add_virtual_keys_base
+  - _self_
+
+habitat:
+  task:
+    type: TwoAgentSocialNavTask-v0
+    measurements:
+      social_nav_reward:
+        count_coll_pen: 0.01
+        max_count_colls: -1
+        count_coll_end_pen: 5.0
+        safe_dis_min: 0.2
+    success_reward: 10.0
+    slack_reward: -0.1
+    end_on_success: true
+
+  environment:
+    max_episode_steps: 300  # Short episodes to cycle through all skills
+
+  simulator:
+    kinematic_mode: true
+    ac_freq_ratio: 4
+    ctrl_freq: 120
+    agents:
+      agent_0:
+        joint_start_noise: 0.0
+
+habitat_baselines:
+  verbose: true
+  trainer_name: "ddppo"
+  updater_name: "HRLPPO"
+  distrib_updater_name: "HRLDDPPO"
+  torch_gpu_id: 0
+  video_fps: 30
+  num_environments: 1  # Single env for easier debugging
+  num_updates: -1
+  total_num_steps: 1.0e6  # Small budget for quick test
+  log_interval: 10
+  num_checkpoints: 1
+  force_torch_single_threaded: true
+  eval_keys_to_include_in_name: ["social_nav_reward"]
+  load_resume_state_config: false
+  rollout_storage_name: "HrlRolloutStorage"
+
+  eval:
+    use_ckpt_config: false
+    should_load_ckpt: false
+    video_option: ["disk"]
+
+  rl:
+    ppo:
+      clip_param: 0.2
+      ppo_epoch: 2
+      num_mini_batch: 4
+      value_loss_coef: 0.5
+      entropy_coef: 0.001
+      lr: 2.5e-4
+      eps: 1e-5
+      max_grad_norm: 0.5
+      num_steps: 256
+      use_gae: true
+      gamma: 0.99
+      tau: 0.95
+      hidden_size: 256
+
+    ddppo:
+      sync_frac: 0.6
+      distrib_backend: NCCL
+      pretrained_weights: "NULL"
+      pretrained: false
+      pretrained_encoder: false
+      train_encoder: true
+      reset_critic: false
+      backbone: resnet18
+      rnn_type: LSTM
+      num_recurrent_layers: 2
+
+    agent:
+      type: "MultiAgentAccessMgr"
+      num_agent_types: 2
+      num_active_agents_per_type: [1, 1]
+      num_pool_agents_per_type: [1, 1]
+      agent_sample_interval: 20
+      force_partner_sample_idx: -1
+
+    policy:
+      agent_0:
+        name: "HierarchicalPolicy"
+        hierarchical_policy:
+          # High-level policy: cycles through all skills
+          high_level_policy:
+            name: "CyclingHighLevelPolicy"
+
+          # Low-level skills - NO PDDL constraints
+          defined_skills:
+            backoff:
+              skill_name: "BackOffSkill"
+              pddl_action_names: null
+              max_skill_steps: 100
+            wait:
+              skill_name: "WaitSkill"
+              pddl_action_names: null
+              max_skill_steps: 100
+            go_to_goal:
+              skill_name: "GoToGoalSkill"
+              pddl_action_names: null
+              max_skill_steps: 100
+
+          ignore_skills: []
+
+      agent_1:
+        name: HierarchicalPolicy
+        agent_name: "agent_1"
+        hierarchical_policy:
+          high_level_policy:
+            name: "FixedHighLevelPolicy"
+            allow_other_place: False
+            add_arm_rest: False
+            termination_obs_name: "has_finished_oracle_nav"
+          defined_skills:
+            oracle_nav:
+              skill_name: "OracleNavPolicy"
+              pddl_action_names: ["nav_to_goal_social"]
+              action_name: "agent_1_oracle_nav_action"
+              max_skill_steps: 1500
+              ignore_grip: true
+            wait:
+              skill_name: "WaitSkillPolicy"
+              pddl_action_names: ["wait"]
+              max_skill_steps: -1
+              force_end_on_timeout: False
+          ignore_skills: ["nav_to_obj", "nav_to_goal", "nav_to_randcoord"]
+
+  checkpoint_folder: "checkpoints_social_nav_skill_test"
+  tensorboard_dir: "tb_social_nav_skill_test"
+  video_dir: "video_social_nav_skill_test"

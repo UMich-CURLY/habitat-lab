@@ -1,0 +1,21 @@
+# Configuration for hierarchical neural policy on Spot agent for social navigation
+
+name: "HierarchicalPolicy"
+hierarchical_policy:
+  high_level_policy:
+    name: "SocialNavNeuralHighLevelPolicy"
+    policy_input_keys:
+      - "agent_0_base_pos"
+      - "agent_1_base_pos"
+      - "agent_0_base_vel"
+      - "agent_1_base_vel"
+      - "agent_0_orientation"
+      - "agent_1_orientation"
+    hidden_dim: 256
+    rnn_type: "GRU"
+    num_rnn_layers: 2
+    backbone: "NONE"
+    termination_obs_name: null
+
+  defined_skills: {}
+  ignore_skills: []

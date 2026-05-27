@@ -21,6 +21,11 @@ from habitat_baselines.rl.hrl.skills.reset import ResetArmSkill
 from habitat_baselines.rl.hrl.skills.skill import SkillPolicy
 from habitat_baselines.rl.hrl.skills.wait import WaitSkillPolicy
 from habitat_baselines.rl.hrl.skills.back_off import BackOffSkillPolicy
+from habitat_baselines.rl.hrl.skills.social_nav_skills import (
+    BackOffSkill,
+    WaitSkill,
+    GoToGoalSkill,
+)
 
 __all__ = [
     "ArtObjSkillPolicy",
@@ -38,4 +43,7 @@ __all__ = [
     "WaitSkillPolicy",
     "BackOffSkillPolicy",
     "NoopSkillPolicy",
+    "BackOffSkill",
+    "WaitSkill",
+    "GoToGoalSkill",
 ]

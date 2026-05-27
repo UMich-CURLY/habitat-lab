@@ -280,6 +280,7 @@ class PolicyConfig(HabitatBaselinesBaseConfig):
     action_dist: ActionDistributionConfig = ActionDistributionConfig()
     obs_transforms: Dict[str, ObsTransformConfig] = field(default_factory=dict)
     hierarchical_policy: HierarchicalPolicyConfig = MISSING
+    agent_name: Optional[str] = None  # For multi-agent setups, identify which agent this policy controls
 
 
 @dataclass

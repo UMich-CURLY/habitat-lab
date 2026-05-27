@@ -307,6 +307,8 @@ class Env:
         if isinstance(action, (str, int, np.integer)):
             action = {"action": action}
 
+        print(f"[Env.step] action type={type(action).__name__} value={action}")
+
         observations = self.task.step(
             action=action, episode=self.current_episode
         )
