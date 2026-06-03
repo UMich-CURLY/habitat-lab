@@ -550,19 +550,6 @@ class RVOManager:
 
     # --- keyed API (skip if trajectory-only) ---
 
-    def set_static_obstacles(self, obstacles: List[ObstaclePolygon]) -> None:
-        if self._mode != "keys":
-            raise RuntimeError("set_static_obstacles is only for keyed RVOManager.")
-        if self._agents:
-            raise RuntimeError(
-                "set_static_obstacles must be called before add_agent when using RVO2."
-            )
-        for poly in obstacles:
-            self.orca_sim.addObstacle(
-                [tuple(float(p[i]) for i in range(2)) for p in poly]
-            )
-        self.orca_sim.processObstacles()
-
     def add_agent(
         self,
         key: str,

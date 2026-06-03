@@ -23,7 +23,12 @@ from habitat.tasks.rearrange.sub_tasks.nav_to_obj_task import (
     NavToInfo,
     MyNavToInfo,
 )
-from IPython import embed
+
+# Seconds of ORCA velocity to project the per-step nav waypoint. A 1 s horizon
+# makes the waypoint distance numerically equal to the ORCA-solved speed (m/s),
+# which OracleNavWaypointAction reads back as its forward speed (speed-matching).
+RVO_WAYPOINT_LOOKAHEAD = 1.0
+
 
 @registry.register_task(name="TwoAgentSocialNavTask-v0")
 class TwoAgentSocialNavTask(PddlTask):
@@ -44,10 +49,6 @@ class TwoAgentSocialNavTask(PddlTask):
         
         self._min_start_distance = getattr(config, "min_start_distance", 0.0)
         self._nav_to_info = None
-        print("task.actions keys:", list(self.actions.keys()))
-        # Inspect PDDL problem and actions
-        pddl_prob = self.pddl_problem  # or task._pddl_problem depending on your Task impl
-        print("Available PDDL actions:", list(pddl_prob.actions.keys()))
 
         # --- RVO / ORCA state (see enable_rvo / step) ---
         # These names mirror the ``rvo_*`` fields on ``TaskConfig``; Hydra
@@ -95,12 +96,6 @@ class TwoAgentSocialNavTask(PddlTask):
         self._rvo_meters_per_pixel: Optional[float] = getattr(
             config, "rvo_meters_per_pixel", None
         )
-        self._rvo_lin_scale: float = float(
-            getattr(config, "rvo_lin_speed_scale", 1.0)
-        )
-        self._rvo_ang_scale: float = float(
-            getattr(config, "rvo_ang_speed_scale", 1.0)
-        )
         # Per-agent overrides (both default to None -> fall back to the
         # shared ``rvo_agent_radius`` / ``rvo_default_max_speed`` values).
         self._rvo_agent_radius: Dict[int, Optional[float]] = {
@@ -128,22 +123,12 @@ class TwoAgentSocialNavTask(PddlTask):
         # Cache last applied (vx, vz) per agent so sync_agent_pose keeps ORCA
         # warm-started even though Habitat doesn't expose a base velocity.
         self._rvo_last_vel: Dict[str, Tuple[float, float]] = {}
-        self._rvo_last_pref: Dict[str, Tuple[float, float]] = {}
-        self._rvo_last_goal_dist: Dict[int, float] = {}
         print(
             f"[RVO][init] auto_enable={self._rvo_auto_enable} "
             f"static_map={self._rvo_static_map_enabled} "
             f"controlled={self._rvo_default_controlled} "
             f"radius={self._rvo_radius} max_speed={self._rvo_max_speed}"
         )
-        
-        # Examine the post-conditions for a named action (e.g., 'nav' or 'nav_to_receptacle_by_name')
-        # for a_name, a_obj in pddl_prob.actions.items():
-        #     print("Action:", a_name)
-        #     print("  preconds:", [p.compact_str for p in a_obj.pre_cond])
-        #     print("  postconds:", [p.compact_str for p in a_obj.post_cond])
-        #     print("  n_args:", a_obj.n_args)
-        
 
     def _generate_nav_start_goal(self, episode, agent_idx, force_idx=None) -> NavToInfo:
         """
@@ -226,11 +211,9 @@ class TwoAgentSocialNavTask(PddlTask):
 
         # Rebuild the RVO manager every episode: navmesh / agent poses change.
         self.disable_rvo()
-        self._rvo_step_counter = 0
         if self._rvo_auto_enable:
             self.enable_rvo(self._rvo_default_controlled, episode=episode)
 
-        # embed()
         return self._get_observations(episode)
 
     # ------------------------------------------------------------------ RVO
@@ -412,10 +395,6 @@ class TwoAgentSocialNavTask(PddlTask):
         self._rvo_agent_keys = []
         self._rvo_controlled_agents = []
         self._rvo_last_vel = {}
-        self._rvo_last_pref = {}
-        self._rvo_last_goal_dist = {}
-        self._rvo_debug_tick = 0
-        self._rvo_warned_snapshot = False
         self._rvo_debug_episode_id = None
         self._rvo_debug_step_trail = {}
         self._rvo_debug_agent_paths = {}
@@ -533,297 +512,127 @@ class TwoAgentSocialNavTask(PddlTask):
             extra = f" ({label})" if label else ""
             print(f"  sparse[{i}] (x={px:.4f}, z={pz:.4f}){extra}")
 
-    def _snapshot_pre_step_state(self) -> Dict[int, np.ndarray]:
-        """Record every controlled agent's pre-step (x, y, z) base position.
-
-        Needed because we can only compute the correct ORCA-applied pose by
-        starting from where the agent *was* this tick, not where Oracle-nav
-        (run inside ``super().step(...)``) has already moved it to.
+    def _rvo_drive_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Solve ORCA at the agents' current poses and rewrite ``action`` so each
+        controlled agent's ``oracle_nav_action`` carries a 1 s-ahead waypoint
+        (``base_pos + orca_vel * RVO_WAYPOINT_LOOKAHEAD``). The waypoint distance
+        therefore equals the desired speed, which ``OracleNavWaypointAction``
+        reads back as its forward speed. Other action components (e.g.
+        ``pddl_apply_action``) are preserved; uncontrolled agents stay in ORCA as
+        dynamic obstacles at their current positions.
         """
-        snapshot: Dict[int, np.ndarray] = {}
-        if not self._rvo_enabled or self._rvo_manager is None:
-            return snapshot
-        for aid in self._rvo_controlled_agents:
-            if aid >= len(self._rvo_agent_keys):
-                continue
-            try:
-                pos = np.asarray(
-                    self._sim.get_agent_data(aid).articulated_agent.base_pos,
-                    dtype=float,
-                )
-                snapshot[aid] = pos.copy()
-            except Exception:
-                continue
-        return snapshot
+        mgr = self._rvo_manager
+        n = len(self._rvo_agent_keys)
 
-    def _rvo_compute_and_apply(
-        self, pre_step_pos: Dict[int, np.ndarray]
-    ) -> None:
-        """Compute ORCA velocities and overwrite controlled agents' base poses.
+        # Current (pre-step) base positions for every registered agent.
+        cur_pos: Dict[int, np.ndarray] = {
+            aid: np.asarray(
+                self._sim.get_agent_data(aid).articulated_agent.base_pos,
+                dtype=float,
+            )
+            for aid in range(n)
+        }
 
-        Controlled agents are *synced* into ORCA at their pre-step positions and
-        *written back* to ``pre_step_pos + orca_vel * dt``. Uncontrolled agents
-        are synced at their current (post-Oracle) positions so they still act
-        as dynamic obstacles.
-        """
-        if not self._rvo_enabled or self._rvo_manager is None:
-            self._rvo_step_counter = getattr(self, "_rvo_step_counter", 0) + 1
-            ctrl_freq = int(getattr(self._sim, "ctrl_freq", 30))
-            if ctrl_freq > 0 and self._rvo_step_counter % max(1, ctrl_freq) == 0:
-                print(
-                    f"[RVO][skip step {self._rvo_step_counter}] "
-                    f"enabled={self._rvo_enabled} manager="
-                    f"{self._rvo_manager is not None}"
-                )
-            return
-
-        dt = 1.0 / float(getattr(self._sim, "ctrl_freq", 30))
-        controlled_set = set(self._rvo_controlled_agents)
-
-        # 1) Sync ORCA with the correct per-agent reference position.
+        # 1) Sync ORCA with each agent's current position (warm-started velocity).
         for aid, key in enumerate(self._rvo_agent_keys):
-            if aid in controlled_set and aid in pre_step_pos:
-                pos3 = pre_step_pos[aid]
-            else:
-                pos3 = np.asarray(
-                    self._sim.get_agent_data(aid).articulated_agent.base_pos,
-                    dtype=float,
-                )
-            self._rvo_manager.sync_agent_pose(
+            pos3 = cur_pos[aid]
+            mgr.sync_agent_pose(
                 key,
                 (float(pos3[0]), float(pos3[2])),
                 self._rvo_last_vel.get(key, (0.0, 0.0)),
             )
 
-        # 2) Preferred velocities toward each agent's final nav goal.
+        # 2) Preferred velocity toward each agent's nav goal (0 within stop radius).
         for aid, key in enumerate(self._rvo_agent_keys):
-            if aid in controlled_set and aid in pre_step_pos:
-                pos3 = pre_step_pos[aid]
-            else:
-                pos3 = np.asarray(
-                    self._sim.get_agent_data(aid).articulated_agent.base_pos,
-                    dtype=float,
-                )
+            pos3 = cur_pos[aid]
             goal_xz = self._rvo_goal_xz_for_agent(aid)
-            if goal_xz is None:
-                pref = (0.0, 0.0)
-                self._rvo_manager.set_pref_velocity(key, pref)
-                self._rvo_last_pref[key] = pref
-                continue
-            goal_dist = float(
-                np.hypot(goal_xz[0] - pos3[0], goal_xz[1] - pos3[2])
-            )
-            if aid in controlled_set:
-                self._rvo_last_goal_dist[aid] = goal_dist
-            if goal_dist < self._rvo_goal_stop_radius:
-                pref = (0.0, 0.0)
-                self._rvo_manager.set_pref_velocity(key, pref)
-                self._rvo_last_pref[key] = pref
-                continue
-            tx, tz = float(goal_xz[0]), float(goal_xz[1])
-            dx = tx - float(pos3[0])
-            dz = tz - float(pos3[2])
-            dist = float(np.hypot(dx, dz))
-            if dist < 1e-6:
-                pref = (0.0, 0.0)
-                self._rvo_manager.set_pref_velocity(key, pref)
-                self._rvo_last_pref[key] = pref
-                continue
-            override_ms = self._rvo_agent_max_speed.get(aid)
-            max_speed = (
-                float(override_ms)
-                if override_ms is not None
-                else self._rvo_max_speed
-            )
-            inv = max_speed / dist
-            pref = (dx * inv, dz * inv)
-            self._rvo_manager.set_pref_velocity(key, pref)
-            self._rvo_last_pref[key] = pref
+            pref = (0.0, 0.0)
+            if goal_xz is not None:
+                dx = goal_xz[0] - float(pos3[0])
+                dz = goal_xz[1] - float(pos3[2])
+                goal_dist = float(np.hypot(dx, dz))
+                if goal_dist >= self._rvo_goal_stop_radius and goal_dist > 1e-6:
+                    override_ms = self._rvo_agent_max_speed.get(aid)
+                    max_speed = (
+                        float(override_ms)
+                        if override_ms is not None
+                        else self._rvo_max_speed
+                    )
+                    inv = max_speed / goal_dist
+                    pref = (dx * inv, dz * inv)
+            mgr.set_pref_velocity(key, pref)
 
+        # 3) Advance ORCA and cache the solved velocities.
+        mgr.step()
+        for key in self._rvo_agent_keys:
+            v = mgr.get_agent_velocity(key)
+            self._rvo_last_vel[key] = (float(v[0]), float(v[1]))
+
+        # 4) Project a 1 s-ahead waypoint into each controlled agent's
+        #    oracle_nav_action. RVO is the sole driver of controlled agents, so
+        #    drop their *_base_velocity: when oracle_nav stops (agent at/near its
+        #    waypoint) it sets skill_done, the HL policy churns and may emit a
+        #    non-zero base_velocity that would otherwise push the agent past ORCA.
+        raw_names = (
+            list(action["action"])
+            if isinstance(action.get("action"), (tuple, list))
+            else ([action["action"]] if action.get("action") else [])
+        )
+        drop = {f"agent_{aid}_base_velocity" for aid in self._rvo_controlled_agents}
+        names = [nm for nm in raw_names if nm not in drop]
+        args = dict(action.get("action_args") or {})
+        for aid in self._rvo_controlled_agents:
+            if aid >= n:
+                continue
+            vx, vz = self._rvo_last_vel[self._rvo_agent_keys[aid]]
+            p = cur_pos[aid]
+            waypoint = np.array(
+                [
+                    float(p[0]) + vx * RVO_WAYPOINT_LOOKAHEAD,
+                    float(p[1]),
+                    float(p[2]) + vz * RVO_WAYPOINT_LOOKAHEAD,
+                ],
+                dtype=np.float32,
+            )
+            nav = f"agent_{aid}_oracle_nav_action"
+            args[nav] = waypoint
+            if nav not in names:
+                names.append(nav)
             if (
                 self._rvo_debug_save_obstacle_figure
                 and self._rvo_debug_episode_id is not None
             ):
-                trail = self._rvo_debug_step_trail.setdefault(key, [])
-                trail.append((float(tx), float(tz)))
+                self._rvo_debug_step_trail.setdefault(
+                    self._rvo_agent_keys[aid], []
+                ).append((float(waypoint[0]), float(waypoint[2])))
 
-        # 3) Advance ORCA by dt and cache the solved velocities.
-        self._rvo_manager.step()
-        for key in self._rvo_agent_keys:
-            v = self._rvo_manager.get_agent_velocity(key)
-            self._rvo_last_vel[key] = (float(v[0]), float(v[1]))
-
-        # Debug (no behavior change): when both agents are close, log ORCA vels vs
-        # line-of-sight between them. Throttle to avoid flooding the console.
-        # - along_0: signed component of agent_0 velocity along 0→1 (large + ⇒
-        #   moving toward the other along the connecting segment; large lateral
-        #   split means |along| is small while |v| is not).
-        self._rvo_debug_tick = getattr(self, "_rvo_debug_tick", 0) + 1
-        if (
-            len(self._rvo_agent_keys) >= 2
-            and 0 in pre_step_pos
-            and 1 in pre_step_pos
-        ):
-            p0 = pre_step_pos[0]
-            p1 = pre_step_pos[1]
-            sep = float(
-                np.hypot(
-                    float(p0[0]) - float(p1[0]), float(p0[2]) - float(p1[2])
-                )
-            )
-            if sep < 3.0 and self._rvo_debug_tick % 6 == 0:
-                udx = float(p1[0]) - float(p0[0])
-                udz = float(p1[2]) - float(p0[2])
-                ulen = float(np.hypot(udx, udz)) + 1e-9
-                udx /= ulen
-                udz /= ulen
-                v0 = self._rvo_last_vel.get("agent_0", (0.0, 0.0))
-                v1 = self._rvo_last_vel.get("agent_1", (0.0, 0.0))
-                v0n = float(np.hypot(v0[0], v0[1])) + 1e-9
-                v1n = float(np.hypot(v1[0], v1[1])) + 1e-9
-                along_0 = (v0[0] * udx + v0[1] * udz) / v0n
-                along_1 = (v1[0] * (-udx) + v1[1] * (-udz)) / v1n
-                lat0 = float(
-                    np.hypot(v0[0] * udz - v0[1] * udx, 0.0) / v0n
-                )
-                lat1 = float(
-                    np.hypot(v1[0] * udz - v1[1] * udx, 0.0) / v1n
-                )
-                # Remaining straight-line dist to each agent's nav goal (not
-                # path length). If still far but pref gets zeroed, check
-                # goal_stop; door choke is often narrow-portal + dual ORCA.
-                dg0: Optional[float] = None
-                dg1: Optional[float] = None
-                g0 = self._rvo_goal_xz_for_agent(0)
-                g1 = self._rvo_goal_xz_for_agent(1)
-                if g0 is not None:
-                    dg0 = float(
-                        np.hypot(
-                            float(p0[0]) - g0[0], float(p0[2]) - g0[1]
-                        )
-                    )
-                if g1 is not None:
-                    dg1 = float(
-                        np.hypot(
-                            float(p1[0]) - g1[0], float(p1[2]) - g1[1]
-                        )
-                    )
-                gs = self._rvo_goal_stop_radius
-                print(
-                    f"[RVO][debug:close] tick={self._rvo_debug_tick} "
-                    f"sep_m={sep:.2f} "
-                    f"dist2goal0={dg0} dist2goal1={dg1} goal_stop_r={gs} "
-                    f"(0_stops={dg0 is not None and dg0 < gs}) "
-                    f"(1_stops={dg1 is not None and dg1 < gs}) "
-                    f"v0=({v0[0]:.3f},{v0[1]:.3f})|v|={v0n:.3f} "
-                    f"v1=({v1[0]:.3f},{v1[1]:.3f})|v|={v1n:.3f} "
-                    f"along0_toward1={along_0:+.2f} lat0={lat0:.2f} "
-                    f"along1_toward0={along_1:+.2f} lat1={lat1:.2f}"
-                )
-
-        # 4) Teleport controlled agents to (pre_pos + orca_vel * dt), keeping
-        #    the ambient y (height) and snapping back onto the navmesh so we
-        #    don't go through walls missed by the 2D ORCA obstacle list.
-        pathfinder = getattr(self._sim, "pathfinder", None)
-        for aid in self._rvo_controlled_agents:
-            if aid not in pre_step_pos or aid >= len(self._rvo_agent_keys):
-                continue
-            key = self._rvo_agent_keys[aid]
-            vx, vz = self._rvo_last_vel[key]
-            pre3 = pre_step_pos[aid]
-            new_x = float(pre3[0]) + vx * dt * self._rvo_lin_scale
-            new_z = float(pre3[2]) + vz * dt * self._rvo_lin_scale
-            new_y = float(pre3[1])
-            start = mn.Vector3(float(pre3[0]), new_y, float(pre3[2]))
-            target = mn.Vector3(new_x, new_y, new_z)
-            try:
-                filtered = self._sim.step_filter(start, target)
-            except Exception:
-                filtered = target
-            final_pos = np.array(
-                [float(filtered[0]), float(filtered[1]), float(filtered[2])],
-                dtype=float,
-            )
-            # Snap back onto the navmesh surface to preserve height across slopes.
-            if pathfinder is not None and getattr(pathfinder, "is_loaded", True):
-                try:
-                    snapped = pathfinder.snap_point(final_pos)
-                    snap_arr = np.array(
-                        [float(snapped[0]), float(snapped[1]), float(snapped[2])],
-                        dtype=float,
-                    )
-                    if np.all(np.isfinite(snap_arr)):
-                        final_pos = snap_arr
-                except Exception:
-                    pass
-
-            try:
-                agent_data = self._sim.get_agent_data(aid)
-                agent_data.articulated_agent.base_pos = mn.Vector3(
-                    float(final_pos[0]),
-                    float(final_pos[1]),
-                    float(final_pos[2]),
-                )
-                # Orient the base toward the ORCA velocity when we actually moved.
-                if np.hypot(vx, vz) > 1e-3:
-                    # Habitat base_rot is yaw around +Y; forward is -Z in local
-                    # frame, so a world-space (vx, vz) direction of motion
-                    # corresponds to yaw = atan2(vx, -vz).
-                    try:
-                        agent_data.articulated_agent.base_rot = float(
-                            np.arctan2(vx, -vz)
-                        )
-                    except Exception:
-                        pass
-                # Keep grasped objects anchored while we teleport the base.
-                if (
-                    agent_data.grasp_mgr is not None
-                    and agent_data.grasp_mgr.snap_idx is not None
-                ):
-                    agent_data.grasp_mgr.update_object_to_grasp()
-            except Exception as e:
-                print(f"[RVO] apply pose for agent {aid} failed: {e}")
+        return {"action": tuple(names), "action_args": args}
 
     def step(self, action: Dict[str, Any], episode: Episode):
-        """Snapshot pre-step poses, let the base task process the action,
-        then overwrite controlled agents' poses with ``pre_pos + ORCA_vel * dt``."""
-        pre_pos = self._snapshot_pre_step_state()
-        # Debug: snapshot should cover every controlled id when RVO is on.
-        if self._rvo_enabled and self._rvo_manager is not None:
-            expected = set(self._rvo_controlled_agents)
-            have = set(pre_pos.keys())
-            if expected and not expected.issubset(have):
-                if not getattr(self, "_rvo_warned_snapshot", False):
-                    print(
-                        "[RVO][debug] snapshot missing some controlled agents: "
-                        f"expected={sorted(expected)} got={sorted(have)}"
-                    )
-                    self._rvo_warned_snapshot = True
-        obs = super().step(action=action, episode=episode)
+        """Solve ORCA at the current poses and rewrite ``action`` so each
+        controlled agent's oracle-nav action receives a 1 s-ahead waypoint; the
+        action then walks the agent there (turn-then-go / walk animation). No
+        teleport: locomotion and rotation are handled by the action + step_filter.
+        """
         if self._rvo_enabled and self._rvo_manager is not None:
             try:
-                self._rvo_compute_and_apply(pre_pos)
-                # Print velocities once per second so you can verify RVO is live.
-                self._rvo_step_counter = getattr(self, "_rvo_step_counter", 0) + 1
-                ctrl_freq = int(getattr(self._sim, "ctrl_freq", 30))
-                if ctrl_freq > 0 and self._rvo_step_counter % max(1, ctrl_freq) == 0:
-                    preview = {
-                        k: (round(v[0], 3), round(v[1], 3))
-                        for k, v in self._rvo_last_vel.items()
-                    }
-                    pref0 = self._rvo_last_pref.get("agent_0")
-                    dg0 = self._rvo_last_goal_dist.get(0)
-                    extra = ""
-                    if pref0 is not None:
-                        extra = (
-                            f" agent_0 pref={tuple(round(x, 3) for x in pref0)}"
-                            f" dist2goal={round(dg0, 3) if dg0 is not None else None}"
-                            f" goal_stop={self._rvo_goal_stop_radius}"
-                        )
-                    print(
-                        f"[RVO][step {self._rvo_step_counter}] "
-                        f"controlled={self._rvo_controlled_agents} vel={preview}{extra}"
-                    )
+                print(
+                    f"[RVO][dbg] IN type={type(action).__name__} "
+                    f"keys={list(action.keys()) if isinstance(action, dict) else 'NOT-A-DICT'}"
+                )
+                action = self._rvo_drive_action(action)
+                _vels = {
+                    k: (round(v[0], 3), round(v[1], 3))
+                    for k, v in self._rvo_last_vel.items()
+                }
+                print(
+                    f"[RVO][dbg] OUT names={action.get('action')} "
+                    f"orca_vel={_vels} "
+                    f"arg_keys={list(action.get('action_args', {}).keys())}"
+                )
             except Exception as e:  # pragma: no cover - defensive
-                print(f"[RVO] step failed, skipping overlay: {e}")
-        return obs
+                import traceback
+
+                traceback.print_exc()
+                print(f"[RVO] waypoint injection failed: {e}")
+        return super().step(action=action, episode=episode)

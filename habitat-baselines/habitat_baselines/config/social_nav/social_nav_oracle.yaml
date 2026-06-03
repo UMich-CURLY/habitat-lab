@@ -93,9 +93,9 @@ habitat:
 
 
     rvo_agent_radius: 1.5
-    rvo_agent_0_radius: 0.5
-    rvo_agent_1_radius: 0.5
-    rvo_time_horizon: 5.0
+    rvo_agent_0_radius: 0.6
+    rvo_agent_1_radius: 0.6
+    rvo_time_horizon: 1.0
     rvo_agent_0_max_speed: 0.8
     rvo_agent_1_max_speed: 0.8
     rvo_neighbor_dist: 3.0
