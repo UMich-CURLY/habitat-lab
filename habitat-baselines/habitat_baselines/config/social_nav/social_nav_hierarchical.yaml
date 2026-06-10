@@ -110,10 +110,8 @@ habitat_baselines:
             name: "SocialNavNeuralHighLevelPolicy"
             # Input features: [hpx, hpy, velx, vely, thetar, thetah]
             policy_input_keys:
-              - "agent_0_base_pos"
-              - "agent_1_base_pos"
-              - "agent_0_base_vel"
-              - "agent_1_base_vel"
+              - "agent_0_other_agent_gps"
+              - "agent_0_goal_to_agent_gps_compass"
               - "agent_0_orientation"
               - "agent_1_orientation"
             hidden_dim: 256
@@ -145,26 +143,13 @@ habitat_baselines:
         agent_name: "agent_1"
         hierarchical_policy:
           high_level_policy:
-            # Mirror agent_0 but use the fixed planner so no neural encoder
-            # is constructed for agent_1 either.
-            name: "FixedHighLevelPolicy"
-            allow_other_place: False
-            add_arm_rest: False
-            termination_obs_name: "has_finished_oracle_nav"
+            name: "CyclingHighLevelPolicy"
           defined_skills:
-            oracle_nav:
-              skill_name: "OracleNavPolicy"
-              pddl_action_names: ["nav_to_goal_social"]
-              action_name: "agent_1_oracle_nav_action"
+            go_to_goal:
+              skill_name: "GoToGoalSkill"
+              pddl_action_names: null
               max_skill_steps: 1500
-              ignore_grip: true
-            wait:
-              skill_name: "WaitSkillPolicy"
-              pddl_action_names: ["wait"]
-              max_skill_steps: -1
-              force_end_on_timeout: False
-          # Mirror the ignore list for agent_1 as well.
-          ignore_skills: ["nav_to_obj", "nav_to_goal", "nav_to_randcoord"]
+          ignore_skills: []
 
   checkpoint_folder: "checkpoints_social_nav_hrl"
   tensorboard_dir: "tb_social_nav_hrl"

@@ -63,6 +63,7 @@ class HierarchicalPolicy(Policy):
 
         self._action_space = action_space
         self._num_envs: int = num_envs
+        self._envs = None  # Will be set by trainer after initialization
 
         # Extract agent_name from config if not explicitly provided
         if agent_name is None and hasattr(config, 'agent_name'):
@@ -171,6 +172,14 @@ class HierarchicalPolicy(Policy):
 
     def eval(self):
         pass
+
+    def set_envs(self, envs):
+        """Set the environment reference so skills can access task.actions"""
+        self._envs = envs
+        # Also propagate to skills that need it
+        for skill in self._skills.values():
+            if hasattr(skill, 'set_envs'):
+                skill.set_envs(envs)
 
     @property
     def num_recurrent_layers(self):
@@ -401,10 +410,7 @@ class HierarchicalPolicy(Policy):
         # Always call high-level if the episode is over.
         self._call_high_level = self._call_high_level | (~masks).view(-1)
 
-        # Trigger backoff at step 20 for testing
-        if self._step_counter == 20:
-            print(f"[hierarchical_policy] Triggering backoff at step {self._step_counter}", flush=True)
-            self._call_high_level[:] = True
+        # Always call high-level at step 20 to verify skill switching works
 
         # Rule-based: call high-level to trigger backoff if human is detected
         if isinstance(observations, dict):
@@ -517,6 +523,7 @@ class HierarchicalPolicy(Policy):
             skill_idx = int(self._cur_skills[batch_idx].item())
             if skill_idx not in self._skills:
                 # Skip if skill index is invalid
+                baselines_logger.warning(f"skill_idx={skill_idx} not in self._skills (available: {list(self._skills.keys())})")
                 continue
 
             try:
@@ -526,9 +533,8 @@ class HierarchicalPolicy(Policy):
                 else:
                     skill_hidden_states = batched_rnn_hidden_states.new_zeros((0, 1, 0))
 
-                action_data = self._skills[
-                    skill_idx
-                ].act(
+                skill = self._skills[skill_idx]
+                action_data = skill.act(
                     batched_observations[batch_idx],
                     skill_hidden_states,
                     batched_prev_actions[batch_idx],

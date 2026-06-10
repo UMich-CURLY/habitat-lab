@@ -106,6 +106,7 @@ class SocialNavNeuralHighLevelPolicy(HighLevelPolicy):
 
         # Aux modules (e.g., for auxiliary losses)
         self.aux_modules = get_aux_modules(aux_loss_config, action_space, self)
+        self._debug_call_count = 0
 
         baselines_logger.info(
             f"SocialNavNeuralHighLevelPolicy initialized with {self._n_actions} actions: "
@@ -188,79 +189,59 @@ class SocialNavNeuralHighLevelPolicy(HighLevelPolicy):
     ) -> torch.Tensor:
         """
         Extract the 6-D feature vector from observations:
-        [hpx, hpy, velx, vely, thetar, thetah]
+        [hpx, hpy, goal_dist, goal_bearing, thetar, thetah]
 
-        Expects observations to contain keys with these features or
-        computable from robot/human state observations.
-
-        :param observations: Dictionary of observations from the environment.
-        :return: Tensor of shape (batch_size, 6) with social nav features.
+        Sources:
+          hpx, hpy       — other_agent_gps / agent_0_other_agent_gps (human XY relative to robot)
+          goal_dist,
+          goal_bearing   — goal_to_agent_gps_compass / agent_0_goal_to_agent_gps_compass
+          thetar         — agent_0_orientation (robot yaw)
+          thetah         — agent_1_orientation (human yaw)
         """
         batch_size = None
         features = []
+        device = list(observations.values())[0].device
 
-        # Extract human relative position (hpx, hpy)
-        for key in ["human_relative_position", "human_pos_relative"]:
-            if key in observations:
-                hpos = observations[key]
-                if isinstance(hpos, np.ndarray):
-                    hpos = torch.from_numpy(hpos).float()
-                if batch_size is None:
-                    batch_size = hpos.shape[0]
-                # Take only x, y components
-                features.extend([hpos[:, 0:1], hpos[:, 1:2]])
-                break
+        def _obs(keys):
+            for k in keys:
+                if k in observations:
+                    v = observations[k]
+                    return torch.from_numpy(v).float().to(device) if isinstance(v, np.ndarray) else v.float().to(device)
+            return None
+
+        def _zeros(n=1):
+            return torch.zeros(batch_size, n, device=device)
+
+        # Human XY relative to robot — other_agent_gps shape: [B, 2]
+        hpos = _obs(["agent_0_other_agent_gps", "other_agent_gps"])
+        if hpos is not None:
+            batch_size = hpos.shape[0]
+            features.extend([hpos[:, 0:1], hpos[:, 1:2]])
         else:
-            # Fallback: zeros if not available
             if batch_size is None:
                 batch_size = list(observations.values())[0].shape[0]
-            features.append(torch.zeros(batch_size, 1, device=list(observations.values())[0].device))
-            features.append(torch.zeros(batch_size, 1, device=list(observations.values())[0].device))
+            features.extend([_zeros(), _zeros()])
 
-        # Extract relative velocity (velx, vely)
-        for key in ["human_relative_velocity", "human_vel_relative"]:
-            if key in observations:
-                hvel = observations[key]
-                if isinstance(hvel, np.ndarray):
-                    hvel = torch.from_numpy(hvel).float()
-                features.extend([hvel[:, 0:1], hvel[:, 1:2]])
-                break
+        # Goal polar coords — goal_to_agent_gps_compass shape: [B, 2] = [dist, bearing]
+        gps = _obs(["agent_0_goal_to_agent_gps_compass", "goal_to_agent_gps_compass"])
+        if gps is not None:
+            features.extend([gps[:, 0:1], gps[:, 1:2]])
         else:
-            # Fallback: zeros
-            features.append(torch.zeros(batch_size, 1, device=features[0].device))
-            features.append(torch.zeros(batch_size, 1, device=features[0].device))
+            features.extend([_zeros(), _zeros()])
 
-        # Extract robot orientation (thetar)
-        for key in ["robot_orientation", "agent_0_orientation"]:
-            if key in observations:
-                thetar = observations[key]
-                if isinstance(thetar, np.ndarray):
-                    thetar = torch.from_numpy(thetar).float()
-                # Keep only yaw (typically last component or index 2 for XYZ Euler)
-                if thetar.shape[-1] >= 3:
-                    thetar = thetar[:, 2:3]
-                elif thetar.shape[-1] == 1:
-                    thetar = thetar[:, 0:1]
-                features.append(thetar)
-                break
+        # Robot yaw — agent_0_orientation shape: [B, 3] or [B, 1]
+        thetar = _obs(["agent_0_orientation", "robot_orientation"])
+        if thetar is not None:
+            features.append(thetar[:, 2:3] if thetar.shape[-1] >= 3 else thetar[:, 0:1])
         else:
-            features.append(torch.zeros(batch_size, 1, device=features[0].device))
+            features.append(_zeros())
 
-        # Extract human orientation (thetah)
-        for key in ["human_orientation", "agent_1_orientation"]:
-            if key in observations:
-                thetah = observations[key]
-                if isinstance(thetah, np.ndarray):
-                    thetah = torch.from_numpy(thetah).float()
-                # Keep only yaw
-                if thetah.shape[-1] >= 3:
-                    thetah = thetah[:, 2:3]
-                elif thetah.shape[-1] == 1:
-                    thetah = thetah[:, 0:1]
-                features.append(thetah)
-                break
+        # Human yaw — agent_1_orientation shape: [B, 3] or [B, 1]
+        thetah = _obs(["agent_1_orientation", "human_orientation"])
+        if thetah is not None:
+            features.append(thetah[:, 2:3] if thetah.shape[-1] >= 3 else thetah[:, 0:1])
         else:
-            features.append(torch.zeros(batch_size, 1, device=features[0].device))
+            features.append(_zeros())
 
         # Concatenate all features
         social_nav_features = torch.cat(features, dim=1)  # Shape: (batch_size, 6)
@@ -269,6 +250,17 @@ class SocialNavNeuralHighLevelPolicy(HighLevelPolicy):
             raise ValueError(
                 f"Expected {self._input_feature_dim} features, got {social_nav_features.shape[1]}. "
                 f"Available observation keys: {list(observations.keys())}"
+            )
+
+        self._debug_call_count += 1
+        if self._debug_call_count <= 5 or self._debug_call_count % 50 == 0:
+            f = social_nav_features[0].tolist()
+            print(
+                f"[HL input #{self._debug_call_count}] "
+                f"hpx={f[0]:.3f} hpy={f[1]:.3f} "
+                f"goal_dist={f[2]:.3f} goal_bearing={f[3]:.3f} "
+                f"thetar={f[4]:.3f} thetah={f[5]:.3f}",
+                flush=True,
             )
 
         return social_nav_features

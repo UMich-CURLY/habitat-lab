@@ -50,19 +50,12 @@ class FixedHighLevelPolicy(HighLevelPolicy):
         Filters the solution to only include actions for this agent (multi-agent support).
         """
         if self._pddl_prob is None:
-            # For multi-agent setups without PDDL available, provide simple hardcoded navigation
-            if self._agent_name == "agent_1":
-                # Human navigates to its goal
-                return [
-                    ("nav_to_goal_social", ["TARGET_robot_1_goal", "robot_1"]),
-                    parse_func("wait(30)")
-                ]
-            else:
-                # Default fallback: wait
-                baselines_logger.warning(
-                    f"No PDDL problem available for agent {self._agent_name}, using default wait action"
-                )
-                return [parse_func("wait(30)")]
+            # For multi-agent setups without PDDL available, provide simple hardcoded actions
+            # Default: just wait (no navigation)
+            baselines_logger.warning(
+                f"No PDDL problem available for agent {self._agent_name}, using default wait action"
+            )
+            return [parse_func("wait(30)")]
 
         # Derive robot entity name from agent name for filtering
         # E.g., "agent_1" -> "robot_1"
@@ -142,9 +135,6 @@ class FixedHighLevelPolicy(HighLevelPolicy):
         log_info,
     ):
         batch_size = masks.shape[0]
-        print(f"[FixedHighLevelPolicy.get_next_skill] Called with plan_masks={plan_masks}, _steps_since_start={self._steps_since_start}", flush=True)
-        if isinstance(observations, dict):
-            print(f"[FixedHighLevelPolicy.get_next_skill] obs_keys={sorted(observations.keys())}", flush=True)
         next_skill = torch.zeros(batch_size)
         skill_args_data = [None for _ in range(batch_size)]
         immediate_end = torch.zeros(batch_size, dtype=torch.bool)
@@ -155,7 +145,6 @@ class FixedHighLevelPolicy(HighLevelPolicy):
             for i in range(batch_size):
                 next_skill[i] = 0  # Force first skill (backoff)
                 skill_args_data[i] = {}
-            print(f"[FixedHighLevelPolicy] FORCING BACKOFF AT STEP {self._steps_since_start}, next_skill={next_skill}", flush=True)
             return next_skill, skill_args_data, immediate_end, PolicyActionData()
 
         # Rule-based override: force backoff if human is detected
@@ -172,7 +161,6 @@ class FixedHighLevelPolicy(HighLevelPolicy):
                     if "backoff" in self._skill_name_to_idx:
                         next_skill[i] = self._skill_name_to_idx["backoff"]
                         skill_args_data[i] = {}
-                        print(f"[FixedHighLevelPolicy] Rule-based backoff override for batch {i} (human_detected=1.0)", flush=True)
                         continue
 
         for batch_idx, should_plan in enumerate(plan_masks):
@@ -189,8 +177,6 @@ class FixedHighLevelPolicy(HighLevelPolicy):
                 # Map PDDL action name to skill name using the mapping passed during initialization
                 skill_name = self._pddl_action_name_to_skill_name.get(pddl_action_name, pddl_action_name)
 
-                print(f"[FixedHighLevelPolicy.get_next_skill] batch_idx={batch_idx}, pddl_action_name={pddl_action_name}, skill_name={skill_name}, skill_idx={self._skill_name_to_idx[skill_name]}", flush=True)
-
                 if skill_name not in self._skill_name_to_idx:
                     raise ValueError(
                         f"Could not find skill named {skill_name} (from PDDL action {pddl_action_name}) in {self._skill_name_to_idx}"
@@ -201,7 +187,6 @@ class FixedHighLevelPolicy(HighLevelPolicy):
 
                 self._next_sol_idxs[batch_idx] += 1
 
-        print(f"[FixedHighLevelPolicy.get_next_skill] Returning next_skill={next_skill}", flush=True)
         return next_skill, skill_args_data, immediate_end, PolicyActionData()
 
     def filter_envs(self, curr_envs_to_keep_active):
