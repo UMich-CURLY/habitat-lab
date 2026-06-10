@@ -1,0 +1,30 @@
+# @package _global_
+
+# Skills configuration for social navigation with TwoAgentSocialNavTask
+# NO PDDL constraints - skills execute directly
+# 
+# HL policy learns to select skills based on 6-D features:
+# - go_to_wait_pos: Navigate to safe wait position
+# - wait: Stay at current position without moving
+# - go_to_goal: Navigate to final goal
+#
+# The RL agent learns which skill to use when based on:
+# [human_relative_pos_x, human_relative_pos_y, 
+#  human_relative_vel_x, human_relative_vel_y, 
+#  robot_orientation, human_orientation]
+
+habitat_baselines:
+  rl:
+    policy:
+      main_agent:
+        hierarchical_policy:
+          defined_skills:
+            go_to_wait_pos:
+              skill_name: "GoToWaitPosSkill"
+              pddl_action_names: []  # No PDDL constraints
+            wait:
+              skill_name: "WaitSkill"
+              pddl_action_names: []  # No PDDL constraints
+            go_to_goal:
+              skill_name: "GoToGoalSkill"
+              pddl_action_names: []  # No PDDL constraints

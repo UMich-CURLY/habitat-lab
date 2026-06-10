@@ -5,6 +5,7 @@
 import os.path as osp
 from dataclasses import dataclass
 
+import gym.spaces as spaces
 import torch
 
 from habitat.core.spaces import ActionSpace
@@ -47,12 +48,39 @@ class OracleNavPolicy(NnSkillPolicy):
             filtered_action_space,
             batch_size,
         )
-        try:
-            self._oracle_nav_ac_idx, _ = find_action_range(
-                action_space, "oracle_nav_action"
-            )
-        except KeyError:
-            import pdb; pdb.set_trace()
+        # Handle both Dict and Box action spaces
+        from gym import spaces
+        if isinstance(action_space, spaces.Box):
+            # For Box action space (flattened from Dict), find oracle_nav position
+            # Try to find it in filtered_action_space first
+            found_idx = None
+            try:
+                found_idx, _ = find_action_range(
+                    filtered_action_space, "oracle_nav_action"
+                )
+            except (KeyError, ValueError):
+                pass
+
+            if found_idx is not None:
+                self._oracle_nav_ac_idx = found_idx
+            else:
+                # Fallback: for humanoid with arm, oracle_nav typically comes after:
+                # arm_action (7) + grip (1) + base_vel (2) = position 10
+                if self._full_ac_size == 12:  # humanoid with oracle_nav
+                    self._oracle_nav_ac_idx = 10
+                else:
+                    # For other cases, oracle_nav is at the end
+                    self._oracle_nav_ac_idx = self._full_ac_size - 1
+        else:
+            # For Dict action space, use find_action_range
+            try:
+                self._oracle_nav_ac_idx, _ = find_action_range(
+                    action_space, "oracle_nav_action"
+                )
+            except (KeyError, ValueError):
+                raise ValueError(
+                    f"Could not find oracle_nav_action in action space {action_space}"
+                )
 
     def set_pddl_problem(self, pddl_prob):
         super().set_pddl_problem(pddl_prob)
@@ -82,17 +110,44 @@ class OracleNavPolicy(NnSkillPolicy):
     def from_config(
         cls, config, observation_space, action_space, batch_size, full_config
     ):
-        try:
-            filtered_action_space = ActionSpace(
-                {config.action_name: action_space[config.action_name]}
-            )
-        except KeyError as e:
+        # If action_space is a Box (agent-specific for social nav), 
+        # we need to get the full Dict action space from the environment config
+        if isinstance(action_space, spaces.Box):
+            # For multi-agent setups, we need the full action space from the env
+            # This is typically stored in full_config if available
+            try:
+                # Try to get action space from full_config's habitat settings
+                from habitat_baselines.rl.hrl.hl.high_level_policy import HighLevelPolicy
+                # We'll use the orig_action_space if available in full_config
+                if hasattr(full_config, 'habitat') and hasattr(full_config.habitat, 'task'):
+                    # This is a navigation task with Box action space
+                    # Create a simple filtered action space for oracle nav
+                    filtered_action_space = ActionSpace(
+                        {config.action_name: action_space}
+                    )
+                else:
+                    filtered_action_space = ActionSpace(
+                        {config.action_name: action_space}
+                    )
+            except Exception as e:
+                baselines_logger.warning(f"Could not construct action space: {e}")
+                filtered_action_space = ActionSpace(
+                    {config.action_name: action_space}
+                )
+        else:
+            # Original logic for Dict action spaces (manipulation tasks)
             try:
                 filtered_action_space = ActionSpace(
-                    {config.action_name: action_space["oracle_nav_action"][config.action_name]}
+                    {config.action_name: action_space[config.action_name]}
                 )
-            except KeyError:
-                import pdb; pdb.set_trace()
+            except KeyError as e:
+                try:
+                    filtered_action_space = ActionSpace(
+                        {config.action_name: action_space["oracle_nav_action"][config.action_name]}
+                    )
+                except KeyError:
+                    baselines_logger.error(f"Could not find action {config.action_name} in action space")
+                    raise
            
         baselines_logger.debug(
             f"Loaded action space {filtered_action_space} for skill {config.skill_name}"
@@ -173,6 +228,8 @@ class OracleNavPolicy(NnSkillPolicy):
         )
 
         full_action[:, self._oracle_nav_ac_idx] = action_idxs
+
+        print(f"[OracleNavPolicy._internal_act] _oracle_nav_ac_idx={self._oracle_nav_ac_idx}, action_idxs={action_idxs}, full_action={full_action}", flush=True)
 
         return PolicyActionData(
             actions=full_action, rnn_hidden_states=rnn_hidden_states

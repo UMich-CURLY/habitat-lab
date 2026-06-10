@@ -45,50 +45,80 @@ class SkillPolicy(Policy):
         ]
         self._full_ac_size = get_num_actions(action_space)
 
-        # TODO: for some reason this doesnt work with "pddl_apply_action" in action_space
-        # and needs to go through the keys argument
-        if "pddl_apply_action" in list(action_space.keys()):
-            self._pddl_ac_start, _ = find_action_range(
-                action_space, "pddl_apply_action"
-            )
+        # Check if action_space is a Dict-like space (manipulation) or Box-like (navigation)
+        has_keys = hasattr(action_space, 'keys') and callable(getattr(action_space, 'keys', None))
+        
+        if has_keys:
+            # TODO: for some reason this doesnt work with "pddl_apply_action" in action_space
+            # and needs to go through the keys argument
+            if "pddl_apply_action" in list(action_space.keys()):
+                self._pddl_ac_start, _ = find_action_range(
+                    action_space, "pddl_apply_action"
+                )
+            else:
+                self._pddl_ac_start = None
+            if self._apply_postconds and self._pddl_ac_start is None:
+                raise ValueError(f"Could not find PDDL action in skill {self}")
+
+            self._grip_ac_idx = 0
+            found_grip = False
+            for k, space in action_space.items():
+                if k != "arm_action":
+                    self._grip_ac_idx += get_num_actions(space)
+                else:
+                    # The last actioin in the arm action is the grip action.
+                    self._grip_ac_idx += get_num_actions(space) - 1
+                    found_grip = True
+                    break
+            if not found_grip and not self.should_ignore_grip:
+                # If the action space simply does not expose an `arm_action`
+                # (common for non-manipulation / navigation-only tasks), treat
+                # the grip action as intentionally absent and fall back to
+                # ignoring grip instead of raising an error. This keeps skill
+                # construction robust across different task types.
+                try:
+                    has_arm_action = "arm_action" in list(action_space.keys())
+                except Exception:
+                    has_arm_action = False
+                if not has_arm_action:
+                    self.should_ignore_grip = True
+                else:
+                    raise ValueError(f"Could not find grip action in {action_space}")
         else:
+            # Box action space (navigation tasks) - skip PDDL and grip logic
             self._pddl_ac_start = None
-        if self._apply_postconds and self._pddl_ac_start is None:
-            raise ValueError(f"Could not find PDDL action in skill {self}")
+            self._grip_ac_idx = 0
 
-        self._grip_ac_idx = 0
-        found_grip = False
-        for k, space in action_space.items():
-            if k != "arm_action":
-                self._grip_ac_idx += get_num_actions(space)
-            else:
-                # The last actioin in the arm action is the grip action.
-                self._grip_ac_idx += get_num_actions(space) - 1
-                found_grip = True
-                break
-        if not found_grip and not self.should_ignore_grip:
-            # If the action space simply does not expose an `arm_action`
-            # (common for non-manipulation / navigation-only tasks), treat
-            # the grip action as intentionally absent and fall back to
-            # ignoring grip instead of raising an error. This keeps skill
-            # construction robust across different task types.
-            try:
-                has_arm_action = "arm_action" in list(action_space.keys())
-            except Exception:
-                has_arm_action = False
-            if not has_arm_action:
-                self.should_ignore_grip = True
-            else:
-                raise ValueError(f"Could not find grip action in {action_space}")
-
-        self._stop_action_idx, _ = find_action_range(
-            action_space, "rearrange_stop"
-        )
+        # Find stop action if it exists
+        try:
+            self._stop_action_idx, _ = find_action_range(
+                action_space, "rearrange_stop"
+            )
+        except Exception:
+            # Stop action may not exist for navigation tasks
+            self._stop_action_idx = None
 
     def _internal_log(self, s):
         baselines_logger.debug(
             f"Skill {self._config.skill_name} @ step {self._cur_skill_step}: {s}"
         )
+
+    @property
+    def num_recurrent_layers(self):
+        return 0
+
+    @property
+    def recurrent_hidden_size(self):
+        return 0
+
+    @property
+    def hidden_state_shape(self):
+        # For non-neural skills, return (0, 0) to indicate no RNN hidden state needed
+        return (0, 0)
+
+    @property
+    def hidden_state_shape_lens(self):
+        return [0]
 
     def _get_multi_sensor_index(self, batch_idx: List[int]) -> List[int]:
         """
@@ -128,7 +158,6 @@ class SkillPolicy(Policy):
         """
         Modifies the actions according to the postconditions set in self._pddl_problem.actions[skill_name]
         """
-        import pdb; pdb.set_trace()
         skill_args = self._raw_skill_args[env_i]
         action = self._pddl_problem.actions[skill_name]
 
@@ -238,10 +267,10 @@ class SkillPolicy(Policy):
                 baselines_logger.debug(
                     f"Entering skill {self} with arguments {skill_arg[i]}"
                 )
-            if skill_arg[i] == '0':
-                import pdb; pdb.set_trace()
+            # Handle None skill_name for social nav skills and other cases
+            skill_name_str = skill_name[i] if skill_name is not None else None
             self._cur_skill_args[batch_idx] = self._parse_skill_arg(
-                skill_name[i], skill_arg[i]
+                skill_name_str, skill_arg[i]
             )
 
         return (

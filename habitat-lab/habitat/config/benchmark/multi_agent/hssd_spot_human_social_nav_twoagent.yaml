@@ -20,8 +20,6 @@ defaults:
   - /habitat/task/actions@habitat.task.actions.agent_0_rearrange_stop: rearrange_stop
   - /habitat/task/actions@habitat.task.actions.agent_0_oracle_nav_action: oracle_nav_action
   - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_action: oracle_nav_action
-  # - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_randcoord_action: oracle_nav_action
-  # - /habitat/task/actions@habitat.task.actions.agent_0_oracle_nav_randcoord_action: oracle_nav_action
   # Config agent sensor
   - /habitat/task/measurements:
     - articulated_agent_force
@@ -123,6 +121,8 @@ habitat:
         # at the ORCA-solved speed (step_filter handles walls).
         type: OracleNavWaypointAction
         motion_control: base_velocity
+        # -1.0 snaps to navmesh closest point to goal (avoids "at goal" on step 0 when robot starts near goal)
+        spawn_max_dist_to_obj: -1.0
         # dist_thresh doubles as the stop gate: halt when ORCA speed < 0.1 m/s.
         dist_thresh: 0.1
         lin_speed: 8.0
@@ -132,6 +132,8 @@ habitat:
       agent_1_oracle_nav_action:
         type: OracleNavWaypointAction
         motion_control: human_joints
+        # Snap to closest navmesh point (deterministic, not random sample within radius)
+        spawn_max_dist_to_obj: -1.0
         dist_thresh: 0.1
         lin_speed: 6.0
         ang_speed: 6.0
@@ -155,6 +157,7 @@ habitat:
       - agent_0_trajectory_buffer
       - agent_0_has_finished_oracle_nav
       - agent_1_has_finished_oracle_nav
+      - agent_0_goal_to_agent_gps_compass
 
 
   environment:

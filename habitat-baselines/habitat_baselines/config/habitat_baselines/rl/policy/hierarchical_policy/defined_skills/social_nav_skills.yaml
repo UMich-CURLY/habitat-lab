@@ -1,0 +1,14 @@
+# Skills configuration for social navigation
+# Three discrete skills: go_to_wait_pos, wait, go_to_goal
+
+go_to_wait_pos:
+  skill_name: "GoToWaitPosSkill"
+  pddl_action_names: ["go_to_wait_pos"]
+
+wait:
+  skill_name: "WaitSkill"
+  pddl_action_names: ["wait"]
+
+go_to_goal:
+  skill_name: "GoToGoalSkill"
+  pddl_action_names: ["go_to_goal"]

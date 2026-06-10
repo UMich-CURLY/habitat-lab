@@ -57,11 +57,17 @@ class NnSkillPolicy(SkillPolicy):
         self._ac_len = get_num_actions(filtered_action_space)
         self._did_want_done = torch.zeros(self._batch_size)
 
-        for k, space in action_space.items():
-            if k not in filtered_action_space.spaces.keys():
-                self._ac_start += get_num_actions(space)
-            else:
-                break
+        # Handle both Dict and Box action spaces
+        if hasattr(action_space, 'items'):
+            # Dict action space
+            for k, space in action_space.items():
+                if k not in filtered_action_space.spaces.keys():
+                    self._ac_start += get_num_actions(space)
+                else:
+                    break
+        else:
+            # Box action space (single agent / navigation task)
+            self._ac_start = 0
 
         self._internal_log(
             f"Skill {self._config.skill_name}: action offset {self._ac_start}, action length {self._ac_len}"
@@ -85,6 +91,27 @@ class NnSkillPolicy(SkillPolicy):
             return self._wrap_policy.net.num_recurrent_layers
         else:
             return 0
+
+    @property
+    def hidden_state_shape(self):
+        if self._wrap_policy is not None and hasattr(self._wrap_policy, 'hidden_state_shape'):
+            return self._wrap_policy.hidden_state_shape
+        # Fallback: return (num_recurrent_layers, recurrent_hidden_size)
+        return (self.num_recurrent_layers, self.recurrent_hidden_size)
+
+    @property
+    def hidden_state_shape_lens(self):
+        if self._wrap_policy is not None and hasattr(self._wrap_policy, 'hidden_state_shape_lens'):
+            return self._wrap_policy.hidden_state_shape_lens
+        return [self.recurrent_hidden_size]
+
+    @property
+    def recurrent_hidden_size(self):
+        if self._wrap_policy is not None and hasattr(self._wrap_policy, 'recurrent_hidden_size'):
+            return self._wrap_policy.recurrent_hidden_size
+        elif self._wrap_policy is not None and hasattr(self._wrap_policy.net, 'hidden_size'):
+            return self._wrap_policy.net.hidden_size
+        return 0
 
     def to(self, device):
         super().to(device)

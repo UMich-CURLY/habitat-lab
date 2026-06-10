@@ -331,7 +331,6 @@ class RNNStateEncoder(nn.Module):
         self, x, hidden_states, masks
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Forward for a non-sequence input"""
-        import pdb; pdb.set_trace()
         hidden_states = torch.where(
             masks.view(1, -1, 1).bool(), hidden_states, hidden_states.new_zeros(())
         )
@@ -407,7 +406,7 @@ class LSTMStateEncoder(RNNStateEncoder):
         hidden_size: int,
         num_layers: int = 1,
     ):
-        super().__init__()
+        super().__init__(input_size, hidden_size, num_layers, rnn_type="LSTM")
 
         self.num_recurrent_layers = num_layers * 2
 
@@ -438,7 +437,7 @@ class GRUStateEncoder(RNNStateEncoder):
         hidden_size: int,
         num_layers: int = 1,
     ):
-        super().__init__()
+        super().__init__(input_size, hidden_size, num_layers, rnn_type="GRU")
 
         self.num_recurrent_layers = num_layers
 

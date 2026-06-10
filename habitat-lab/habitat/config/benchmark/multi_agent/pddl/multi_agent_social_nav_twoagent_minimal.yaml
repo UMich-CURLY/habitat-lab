@@ -37,7 +37,7 @@ stage_goals:
 # ordering of the navigation actions; the planner may choose a different
 # ordering when solving. Keep the solution here for reproducibility and to
 # support code paths that expect a concrete solution list.
+# Both agents navigate to their goals in parallel (no back_off for now).
 solution:
   - nav_to_goal_social(TARGET_robot_0_goal, robot_0)
-  - back_off(robot_0)
   - nav_to_goal_social(TARGET_robot_1_goal, robot_1)

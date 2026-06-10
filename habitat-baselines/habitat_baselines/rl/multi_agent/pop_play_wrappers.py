@@ -133,12 +133,13 @@ class MultiPolicy(Policy):
     def hidden_state_shape(self):
         """
         Stack the hidden states of all the policies in the active population.
+        Policies with 0 recurrent layers will contribute 0 to the hidden state size.
         """
         hidden_shapes = np.stack(
             [policy.hidden_state_shape for policy in self._active_policies]
         )
         # We do max because some policies may be non-neural
-        # And will have a hidden state of [0, hidden_dim]
+        # And will have a hidden state of [0, 0]
         max_hidden_shape = hidden_shapes.max(0)
         # The hidden states will be concatenated over the last dimension.
         return [*max_hidden_shape[:-1], np.sum(hidden_shapes[:, -1])]
@@ -230,10 +231,29 @@ class MultiPolicy(Policy):
         rnn_hidden_lengths = [
             ac.rnn_hidden_states.shape[-1] for ac in agent_actions
         ]
+        
+        # Handle RNN hidden states concatenation
+        # When agents have different numbers of RNN layers, we need to pad
+        rnn_states_to_concat = []
+        max_layers = max([ac.rnn_hidden_states.shape[1] if ac.rnn_hidden_states.dim() == 3 else 0 for ac in agent_actions], default=0)
+        
+        for ac in agent_actions:
+            rnn_state = ac.rnn_hidden_states
+            if rnn_state.dim() == 3 and max_layers > 0:
+                # Pad if this agent has fewer layers than the max
+                current_layers = rnn_state.shape[1]
+                if current_layers < max_layers:
+                    # Pad to [batch, max_layers, hidden]
+                    padding = max_layers - current_layers
+                    rnn_state = torch.cat([
+                        rnn_state,
+                        torch.zeros(*rnn_state.shape[:1], padding, *rnn_state.shape[2:], 
+                                   device=rnn_state.device, dtype=rnn_state.dtype)
+                    ], dim=1)
+            rnn_states_to_concat.append(rnn_state)
+        
         return MultiAgentPolicyActionData(
-            rnn_hidden_states=torch.cat(
-                [ac.rnn_hidden_states for ac in agent_actions], -1
-            ),
+            rnn_hidden_states=torch.cat(rnn_states_to_concat, -1),
             actions=_maybe_cat(
                 lambda ac: ac.actions, action_dims, prev_actions.dtype
             ),
@@ -276,9 +296,8 @@ class MultiPolicy(Policy):
         """
         Return a dictionary with rnn_hidden_states lengths and action lengths that
         will be used to split these tensors into different agents. If the lengths
-        are already in kwargs, we return them as is, if not, we assume agents
-        have the same action/hidden dimension, so the tensors will be split equally.
-        Therefore, the lists become [dimension_tensor // num_agents] * num_agents
+        are already in kwargs, we return them as is, if not, we use the actual
+        hidden state shape lens from each policy.
         """
         n_agents = len(self._active_policies)
         index_names = [
@@ -289,11 +308,19 @@ class MultiPolicy(Policy):
         for name_index in index_names:
             if name_index not in kwargs:
                 if name_index == "index_len_recurrent_hidden_states":
-                    all_dim = rnn_hidden_states.shape[-1]
+                    # Use the actual hidden state shape lens from each policy
+                    split_indices = []
+                    for policy in self._active_policies:
+                        shape_lens = policy.hidden_state_shape_lens
+                        if isinstance(shape_lens, list) and len(shape_lens) > 0:
+                            split_indices.append(shape_lens[0])
+                        else:
+                            # Fallback: use 0 for policies without hidden states
+                            split_indices.append(0)
                 else:
                     all_dim = prev_actions.shape[-1]
-                split_indices = int(all_dim / n_agents)
-                split_indices = [split_indices] * n_agents
+                    split_indices = int(all_dim / n_agents)
+                    split_indices = [split_indices] * n_agents
             else:
                 split_indices = kwargs[name_index]
             split_index_dict[name_index] = split_indices

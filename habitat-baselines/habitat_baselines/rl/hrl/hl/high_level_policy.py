@@ -24,6 +24,7 @@ class HighLevelPolicy(nn.Module):
         action_space: spaces.Space,
         aux_loss_config=None,
         agent_name: Optional[str] = None,
+        pddl_action_name_to_skill_name: Optional[Dict[str, str]] = None,
     ):
         super().__init__()
         self._config = config
@@ -34,6 +35,7 @@ class HighLevelPolicy(nn.Module):
         self._device = None
         self._agent_name = agent_name
         self._action_space = action_space
+        self._pddl_action_name_to_skill_name = pddl_action_name_to_skill_name or {}
 
     def to(self, device):
         self._device = device
