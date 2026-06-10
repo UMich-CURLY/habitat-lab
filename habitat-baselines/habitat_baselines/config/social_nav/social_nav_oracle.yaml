@@ -82,3 +82,20 @@ habitat_baselines:
               force_end_on_timeout: False
           # Mirror the ignore list for agent_1 as well.
           ignore_skills: ["nav_to_obj", "nav_to_goal", "nav_to_randcoord"]
+
+# When using TwoAgentSocialNavTask + RVO, dump navmesh-derived ORCA obstacles each episode reset.
+habitat:
+  task:
+    rvo_static_map_enabled: False
+    rvo_controlled_agents: [0, 1]
+    rvo_debug_save_obstacle_figure: True
+    rvo_debug_obstacle_figure_dir: "video_dir/rvo_static_obstacles"
+
+
+    rvo_agent_radius: 1.5
+    rvo_agent_0_radius: 0.6
+    rvo_agent_1_radius: 0.6
+    rvo_time_horizon: 1.0
+    rvo_agent_0_max_speed: 0.8
+    rvo_agent_1_max_speed: 0.8
+    rvo_neighbor_dist: 3.0

@@ -434,3 +434,95 @@ class OracleNavRandCoordAction(OracleNavCoordAction):  # type: ignore
             except Exception:
                 pass
         return ret_val
+
+
+@registry.register_task_action
+class OracleNavWaypointAction(OracleNavAction):  # type: ignore
+    """Steer the agent toward a fed (x, y, z) waypoint with turn-then-go
+    kinematics, moving at the speed encoded in the waypoint.
+
+    ``TwoAgentSocialNavTask`` solves ORCA and injects
+    ``waypoint = base_pos + orca_vel * 1.0`` into the ``oracle_nav_action`` arg,
+    so ``|waypoint - base_pos|`` equals the desired speed in m/s. We deliberately
+    keep the arg name ``oracle_nav_action`` (not a new ``*_coord_action``) so the
+    habitat-baselines ``OracleNavPolicy`` / ``find_action_range`` still resolve it;
+    the policy's scalar write into that slot is overwritten by the task.
+
+    No door logic, no backward "avoid" mode, no ``_get_target_for_coord`` re-snap,
+    no pathfinder: ORCA handles avoidance and ``step_filter`` (inside
+    ``BaseVelAction`` / ``_update_controller_to_navmesh``) keeps us on the navmesh.
+    """
+
+    @property
+    def action_space(self):
+        return spaces.Dict(
+            {
+                self._action_arg_prefix
+                + "oracle_nav_action": spaces.Box(
+                    shape=(3,),
+                    low=np.finfo(np.float32).min,
+                    high=np.finfo(np.float32).max,
+                    dtype=np.float32,
+                )
+            }
+        )
+
+    def step(self, *args, **kwargs):
+        self.skill_done = False
+        targ = np.asarray(
+            kwargs[self._action_arg_prefix + "oracle_nav_action"], dtype=float
+        )
+        # Idle until the task injects a real 3-D waypoint (the policy may write a
+        # bare scalar entity index into this slot before the task overwrites it).
+        if targ.size < 3 or not np.any(targ):
+            return
+
+        base_T = self.cur_articulated_agent.base_transformation
+        robot_pos = np.array(self.cur_articulated_agent.base_pos)
+        robot_forward = np.array(
+            base_T.transform_vector(mn.Vector3(1.0, 0.0, 0.0))
+        )[[0, 2]]
+        rel_targ = (targ - robot_pos)[[0, 2]]
+        # 1 s lookahead => distance to the waypoint IS the desired speed (m/s).
+        dist = float(np.linalg.norm(rel_targ))
+        angle_to_target = get_angle(robot_forward, rel_targ)
+
+        if self.motion_type == "base_velocity":
+            if dist < self._config.dist_thresh:
+                vel = [0.0, 0.0]
+                self.skill_done = True
+            elif angle_to_target < self._config.turn_thresh:
+                # BaseVelAction does clip(lin,-1,1)*lin_speed, so commanding
+                # dist/lin_speed yields an effective forward speed of `dist`.
+                vel = [dist / self._lin_speed, 0.0]
+            else:
+                vel = OracleNavAction._compute_turn(
+                    rel_targ, self._config.turn_velocity, robot_forward
+                )
+            kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
+            return BaseVelAction.step(self, *args, **kwargs)
+
+        elif self.motion_type == "human_joints":
+            self.humanoid_controller.obj_transform_base = base_T
+            if dist < self._config.dist_thresh:
+                self.humanoid_controller.calculate_stop_pose()
+                self.skill_done = True
+            else:
+                # Match the ORCA speed; the controller turns gradually itself.
+                self.humanoid_controller.set_framerate_for_linspeed(
+                    max(dist, 1e-3),
+                    self._config.ang_speed,
+                    self._sim.ctrl_freq,
+                )
+                self.humanoid_controller.calculate_walk_pose(
+                    mn.Vector3([rel_targ[0], 0.0, rel_targ[1]])
+                )
+            self._update_controller_to_navmesh()
+            kwargs[
+                f"{self._action_arg_prefix}human_joints_trans"
+            ] = self.humanoid_controller.get_pose()
+            return HumanoidJointAction.step(self, *args, **kwargs)
+        else:
+            raise ValueError(
+                "Unrecognized motion type for oracle nav waypoint action"
+            )

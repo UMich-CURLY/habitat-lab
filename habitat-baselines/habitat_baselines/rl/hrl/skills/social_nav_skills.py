@@ -2,12 +2,22 @@
 Low-level skills for social navigation with Spot robot.
 
 Three discrete skills:
-  1. BackOffSkill:  Navigate toward goal via oracle nav to yield to the human;
-                    terminates when distance to human >= 3.0 m or HL requests.
-  2. WaitSkill:     Stay in place while rotating to face the robot goal;
-                    terminates only on HL request.
-  3. GoToGoalSkill: Navigate toward goal via oracle nav at full speed; terminates
-                    when dist < 0.5 m.
+  1. BackOffSkill:  Retrace the recent trajectory backward to yield to the human.
+  2. WaitSkill:     Stay in place while rotating to face the robot goal.
+  3. GoToGoalSkill: Navigate toward the robot goal with **self-contained RVO/ORCA
+                    collision avoidance**. The skill builds a small per-env ORCA
+                    simulation (robot + human, no static obstacles -- walls are
+                    handled downstream by the navmesh ``step_filter`` inside
+                    ``BaseVelNonCylinderAction``) from observation sensors and
+                    outputs ``base_velocity`` ([linear, angular]) directly.
+
+Notes on the multi-agent key convention: each agent's policy receives its own
+observation/action dict with the ``agent_{i}_`` prefix **stripped**
+(see ``rl/multi_agent/utils.update_dict_with_agent_prefix``). So inside agent_0's
+skill the keys are bare: ``base_velocity``, ``localization_sensor``,
+``other_agent_gps``, ``goal_world_delta``, ``humanoid_detector_sensor``. The
+``habitat.gym.obs_keys`` whitelist, however, lists the prefixed env-level names
+(``agent_0_localization_sensor`` etc.).
 """
 
 import logging
@@ -15,10 +25,11 @@ import math
 from typing import Any, List
 
 import numpy as np
-import gym.spaces as spaces
+import gym.spaces as spaces  # noqa: F401  (kept for parity with sibling skills)
 import torch
 import torch.nn as nn
 
+from habitat.tasks.utils import get_angle
 from habitat_baselines.rl.hrl.skills import SkillPolicy
 from habitat_baselines.rl.hrl.utils import find_action_range
 from habitat_baselines.rl.ppo.policy import PolicyActionData
@@ -33,9 +44,18 @@ def _to_tensor(x: Any) -> torch.Tensor:
     return x.float()
 
 
+def _to_np(x: Any):
+    """Convert an observation entry (tensor / ndarray / None) to a 2D ndarray."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
 class SocialNavSkillBase(nn.Module, SkillPolicy):
     """
-    Base for social nav skills that output oracle nav or velocity actions.
+    Base for social nav skills that output base-velocity actions.
     Bypasses SkillPolicy.__init__ to avoid PDDL requirements.
     """
 
@@ -58,9 +78,39 @@ class SocialNavSkillBase(nn.Module, SkillPolicy):
 
         self._full_ac_size = get_num_actions(action_space)
 
-        # Action order for agent_0: base_velocity(2) + oracle_nav_action(1) + rearrange_stop(1)
-        # oracle_nav_action is at index 2
-        self._oracle_nav_ac_idx = 2
+        # Locate the (stripped) base_velocity slot robustly instead of hardcoding
+        # an index. ``BaseVelNonCylinderAction`` with enable_lateral_move=False is
+        # 2-dim [longitudinal, angular]; the slot start is what we write into.
+        try:
+            self._base_vel_start, self._base_vel_end = find_action_range(
+                action_space, "base_velocity"
+            )
+        except (ValueError, KeyError):
+            self._base_vel_start, self._base_vel_end = 0, 2
+
+        # When True, should_terminate ignores all early-exit conditions
+        # (human-distance / goal / retrace-done) and switches purely on the step
+        # counter -- used by CyclingHighLevelPolicy's fixed N-step demo cycle.
+        sd = getattr(config, "skill_data", None) or {}
+        try:
+            self._cycle_demo = bool(sd.get("cycle_demo", False))
+        except AttributeError:
+            self._cycle_demo = bool(getattr(sd, "cycle_demo", False))
+
+    @property
+    def num_recurrent_layers(self) -> int:
+        return 0
+
+    def _timeout_terminate(self, masks, hl_wants_skill_term, actions):
+        """Fixed-cycle termination: hand back only after max_skill_steps."""
+        batch_size = masks.shape[0]
+        call_hl = hl_wants_skill_term.clone()
+        self._cur_skill_step += 1
+        if self._max_skill_steps > 0 and self._cur_skill_step >= self._max_skill_steps:
+            call_hl[:] = True
+            self._cur_skill_step = 0
+        bad = torch.zeros(batch_size, dtype=torch.bool)
+        return call_hl, bad, actions
 
     @property
     def required_obs_keys(self) -> List[str]:
@@ -82,72 +132,32 @@ class SocialNavSkillBase(nn.Module, SkillPolicy):
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
+        if self._cycle_demo:
+            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
 
         self._cur_skill_step += 1
 
-        # Rule-based skill switching: terminate if human is too close or approaching
+        # Rule-based skill switching: terminate if the human is too close. Uses
+        # the (stripped) `other_agent_gps` = (robot_xz - human_xz) world delta.
+        oag = _to_np(observations.get("other_agent_gps")) if isinstance(observations, dict) else None
         for i in range(batch_size):
-            if not call_hl[i]:  # Only check if HL hasn't already requested termination
-                dist_to_human = None
-                vel_towards_human = None
-
-                # Calculate distance to human
-                for key in ["human_relative_position", "human_pos_relative"]:
-                    if key in observations:
-                        hpos = observations[key]
-                        if isinstance(hpos, np.ndarray):
-                            hpos = torch.from_numpy(hpos).float()
-                        # Get distance from relative position [hpx, hpy]
-                        if hpos.shape[0] > i and hpos.shape[1] >= 2:
-                            dist = torch.sqrt(hpos[i, 0]**2 + hpos[i, 1]**2).item()
-                            dist_to_human = dist
-                        break
-
-                # Calculate closing speed
-                for key in ["human_relative_velocity", "human_vel_relative"]:
-                    if key in observations:
-                        hvel = observations[key]
-                        if isinstance(hvel, np.ndarray):
-                            hvel = torch.from_numpy(hvel).float()
-                        # Get velocity components [velx, vely]
-                        if hvel.shape[0] > i and hvel.shape[1] >= 2:
-                            velx = hvel[i, 0].item()
-                            vely = hvel[i, 1].item()
-                            # Get relative position to compute dot product
-                            for pos_key in ["human_relative_position", "human_pos_relative"]:
-                                if pos_key in observations:
-                                    hpos = observations[pos_key]
-                                    if isinstance(hpos, np.ndarray):
-                                        hpos = torch.from_numpy(hpos).float()
-                                    if hpos.shape[0] > i and hpos.shape[1] >= 2:
-                                        hpx = hpos[i, 0].item()
-                                        hpy = hpos[i, 1].item()
-                                        dist_sq = hpx**2 + hpy**2
-                                        if dist_sq > 0:
-                                            vel_towards_human = (velx * hpx + vely * hpy) / (dist_sq**0.5)
-                                    break
-                        break
-
-                # Apply rule-based switching
-                should_switch = False
-                if dist_to_human is not None and dist_to_human < 0.5:
-                    should_switch = True
-                elif vel_towards_human is not None and vel_towards_human > 0.5:
-                    should_switch = True
-
-                if should_switch:
+            if call_hl[i]:
+                continue
+            if oag is not None and oag.shape[0] > i:
+                dist_to_human = float(np.linalg.norm(oag[i][:2]))
+                if dist_to_human < 0.5:
                     call_hl[i] = True
-                    logger.info(f"[SocialNavSkillBase] Rule-based switch at step {self._cur_skill_step}: dist={dist_to_human:.2f}m, closing_speed={vel_towards_human:.2f}m/s")
+                    logger.info(
+                        f"[SocialNavSkillBase] Rule-based switch at step "
+                        f"{self._cur_skill_step}: dist={dist_to_human:.2f}m"
+                    )
 
-        # Fallback: also terminate after max steps if set
         if self._max_skill_steps > 0 and self._cur_skill_step >= self._max_skill_steps:
             call_hl[:] = True
-            logger.warning(f"[SocialNavSkillBase] Terminating after max steps {self._cur_skill_step}")
             self._cur_skill_step = 0
         elif call_hl.any():
-            # Reset step counter when switching
             self._cur_skill_step = 0
 
         bad_should_terminate = torch.zeros(batch_size, dtype=torch.bool)
@@ -158,112 +168,203 @@ class SocialNavSkillBase(nn.Module, SkillPolicy):
         """Create skill from config."""
         return cls(config, action_space, num_envs)
 
+    # ---- shared turn-then-go helpers (world (x,z) -> base_velocity) ----
+    @staticmethod
+    def _robot_forward(yaw: float) -> np.ndarray:
+        """World (x, z) forward direction of the robot from LocalizationSensor
+        yaw (heading = -atan2(fz, fx) => forward = (cos yaw, -sin yaw))."""
+        return np.array([math.cos(yaw), -math.sin(yaw)], dtype=np.float64)
+
+    @staticmethod
+    def _compute_turn(rel, turn_vel, robot_forward):
+        """Angular-only command to rotate toward `rel` (mirrors
+        OracleNavAction._compute_turn)."""
+        is_left = np.cross(robot_forward, rel) > 0
+        return [0.0, -turn_vel] if is_left else [0.0, turn_vel]
+
 
 class BackOffSkill(SocialNavSkillBase):
-    """
-    Back away from humans by retracing the trajectory backward.
-    Moves toward increasingly earlier waypoints in the collected trajectory,
-    one waypoint per timestep. Terminates when reaching trajectory start or HL requests.
+    """Yield to the human by retracing the robot's own recently-traversed path
+    backward. The path was already walked, so it is guaranteed navigable -> the
+    retreat is collision-free (no blind reversing into walls).
+
+    On entry it snapshots the `trajectory_buffer` sensor (a fixed (N, 2) ring
+    buffer of world (x, z) breadcrumbs, newest last, front-padded with the oldest
+    point) and walks back toward progressively earlier breadcrumbs via
+    turn-then-go. Hands control back to the HL switch policy once the human is far
+    again, the retrace is exhausted, or on timeout.
     """
 
     def __init__(self, config, action_space, batch_size, **kwargs):
         super().__init__(config, action_space, batch_size, **kwargs)
-        # Waypoint tracking: index into reversed trajectory
-        self._backoff_waypoint_idx = [0] * batch_size
-        self._skill_entered = [False] * batch_size  # Track if skill has been entered before
-        # Distance threshold to consider waypoint "reached"
-        self._waypoint_threshold = 0.03  # meters (much smaller since waypoints are ~0.06-0.1m apart)
-        # Backoff velocity magnitude
-        self._backoff_velocity = 0.5  # m/s
+        sd = getattr(config, "skill_data", None) or {}
+
+        def _p(key, default):
+            try:
+                return sd.get(key, default)
+            except AttributeError:
+                return getattr(sd, key, default)
+
+        # Resume go_to_goal once the human is farther than this (>= the HL's
+        # backoff_exit_dist).
+        self._human_clear_dist = float(_p("human_clear_dist", 1.2))
+        # Must match the agent_0_base_velocity longitudinal_lin_speed.
+        self._lin_speed = float(_p("lin_speed", 10.0))
+        # Reverse-retrace: keep facing forward and back STRAIGHT up the path
+        # toward a breadcrumb ~lookahead behind -- but only when that breadcrumb
+        # is roughly behind us (angle_back < align_thresh). When the path curves
+        # away (would need a sharp turn that risks wedging into a wall) just yield
+        # in place. Stop after retreating max_back_dist from the entry point.
+        self._lookahead = float(_p("lookahead", 0.4))
+        self._retreat_speed = float(_p("retreat_speed", 0.5))   # m/s (effective)
+        self._max_back_dist = float(_p("max_back_dist", 0.8))
+        self._align_thresh = float(_p("align_thresh", 0.5))     # rad (~29 deg)
+        self._arrive_thresh = float(_p("arrive_thresh", 0.15))
+        self._debug = bool(_p("backoff_debug", False))
+
+        # per-env retrace state (indexed by env id)
+        self._retrace_path = [None] * batch_size   # (M, 2) world breadcrumbs, oldest->newest
+        self._cursor = [-1] * batch_size           # breadcrumb index we steer toward
+        self._entry_xz = [None] * batch_size       # robot pos at entry (max-back reference)
+        self._done = [False] * batch_size          # retrace finished -> hand back
+
+    @property
+    def required_obs_keys(self) -> List[str]:
+        return ["trajectory_buffer", "localization_sensor", "other_agent_gps"]
+
+    @staticmethod
+    def _strip_padding(buf):
+        """Drop the leading run of front-padding (duplicate oldest) points.
+        Returns an (M, 2) array oldest->newest, or None if < 2 distinct points."""
+        if buf is None or len(buf) == 0:
+            return None
+        arr = np.asarray(buf, dtype=np.float64)
+        first = arr[0]
+        k = 0
+        while k < len(arr) - 1 and float(np.linalg.norm(arr[k + 1] - first)) < 1e-6:
+            k += 1
+        path = arr[k:]
+        return path if len(path) >= 2 else None
 
     def on_enter(self, skill_args, batch_indices, observations,
                  rnn_hidden_states, prev_actions, skill_name=None):
-        """Reset waypoint index when skill starts (only once)."""
-        for batch_idx in batch_indices:
-            if batch_idx < len(self._backoff_waypoint_idx):
-                # Only reset if this is the first time entering the skill
-                if not self._skill_entered[batch_idx]:
-                    self._backoff_waypoint_idx[batch_idx] = 1  # Start at 1 (one step back), not 0 (current position)
-                    self._skill_entered[batch_idx] = True
+        """Snapshot the trajectory buffer (path walked so far) for each entering env."""
+        traj = _to_np(observations.get("trajectory_buffer")) if isinstance(observations, dict) else None
+        if traj is not None:
+            # Sensor returns a flattened (num_envs, buffer_size*2); reshape to
+            # (num_envs, buffer_size, 2).
+            traj = traj.reshape(traj.shape[0], -1, 2)
+        for e in batch_indices:
+            path = None
+            if traj is not None and traj.shape[0] > e:
+                path = self._strip_padding(traj[e])
+            self._retrace_path[e] = path
+            if path is not None:
+                self._cursor[e] = len(path) - 1     # start at the entry breadcrumb
+                self._entry_xz[e] = np.array(path[-1], dtype=np.float64)
+            else:
+                self._cursor[e] = -1
+                self._entry_xz[e] = None
+            self._done[e] = False
         return rnn_hidden_states, prev_actions
 
     def _internal_act(self, observations, rnn_hidden_states, prev_actions, masks,
             cur_batch_idx=None, deterministic=False):
         batch_size = masks.shape[0]
-        action = torch.zeros(batch_size, self._full_ac_size)
+        action = torch.zeros(batch_size, self._full_ac_size, device=masks.device)
+        if cur_batch_idx is None:
+            cur_batch_idx = list(range(batch_size))
+        lin_i = self._base_vel_start
+        ang_i = self._base_vel_start + 1
 
-        # Get trajectory buffer from observations
-        trajectory = observations.get("trajectory_buffer", []) if isinstance(observations, dict) else []
+        loc_all = _to_np(observations.get("localization_sensor")) if isinstance(observations, dict) else None
 
-        # Get num_steps for logging
-        num_steps = 0
-        if isinstance(observations, dict) and "num_steps" in observations:
-            num_steps_obs = observations["num_steps"]
-            if isinstance(num_steps_obs, torch.Tensor):
-                num_steps = int(num_steps_obs[0].item()) if num_steps_obs.dim() > 0 else int(num_steps_obs.item())
+        for j in range(batch_size):
+            e = cur_batch_idx[j]
+            if float(masks[j].reshape(-1)[0].item()) == 0.0:
+                self._retrace_path[e] = None
+                self._cursor[e] = -1
+                self._entry_xz[e] = None
+                self._done[e] = False
+
+            path = self._retrace_path[e]
+            if path is None or loc_all is None or self._done[e]:
+                continue  # no path / finished -> stop (yield)
+
+            loc = loc_all[j]
+            robot_xz = np.array([loc[0], loc[2]], dtype=np.float64)
+            yaw = float(loc[3])
+
+            # Stop once we have retreated far enough from the entry point.
+            if self._entry_xz[e] is not None and \
+                    float(np.linalg.norm(robot_xz - self._entry_xz[e])) >= self._max_back_dist:
+                self._done[e] = True
+                continue
+
+            # Pick a target breadcrumb ~lookahead behind us along the path
+            # (advance the cursor toward older breadcrumbs as we move back).
+            cur = self._cursor[e]
+            while cur > 0 and float(np.linalg.norm(robot_xz - path[cur])) < self._lookahead:
+                cur -= 1
+            self._cursor[e] = cur
+            target = path[cur]
+            rel = target - robot_xz
+            dist = float(np.linalg.norm(rel))
+            if cur == 0 and dist < self._arrive_thresh:
+                self._done[e] = True  # reached the oldest breadcrumb
+                continue
+
+            # Back STRAIGHT up the path only if the target breadcrumb is roughly
+            # behind us; otherwise yield (no wedge-turn into walls).
+            robot_back = -self._robot_forward(yaw)
+            angle_back = float(get_angle(robot_back, rel))
+            if angle_back < self._align_thresh:
+                lin, ang = -self._retreat_speed / self._lin_speed, 0.0
             else:
-                num_steps = int(num_steps_obs[0]) if hasattr(num_steps_obs, '__getitem__') else int(num_steps_obs)
+                lin, ang = 0.0, 0.0  # path curves away -> yield in place
 
+            action[j, lin_i] = lin
+            action[j, ang_i] = ang
 
-        # If we have trajectory, follow it backward; otherwise back up slowly
-        if trajectory and len(trajectory) > 1:
-            for i in range(batch_size):
-                waypoint_idx = self._backoff_waypoint_idx[i]
-
-                # Get target position from reversed trajectory
-                # waypoint_idx=1 is one step back, waypoint_idx=2 is two steps back, etc.
-                # trajectory[-1] is current position, trajectory[-2] is one step back
-                if waypoint_idx < len(trajectory):
-                    target_idx = len(trajectory) - 1 - waypoint_idx  # waypoint_idx=1 → target_idx=len-1-1
-                    if target_idx >= 0 and target_idx < len(trajectory):
-                        target_pos = np.array(trajectory[target_idx][:2])
-                        # Estimate current position as last trajectory position
-                        curr_pos = np.array(trajectory[-1][:2]) if trajectory else np.array([0.0, 0.0])
-
-                        # Compute direction to target
-                        diff = target_pos - curr_pos
-                        dist = np.linalg.norm(diff)
-
-                        if dist > self._waypoint_threshold:
-                            # Move toward waypoint
-                            direction = diff / (dist + 1e-6)
-                            action[i, 0] = direction[0] * self._backoff_velocity
-                            action[i, 1] = direction[1] * self._backoff_velocity
-                        else:
-                            # Reached waypoint, move to next one (further back)
-                            self._backoff_waypoint_idx[i] += 1
-                            action[i, 0] = 0.0
-                            action[i, 1] = 0.0
-                    else:
-                        # Past start of trajectory, stop
-                        action[i, 0] = 0.0
-                        action[i, 1] = 0.0
-                else:
-                    # Finished retracing all waypoints
-                    action[i, 0] = 0.0
-                    action[i, 1] = 0.0
-        else:
-            # No trajectory yet, back up slowly
-            for i in range(batch_size):
-                action[i, 0] = -self._backoff_velocity
-                action[i, 1] = 0.0
+            if self._debug and e == 0:
+                print(
+                    f"[BackOff] env0 robot_xz=({robot_xz[0]:.2f},{robot_xz[1]:.2f}) "
+                    f"target=({target[0]:.2f},{target[1]:.2f}) cur={cur} "
+                    f"back_from_entry={float(np.linalg.norm(robot_xz - self._entry_xz[e])):.2f} "
+                    f"angle_back={angle_back:.2f} lin={lin:.2f} ang={ang:.2f}",
+                    flush=True,
+                )
 
         return PolicyActionData(actions=action, rnn_hidden_states=rnn_hidden_states)
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
+        if self._cycle_demo:
+            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
+        self._cur_skill_step += 1
 
-        # Terminate on HL request or if skill exceeded max steps
-        if self._max_skill_steps > 0:
-            self._cur_skill_step += 1
-            if self._cur_skill_step >= self._max_skill_steps:
-                call_hl[:] = True
-                self._cur_skill_step = 0
-                # Reset waypoint tracking for next backoff
-                self._backoff_waypoint_idx = [0] * batch_size
+        batch_idx = kwargs.get("batch_idx", list(range(batch_size)))
+        oag = _to_np(observations.get("other_agent_gps")) if isinstance(observations, dict) else None
+        for i in range(batch_size):
+            if call_hl[i]:
+                continue
+            # Human cleared -> resume go_to_goal.
+            if oag is not None and oag.shape[0] > i:
+                if float(np.linalg.norm(oag[i][:2])) > self._human_clear_dist:
+                    call_hl[i] = True
+                    continue
+            # Retrace finished (retreated enough / reached oldest / no path) ->
+            # hand back so the HL re-decides.
+            e = batch_idx[i] if i < len(batch_idx) else i
+            if e < len(self._done) and (self._done[e] or self._retrace_path[e] is None):
+                call_hl[i] = True
 
+        if self._max_skill_steps > 0 and self._cur_skill_step >= self._max_skill_steps:
+            call_hl[:] = True
+        if call_hl.any():
+            self._cur_skill_step = 0
         bad_should_terminate = torch.zeros(batch_size, dtype=torch.bool)
         return call_hl, bad_should_terminate, actions
 
@@ -276,104 +377,267 @@ class WaitSkill(SocialNavSkillBase):
 
     @property
     def required_obs_keys(self) -> List[str]:
-        return ["agent_0_base_pos", "robot_goal_pos", "agent_0_orientation"]
+        return ["localization_sensor", "goal_world_delta"]
 
     def _internal_act(self, observations, rnn_hidden_states, prev_actions, masks,
             cur_batch_idx=None, deterministic=False):
         batch_size = masks.shape[0]
-        action = torch.zeros(batch_size, self._full_ac_size)
+        action = torch.zeros(batch_size, self._full_ac_size, device=masks.device)
 
-        # Get num_steps for logging
-        num_steps = 0
-        if isinstance(observations, dict) and "num_steps" in observations:
-            num_steps_obs = observations["num_steps"]
-            if isinstance(num_steps_obs, torch.Tensor):
-                num_steps = int(num_steps_obs[0].item()) if num_steps_obs.dim() > 0 else int(num_steps_obs.item())
-            else:
-                num_steps = int(num_steps_obs[0]) if hasattr(num_steps_obs, '__getitem__') else int(num_steps_obs)
-
-        print(f"[WaitSkill] EXECUTING at num_steps={num_steps}")
-
-        if ("agent_0_base_pos" in observations
-                and "robot_goal_pos" in observations
-                and "agent_0_orientation" in observations):
-            robot_pos = _to_tensor(observations["agent_0_base_pos"])   # [B, 3]
-            goal_pos  = _to_tensor(observations["robot_goal_pos"])     # [B, 2 or 3]
-            orient    = _to_tensor(observations["agent_0_orientation"]) # [B, ≥3]
-            robot_yaw = orient[:, 2]                                    # [B]
-
-            dx = goal_pos[:, 0] - robot_pos[:, 0]
-            dy = goal_pos[:, 1] - robot_pos[:, 1]
-            desired_yaw = torch.atan2(dy, dx)
-            yaw_err = desired_yaw - robot_yaw
-            # Wrap to [-π, π]
-            yaw_err = torch.atan2(torch.sin(yaw_err), torch.cos(yaw_err))
-            # Proportional angular control, clipped to [-1, 1]
-            ang_vel = torch.clamp(yaw_err / math.pi, -1.0, 1.0).cpu()
-            action[:, 1] = ang_vel  # action[:, 1] = angular velocity
+        loc = _to_np(observations.get("localization_sensor")) if isinstance(observations, dict) else None
+        goal_delta = _to_np(observations.get("goal_world_delta")) if isinstance(observations, dict) else None
+        if loc is not None and goal_delta is not None:
+            for j in range(batch_size):
+                yaw = float(loc[j][3])
+                robot_forward = np.array([math.cos(yaw), -math.sin(yaw)])
+                gd = np.asarray(goal_delta[j][:2], dtype=np.float64)
+                if np.linalg.norm(gd) < 1e-6:
+                    continue
+                angle = float(get_angle(robot_forward, gd))
+                is_left = np.cross(robot_forward, gd) > 0
+                ang_vel = -angle / math.pi if is_left else angle / math.pi
+                action[j, self._base_vel_start + 1] = float(np.clip(ang_vel, -1.0, 1.0))
 
         return PolicyActionData(actions=action, rnn_hidden_states=rnn_hidden_states)
 
 
 class GoToGoalSkill(SocialNavSkillBase):
     """
-    Navigate toward the robot's goal using oracle nav.
+    Navigate toward the robot's goal with self-contained RVO/ORCA collision
+    avoidance, outputting ``base_velocity`` ([linear, angular]) directly.
+
+    Per-env state: one keyed ``RVOManager`` (agents ``"robot"``, ``"human"``),
+    the last human position (for a finite-difference velocity estimate), and the
+    last robot ORCA velocity (warm start). The ORCA sim is rebuilt lazily on
+    episode reset / skill (re)entry.
     """
+
+    def __init__(self, config, action_space, batch_size, **kwargs):
+        super().__init__(config, action_space, batch_size, **kwargs)
+        # --- ORCA params (from the skill config's `skill_data` escape hatch;
+        # HrlDefinedSkillConfig is a closed schema, so custom keys live there) ---
+        sd = getattr(config, "skill_data", None) or {}
+
+        def _p(key, default):
+            try:
+                return sd.get(key, default)
+            except AttributeError:
+                return getattr(sd, key, default)
+
+        self._rvo_radius = float(_p("rvo_radius", 0.4))
+        self._rvo_human_radius = float(_p("rvo_human_radius", 0.4))
+        self._rvo_max_speed = float(_p("rvo_max_speed", 1.0))
+        self._rvo_neighbor_dist = float(_p("rvo_neighbor_dist", 2.0))
+        self._rvo_max_neighbors = int(_p("rvo_max_neighbors", 10))
+        self._rvo_time_horizon = float(_p("rvo_time_horizon", 2.0))
+        self._rvo_time_horizon_obst = float(_p("rvo_time_horizon_obst", 4.0))
+        self._rvo_goal_stop_radius = float(_p("rvo_goal_stop_radius", 0.3))
+        # Must match the env control step (ac_freq_ratio / ctrl_freq).
+        self._rvo_time_step = float(_p("rvo_time_step", 1.0 / 30.0))
+        # Must match the agent_0_base_velocity action's longitudinal_lin_speed so
+        # the post-clip effective forward speed equals the ORCA-solved speed.
+        self._rvo_lin_speed = float(_p("rvo_lin_speed", 10.0))
+        self._turn_thresh = float(_p("turn_thresh", 0.1))
+        self._turn_velocity = float(_p("turn_velocity", 1.0))
+        self._goal_done_radius = float(_p("goal_done_radius", 0.5))
+        # Hand control back to the HL switch policy once the human is closer than
+        # this (so it can switch to backoff). Keep >= the CyclingHighLevelPolicy
+        # backoff_enter_dist.
+        self._human_switch_dist = float(_p("human_switch_dist", 1.0))
+        # When enabled, print a concise per-step trace for env 0 (debug/tuning).
+        self._rvo_debug = bool(_p("rvo_debug", False))
+
+        # --- per-env state ---
+        self._rvo = [None] * batch_size
+        self._last_human_xz = [None] * batch_size
+        self._last_robot_vel = [(0.0, 0.0)] * batch_size
 
     @property
     def required_obs_keys(self) -> List[str]:
-        return []
+        return [
+            "localization_sensor",
+            "other_agent_gps",
+            "goal_world_delta",
+            "humanoid_detector_sensor",
+        ]
+
+    def on_enter(self, skill_args, batch_indices, observations,
+                 rnn_hidden_states, prev_actions, skill_name=None):
+        for e in batch_indices:
+            if e < len(self._rvo):
+                self._rvo[e] = None
+                self._last_human_xz[e] = None
+                self._last_robot_vel[e] = (0.0, 0.0)
+        return rnn_hidden_states, prev_actions
+
+    def _build_rvo(self, robot_xz, human_xz):
+        # Lazy import so importing this module does not hard-require rvo2.
+        from habitat.tasks.rearrange.social_nav.rvo_manager import RVOManager
+
+        mgr = RVOManager(
+            time_step=self._rvo_time_step,
+            neighbor_dist=self._rvo_neighbor_dist,
+            max_neighbors=self._rvo_max_neighbors,
+            time_horizon=self._rvo_time_horizon,
+            time_horizon_obst=self._rvo_time_horizon_obst,
+            radius=self._rvo_radius,
+            default_max_speed=self._rvo_max_speed,
+            static_obstacles=None,
+        )
+        mgr.add_agent(
+            "robot",
+            (float(robot_xz[0]), float(robot_xz[1])),
+            radius=self._rvo_radius,
+            max_speed=self._rvo_max_speed,
+        )
+        mgr.add_agent(
+            "human",
+            (float(human_xz[0]), float(human_xz[1])),
+            radius=self._rvo_human_radius,
+            max_speed=self._rvo_max_speed,
+        )
+        return mgr
+
+    @staticmethod
+    def _compute_turn(rel, turn_vel, robot_forward):
+        # Mirrors OracleNavAction._compute_turn.
+        is_left = np.cross(robot_forward, rel) > 0
+        return [0.0, -turn_vel] if is_left else [0.0, turn_vel]
 
     def _internal_act(self, observations, rnn_hidden_states, prev_actions, masks,
             cur_batch_idx=None, deterministic=False):
         batch_size = masks.shape[0]
-        action = torch.zeros(batch_size, self._full_ac_size)
+        action = torch.zeros(batch_size, self._full_ac_size, device=masks.device)
+        if cur_batch_idx is None:
+            cur_batch_idx = list(range(batch_size))
 
-        # Get num_steps for logging
-        num_steps = 0
-        if isinstance(observations, dict) and "num_steps" in observations:
-            num_steps_obs = observations["num_steps"]
-            if isinstance(num_steps_obs, torch.Tensor):
-                num_steps = int(num_steps_obs[0].item()) if num_steps_obs.dim() > 0 else int(num_steps_obs.item())
+        loc_all = _to_np(observations.get("localization_sensor")) if isinstance(observations, dict) else None
+        oag_all = _to_np(observations.get("other_agent_gps")) if isinstance(observations, dict) else None
+        goal_all = _to_np(observations.get("goal_world_delta")) if isinstance(observations, dict) else None
+
+        if loc_all is None or oag_all is None or goal_all is None:
+            logger.warning(
+                "[GoToGoalSkill][RVO] missing required sensors; keys=%s",
+                sorted(observations.keys()) if isinstance(observations, dict) else type(observations),
+            )
+            return PolicyActionData(actions=action, rnn_hidden_states=rnn_hidden_states)
+
+        dt = self._rvo_time_step
+        lin_i = self._base_vel_start
+        ang_i = self._base_vel_start + 1
+
+        for j in range(batch_size):
+            e = cur_batch_idx[j]
+
+            # Episode reset -> drop per-env ORCA state.
+            if float(masks[j].reshape(-1)[0].item()) == 0.0:
+                self._rvo[e] = None
+                self._last_human_xz[e] = None
+                self._last_robot_vel[e] = (0.0, 0.0)
+
+            loc = loc_all[j]
+            robot_xz = np.array([loc[0], loc[2]], dtype=np.float64)
+            yaw = float(loc[3])
+            # Derived from LocalizationSensor: heading = -atan2(fz, fx), so the
+            # world forward (x, z) of the robot is (cos yaw, -sin yaw).
+            robot_forward = np.array([math.cos(yaw), -math.sin(yaw)], dtype=np.float64)
+
+            # other_agent_gps = (robot_xz - human_xz) -> human_xz = robot_xz - oag
+            human_xz = robot_xz - np.asarray(oag_all[j][:2], dtype=np.float64)
+
+            # Human velocity via finite difference (zero on first step / reset).
+            if self._last_human_xz[e] is not None:
+                human_vel = (human_xz - self._last_human_xz[e]) / dt
+                sp = float(np.linalg.norm(human_vel))
+                if sp > self._rvo_max_speed and sp > 1e-6:
+                    human_vel = human_vel * (self._rvo_max_speed / sp)
             else:
-                num_steps = int(num_steps_obs[0]) if hasattr(num_steps_obs, '__getitem__') else int(num_steps_obs)
+                human_vel = np.zeros(2, dtype=np.float64)
+            self._last_human_xz[e] = human_xz
 
-        if num_steps == 1 and isinstance(observations, dict):
-            print(f"[GoToGoalSkill] obs_keys={sorted(observations.keys())}")
+            if self._rvo[e] is None:
+                self._rvo[e] = self._build_rvo(robot_xz, human_xz)
+            mgr = self._rvo[e]
 
+            mgr.sync_agent_pose(
+                "robot", (float(robot_xz[0]), float(robot_xz[1])), self._last_robot_vel[e]
+            )
+            mgr.sync_agent_pose(
+                "human", (float(human_xz[0]), float(human_xz[1])),
+                (float(human_vel[0]), float(human_vel[1])),
+            )
 
-        print(f"[GoToGoalSkill] EXECUTING at num_steps={num_steps}")
+            # Preferred velocity toward the goal (world-frame delta from sensor).
+            goal_delta = np.asarray(goal_all[j][:2], dtype=np.float64)
+            rho = float(np.linalg.norm(goal_delta))
+            if rho >= self._rvo_goal_stop_radius and rho > 1e-6:
+                pref = goal_delta * (self._rvo_max_speed / rho)
+            else:
+                pref = np.zeros(2, dtype=np.float64)
+            mgr.set_pref_velocity("robot", (float(pref[0]), float(pref[1])))
+            mgr.set_pref_velocity("human", (float(human_vel[0]), float(human_vel[1])))
 
-        # Navigate using oracle_nav_action to TARGET_robot_0_goal (alphabetical idx 0 → 1-indexed 1.0)
-        action[:, self._oracle_nav_ac_idx] = 1.0
+            mgr.step()
+            orca_vel = np.asarray(mgr.get_agent_velocity("robot"), dtype=np.float64)
+            self._last_robot_vel[e] = (float(orca_vel[0]), float(orca_vel[1]))
 
-        if isinstance(observations, dict):
-            for key in observations:
-                if "goal" in key.lower() or "compass" in key.lower():
-                    rho = _to_tensor(observations[key]).view(-1)[0].item()
-                    finished = observations.get("has_finished_oracle_nav")
-                    print(f"[GoToGoalSkill] {key}[0]={rho:.3f}  has_finished_oracle_nav={finished}")
-                    break
+            # Convert world ORCA velocity -> [linear, angular] via turn-then-go.
+            dist = float(np.linalg.norm(orca_vel))
+            if dist < 1e-3 or rho < self._rvo_goal_stop_radius:
+                lin, ang = 0.0, 0.0
+            else:
+                angle_to_target = float(get_angle(robot_forward, orca_vel))
+                if angle_to_target < self._turn_thresh:
+                    # BaseVelAction clips lin to [-1,1] then *longitudinal_lin_speed,
+                    # so dist/lin_speed yields an effective forward speed of `dist`.
+                    lin, ang = dist / self._rvo_lin_speed, 0.0
+                else:
+                    vel = self._compute_turn(orca_vel, self._turn_velocity, robot_forward)
+                    lin, ang = vel[0], vel[1]
+
+            action[j, lin_i] = lin
+            action[j, ang_i] = ang
+
+            if self._rvo_debug and e == 0:
+                print(
+                    f"[GoToGoalSkill][RVO] env0 robot_xz=({robot_xz[0]:.2f},{robot_xz[1]:.2f}) "
+                    f"yaw={yaw:.2f} human_xz=({human_xz[0]:.2f},{human_xz[1]:.2f}) "
+                    f"goal_rho={rho:.2f} pref=({pref[0]:.2f},{pref[1]:.2f}) "
+                    f"orca_vel=({orca_vel[0]:.2f},{orca_vel[1]:.2f}) lin={lin:.2f} ang={ang:.2f}",
+                    flush=True,
+                )
 
         return PolicyActionData(actions=action, rnn_hidden_states=rnn_hidden_states)
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
+        if self._cycle_demo:
+            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
-
         self._cur_skill_step += 1
 
-        # Request termination if human is detected (will trigger HL policy to decide next skill)
-        for i in range(batch_size):
-            if not call_hl[i]:
-                if isinstance(observations, dict) and "humanoid_detector_sensor" in observations:
-                    detector = _to_tensor(observations["humanoid_detector_sensor"])
-                    if detector.shape[0] > i and detector[i, 0].item() > 0.5:
-                        # Human detected - request termination to trigger HL policy
-                        call_hl[i] = True
+        goal_all = _to_np(observations.get("goal_world_delta")) if isinstance(observations, dict) else None
+        detector = _to_np(observations.get("humanoid_detector_sensor")) if isinstance(observations, dict) else None
+        oag = _to_np(observations.get("other_agent_gps")) if isinstance(observations, dict) else None
 
-        # Also terminate on HL request or if max steps reached
+        for i in range(batch_size):
+            if call_hl[i]:
+                continue
+            # Goal reached.
+            if goal_all is not None and goal_all.shape[0] > i:
+                if float(np.linalg.norm(goal_all[i][:2])) < self._goal_done_radius:
+                    call_hl[i] = True
+                    continue
+            # Human got close -> hand back so the HL can switch to backoff.
+            if oag is not None and oag.shape[0] > i:
+                if float(np.linalg.norm(oag[i][:2])) < self._human_switch_dist:
+                    call_hl[i] = True
+                    continue
+            # Human detected by the panoptic sensor -> hand control back.
+            if detector is not None and detector.shape[0] > i and detector[i, 0] > 0.5:
+                call_hl[i] = True
+
         if self._max_skill_steps > 0 and self._cur_skill_step >= self._max_skill_steps:
             call_hl[:] = True
             self._cur_skill_step = 0

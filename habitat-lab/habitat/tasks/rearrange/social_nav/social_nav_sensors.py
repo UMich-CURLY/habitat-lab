@@ -797,3 +797,129 @@ class InitialGpsCompassSensor(UsesArticulatedAgentInterface, Sensor):
             init_rel_pos = np.array([rho, -phi], dtype=np.float32)
 
             return init_rel_pos
+
+
+@registry.register_sensor
+class NavGoalWorldDeltaSensor(UsesArticulatedAgentInterface, Sensor):
+    """World-frame (x, z) vector from the agent to its navigation goal.
+
+    Returns ``(nav_goal_pos - base_pos)[[0, 2]]`` in **world** coordinates,
+    unlike ``NavGoalPointGoalSensor`` which returns robot-local polar
+    ``[rho, -phi]``. The self-contained RVO ``GoToGoalSkill`` consumes this to
+    set its ORCA preferred velocity (direction = normalized delta) and to detect
+    goal arrival (distance = ``norm(delta)``) without having to invert the agent
+    base transform in the policy. Per-agent duplication (``agent_0_*`` /
+    ``agent_1_*``) is handled by ``RearrangeTask._duplicate_sensor_suite``.
+    """
+
+    cls_uuid: str = "goal_world_delta"
+
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args, **kwargs):
+        return NavGoalWorldDeltaSensor.cls_uuid
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        return spaces.Box(
+            shape=(2,),
+            low=np.finfo(np.float32).min,
+            high=np.finfo(np.float32).max,
+            dtype=np.float32,
+        )
+
+    def get_observation(self, task, *args, **kwargs):
+        agent_id = self.agent_id if self.agent_id is not None else 0
+        base_pos = np.array(
+            self._sim.get_agent_data(agent_id).articulated_agent.base_pos
+        )
+        info = getattr(task, "my_nav_to_info", None)
+        if info is None:
+            return np.zeros(2, dtype=np.float32)
+        if agent_id == 1 and info.human_info is not None:
+            goal = info.human_info.nav_goal_pos
+        elif info.robot_info is not None:
+            goal = info.robot_info.nav_goal_pos
+        else:
+            return np.zeros(2, dtype=np.float32)
+        goal = np.array(goal, dtype=np.float32)
+        return np.array(
+            [goal[0] - base_pos[0], goal[2] - base_pos[2]], dtype=np.float32
+        )
+
+
+@registry.register_sensor
+class RobotTrajectoryBufferSensor(UsesArticulatedAgentInterface, Sensor):
+    """Fixed-length ring buffer of the agent's recent world-frame (x, z) base
+    positions: newest last, front-padded with the oldest real point.
+
+    Consumed by ``BackOffSkill`` to retrace the robot's own traversed path
+    backward (a path it already walked is guaranteed navigable, so the retreat
+    is collision-free) when yielding to the human.
+
+    State is keyed by ``agent_id`` because ``RearrangeTask._duplicate_sensor_suite``
+    shallow-copies (``copy.copy``) this sensor for each agent -- the copies share
+    these dicts, but distinct ``agent_id`` keys keep the per-agent buffers
+    isolated. The buffer resets whenever the episode id changes.
+    """
+
+    cls_uuid: str = "trajectory_buffer"
+
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        self._buffer_size = int(getattr(config, "buffer_size", 100))
+        self._min_step_dist = float(getattr(config, "min_step_dist", 0.1))
+        self._bufs = {}     # agent_id -> list[np.ndarray(2,)]
+        self._prev_ep = {}  # agent_id -> episode_id
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args, **kwargs):
+        return RobotTrajectoryBufferSensor.cls_uuid
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        # Flattened to 1-D (buffer_size*2,) so the video renderer
+        # (observations_to_image) skips it -- it treats any >1-D obs as an image.
+        # BackOffSkill reshapes it back to (buffer_size, 2).
+        n = int(getattr(config, "buffer_size", 100))
+        return spaces.Box(
+            shape=(n * 2,),
+            low=np.finfo(np.float32).min,
+            high=np.finfo(np.float32).max,
+            dtype=np.float32,
+        )
+
+    def get_observation(self, observations, episode, *args, **kwargs):
+        agent_id = self.agent_id if self.agent_id is not None else 0
+        base_pos = np.asarray(
+            self._sim.get_agent_data(agent_id).articulated_agent.base_pos,
+            dtype=np.float32,
+        )
+        xz = np.array([base_pos[0], base_pos[2]], dtype=np.float32)
+
+        ep_id = getattr(episode, "episode_id", None) if episode is not None else None
+        if self._prev_ep.get(agent_id, "__unset__") != ep_id:
+            self._bufs[agent_id] = []
+            self._prev_ep[agent_id] = ep_id
+        buf = self._bufs.setdefault(agent_id, [])
+
+        # Append only when the agent has moved a meaningful step (keeps the
+        # breadcrumbs spaced ~min_step_dist apart).
+        if len(buf) == 0 or float(np.linalg.norm(xz - buf[-1])) >= self._min_step_dist:
+            buf.append(xz)
+            if len(buf) > self._buffer_size:
+                buf.pop(0)
+
+        out = np.zeros((self._buffer_size, 2), dtype=np.float32)
+        n = len(buf)
+        if n > 0:
+            arr = np.asarray(buf, dtype=np.float32)
+            out[self._buffer_size - n :] = arr
+            out[: self._buffer_size - n] = arr[0]  # front-pad with the oldest point
+        return out.reshape(-1)  # (buffer_size*2,)

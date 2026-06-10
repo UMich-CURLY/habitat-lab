@@ -21,10 +21,14 @@ from habitat_baselines.rl.hrl.skills.reset import ResetArmSkill
 from habitat_baselines.rl.hrl.skills.skill import SkillPolicy
 from habitat_baselines.rl.hrl.skills.wait import WaitSkillPolicy
 from habitat_baselines.rl.hrl.skills.back_off import BackOffSkillPolicy
-from habitat_baselines.rl.hrl.skills.social_nav_skills import (
+
+# Social-nav low-level skills. Imported after SkillPolicy above so the
+# `from habitat_baselines.rl.hrl.skills import SkillPolicy` inside this module
+# resolves against the partially-initialized package.
+from habitat_baselines.rl.hrl.skills.social_nav_skills import (  # noqa: E402
     BackOffSkill,
-    WaitSkill,
     GoToGoalSkill,
+    WaitSkill,
 )
 
 __all__ = [
@@ -43,7 +47,7 @@ __all__ = [
     "WaitSkillPolicy",
     "BackOffSkillPolicy",
     "NoopSkillPolicy",
-    "BackOffSkill",
-    "WaitSkill",
     "GoToGoalSkill",
+    "WaitSkill",
+    "BackOffSkill",
 ]

@@ -113,7 +113,13 @@ navmeshes/
 cluster/
 robo_frames/
 test_irl/
+habitat-web-data/
 habitat-web-data/datasets/
+datasets/runs/
+
+runs/
+video_dir/
+video_social_nav_skills_rvo/
 
 # Videos
 *.mp4
