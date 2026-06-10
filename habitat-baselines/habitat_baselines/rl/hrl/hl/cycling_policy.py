@@ -27,25 +27,22 @@ def _dist_to_human(observations, i):
 
 
 class CyclingHighLevelPolicy(HighLevelPolicy):
+    """Throwaway scaffolding HL policy with no learnable parameters, used only to
+    verify that the low-level skills execute. Two modes (``mode`` config):
+
+    - ``"fixed"`` (default): cycle through skills on a FIXED schedule
+      ``go_to_goal -> wait -> backoff -> ...``, each held for its own
+      ``max_skill_steps`` (run the skills with ``skill_data.cycle_demo: True`` so
+      they terminate purely on the step counter).
+    - ``"distance"``: pick ``backoff`` when the human is within
+      ``backoff_enter_dist``, resume ``go_to_goal`` once farther than
+      ``backoff_exit_dist`` (hysteresis). Sensible, reactive behaviour; nicer
+      demo videos. Run the skills with ``cycle_demo: False``.
+
+    For training, replace this with a learned HL (e.g. SocialNavNeuralHighLevelPolicy).
     """
-    Rule-based high-level switch policy for social navigation.
 
-    Selects between the low-level skills based on how close the human is to the
-    robot (read from the ``other_agent_gps`` observation), with hysteresis to
-    avoid flip-flopping at the boundary:
-
-      - ``go_to_goal`` by default (robot navigates to its goal with RVO).
-      - switch to ``backoff`` once the human is closer than ``backoff_enter_dist``.
-      - switch back to ``go_to_goal`` once the human is farther than
-        ``backoff_exit_dist``.
-
-    The two low-level skills hand control back to this policy at the matching
-    crossings (see GoToGoalSkill / BackOffSkill ``should_terminate``), so this
-    policy is consulted exactly when a switch may be needed.
-
-    Thresholds are read from the high_level_policy config (``backoff_enter_dist``,
-    ``backoff_exit_dist``); defaults 1.0 m / 1.6 m.
-    """
+    CYCLE_NAMES = ("go_to_goal", "wait", "backoff")
 
     def __init__(
         self,
@@ -66,17 +63,25 @@ class CyclingHighLevelPolicy(HighLevelPolicy):
             action_space,
             **kwargs,
         )
+        self._mode = str(getattr(config, "mode", "fixed"))
+        self._idx_to_name = {v: k for k, v in skill_name_to_idx.items()}
+
+        # fixed-cycle state
+        self._cycle = [
+            skill_name_to_idx[n] for n in self.CYCLE_NAMES if n in skill_name_to_idx
+        ]
+        if not self._cycle:
+            self._cycle = sorted(skill_name_to_idx.values())
+        self._cursor = [0] * num_envs
+
+        # distance-mode state
         self._enter_dist = float(getattr(config, "backoff_enter_dist", 1.0))
-        self._exit_dist = float(getattr(config, "backoff_exit_dist", 1.6))
-        # Per-env hysteresis state: are we currently backing off?
+        self._exit_dist = float(getattr(config, "backoff_exit_dist", 1.2))
         self._in_backoff = [False] * num_envs
-        # Resolve skill indices by name (fall back to the documented order
-        # backoff=0, wait=1, go_to_goal=2 if a name is missing).
         self._go_idx = skill_name_to_idx.get("go_to_goal", 2)
         self._backoff_idx = skill_name_to_idx.get("backoff", 0)
 
     def get_value(self, observations, rnn_hidden_states, prev_actions, masks):
-        """Return zero values for all envs (no learning signal)."""
         return torch.zeros(masks.shape[0], 1)
 
     def get_next_skill(
@@ -94,34 +99,33 @@ class CyclingHighLevelPolicy(HighLevelPolicy):
         skill_args_data = [None] * batch_size
         immediate_end = torch.zeros(batch_size, dtype=torch.bool)
 
-        for i in range(batch_size):
-            d = _dist_to_human(observations, i)
-            if self._in_backoff[i]:
-                # Stay backing off until the human is clearly far again.
-                if d is None or d > self._exit_dist:
-                    self._in_backoff[i] = False
-            else:
-                # Start backing off once the human gets close.
-                if d is not None and d < self._enter_dist:
-                    self._in_backoff[i] = True
+        for i, should_plan in enumerate(plan_masks):
+            if should_plan != 1.0:
+                continue
+            if self._mode == "distance":
+                d = _dist_to_human(observations, i)
+                if self._in_backoff[i]:
+                    if d is None or d > self._exit_dist:
+                        self._in_backoff[i] = False
+                else:
+                    if d is not None and d < self._enter_dist:
+                        self._in_backoff[i] = True
+                skill_idx = self._backoff_idx if self._in_backoff[i] else self._go_idx
+            else:  # fixed cycle
+                skill_idx = self._cycle[self._cursor[i] % len(self._cycle)]
+                self._cursor[i] += 1
 
-            skill_idx = self._backoff_idx if self._in_backoff[i] else self._go_idx
             next_skill[i] = float(skill_idx)
             skill_args_data[i] = []
-
-            d_str = "n/a" if d is None else f"{d:.2f}"
             print(
-                f"[CyclingPolicy] env{i} dist_to_human={d_str} -> "
-                f"skill={'backoff' if self._in_backoff[i] else 'go_to_goal'}"
-                f" (idx={skill_idx})",
+                f"[CyclingPolicy] env{i} ({self._mode}) -> skill="
+                f"{self._idx_to_name.get(skill_idx, skill_idx)} (idx={skill_idx})",
                 flush=True,
             )
-
         return next_skill, skill_args_data, immediate_end, PolicyActionData()
 
     @classmethod
     def from_config(cls, config, observation_space, action_space, num_envs, full_config, **kwargs):
-        """Create CyclingHighLevelPolicy from config."""
         return cls(
             config,
             kwargs.get("pddl_problem", None),
@@ -134,8 +138,11 @@ class CyclingHighLevelPolicy(HighLevelPolicy):
         )
 
     def apply_mask(self, mask):
-        """Reset hysteresis state on episode resets (mask == 0)."""
+        """Reset per-env state on episode resets (mask == 0)."""
         m = mask.cpu().view(-1)
-        for i in range(min(len(self._in_backoff), m.shape[0])):
+        for i in range(min(self._num_envs, m.shape[0])):
             if float(m[i]) == 0.0:
-                self._in_backoff[i] = False
+                if i < len(self._cursor):
+                    self._cursor[i] = 0
+                if i < len(self._in_backoff):
+                    self._in_backoff[i] = False

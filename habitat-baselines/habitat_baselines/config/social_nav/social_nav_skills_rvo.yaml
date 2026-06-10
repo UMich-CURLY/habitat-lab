@@ -106,23 +106,22 @@ habitat_baselines:
         name: "HierarchicalPolicy"
         hierarchical_policy:
           high_level_policy:
+            # FIXED-cycle scaffolding HL: go_to_goal -> wait -> backoff -> ...,
+            # each held for its skill's max_skill_steps. The skills run with
+            # skill_data.cycle_demo: True so they terminate purely on the step
+            # counter (ignore human-distance / goal early-exits). This is only a
+            # throwaway demo to verify each low-level skill executes; replace with
+            # a learned HL (SocialNavNeuralHighLevelPolicy) for training.
             name: "CyclingHighLevelPolicy"
-            # Rule-based switch policy: backoff when the human gets within
-            # backoff_enter_dist, resume go_to_goal once farther than
-            # backoff_exit_dist. Narrow band so the robot yields only in very
-            # close encounters and quickly resumes (RVO in go_to_goal already
-            # avoids the human, so the yield is just a brief social pause).
-            backoff_enter_dist: 1.0
-            backoff_exit_dist: 1.2
           defined_skills:
             backoff:
               skill_name: "BackOffSkill"
               pddl_action_names: null
-              max_skill_steps: 60          # safety cap; human-clear / retrace-done usually fire first
+              max_skill_steps: 40          # fixed cycle: ~40 steps per phase
               skill_data:
+                cycle_demo: True           # terminate purely on the step counter
                 # Reverse-retrace the robot's own path backward (collision-free):
                 # keep facing forward, back straight up along the breadcrumb trail.
-                # Resume go_to_goal once the human is farther than human_clear_dist.
                 human_clear_dist: 1.2
                 lookahead: 0.4            # target a breadcrumb ~0.4 m behind
                 retreat_speed: 0.5        # m/s reverse speed
@@ -134,16 +133,19 @@ habitat_baselines:
             wait:
               skill_name: "WaitSkill"
               pddl_action_names: null
-              max_skill_steps: 100
+              max_skill_steps: 40
+              skill_data:
+                cycle_demo: True
             go_to_goal:
               skill_name: "GoToGoalSkill"
               pddl_action_names: null
-              max_skill_steps: 100
+              max_skill_steps: 40
               # Custom RVO/ORCA params live under skill_data (HrlDefinedSkillConfig
               # is a closed schema). rvo_time_step must match ac_freq_ratio/ctrl_freq
               # (4/120 = 0.0333) and rvo_lin_speed must match the agent_0_base_velocity
               # longitudinal_lin_speed (default 10.0).
               skill_data:
+                cycle_demo: True           # fixed-cycle demo: terminate on step counter
                 rvo_radius: 0.4
                 rvo_human_radius: 0.4
                 rvo_max_speed: 1.0

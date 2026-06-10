@@ -88,9 +88,29 @@ class SocialNavSkillBase(nn.Module, SkillPolicy):
         except (ValueError, KeyError):
             self._base_vel_start, self._base_vel_end = 0, 2
 
+        # When True, should_terminate ignores all early-exit conditions
+        # (human-distance / goal / retrace-done) and switches purely on the step
+        # counter -- used by CyclingHighLevelPolicy's fixed N-step demo cycle.
+        sd = getattr(config, "skill_data", None) or {}
+        try:
+            self._cycle_demo = bool(sd.get("cycle_demo", False))
+        except AttributeError:
+            self._cycle_demo = bool(getattr(sd, "cycle_demo", False))
+
     @property
     def num_recurrent_layers(self) -> int:
         return 0
+
+    def _timeout_terminate(self, masks, hl_wants_skill_term, actions):
+        """Fixed-cycle termination: hand back only after max_skill_steps."""
+        batch_size = masks.shape[0]
+        call_hl = hl_wants_skill_term.clone()
+        self._cur_skill_step += 1
+        if self._max_skill_steps > 0 and self._cur_skill_step >= self._max_skill_steps:
+            call_hl[:] = True
+            self._cur_skill_step = 0
+        bad = torch.zeros(batch_size, dtype=torch.bool)
+        return call_hl, bad, actions
 
     @property
     def required_obs_keys(self) -> List[str]:
@@ -112,6 +132,8 @@ class SocialNavSkillBase(nn.Module, SkillPolicy):
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
+        if self._cycle_demo:
+            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
 
@@ -317,6 +339,8 @@ class BackOffSkill(SocialNavSkillBase):
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
+        if self._cycle_demo:
+            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
         self._cur_skill_step += 1
@@ -587,6 +611,8 @@ class GoToGoalSkill(SocialNavSkillBase):
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
+        if self._cycle_demo:
+            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
         self._cur_skill_step += 1
