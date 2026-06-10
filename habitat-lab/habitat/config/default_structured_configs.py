@@ -686,6 +686,28 @@ class OtherAgentGpsConfig(LabSensorConfig):
 
 
 @dataclass
+class NavGoalWorldDeltaSensorConfig(LabSensorConfig):
+    r"""
+    World-frame (x, z) vector from the agent to its navigation goal. Consumed by
+    the self-contained RVO ``GoToGoalSkill`` for the ORCA preferred velocity and
+    goal-arrival check.
+    """
+    type: str = "NavGoalWorldDeltaSensor"
+
+
+@dataclass
+class RobotTrajectoryBufferSensorConfig(LabSensorConfig):
+    r"""
+    Fixed-length ring buffer of the agent's recent world-frame (x, z) base
+    positions. Consumed by ``BackOffSkill`` to retrace its own path backward
+    (collision-free retreat) when yielding to the human.
+    """
+    type: str = "RobotTrajectoryBufferSensor"
+    buffer_size: int = 100
+    min_step_dist: float = 0.1
+
+
+@dataclass
 class TargetStartGpsCompassSensorConfig(LabSensorConfig):
     r"""
     Rearrangement only. Returns the initial position of every object that needs to be rearranged in composite tasks, in 2D polar coordinates.
@@ -2399,6 +2421,18 @@ cs.store(
     group="habitat/task/lab_sensors",
     name="other_agent_gps",
     node=OtherAgentGpsConfig,
+)
+cs.store(
+    package="habitat.task.lab_sensors.goal_world_delta",
+    group="habitat/task/lab_sensors",
+    name="goal_world_delta",
+    node=NavGoalWorldDeltaSensorConfig,
+)
+cs.store(
+    package="habitat.task.lab_sensors.trajectory_buffer",
+    group="habitat/task/lab_sensors",
+    name="trajectory_buffer",
+    node=RobotTrajectoryBufferSensorConfig,
 )
 cs.store(
     package="habitat.task.lab_sensors.target_goal_gps_compass_sensor",

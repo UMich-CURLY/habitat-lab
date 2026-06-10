@@ -43,6 +43,8 @@ defaults:
     - relative_resting_pos_sensor
     - localization_sensor
     - other_agent_gps
+    - goal_world_delta
+    - trajectory_buffer
     - humanoid_detector_sensor
     - has_finished_oracle_nav
   - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_0_goal_to_agent_gps_compass: nav_goal_sensor
@@ -73,10 +75,13 @@ habitat:
     # Use the new minimal TwoAgentSocialNavTask that doesn't bind PDDL/problems
     type: TwoAgentSocialNavTask-v0
     min_start_distance: 0.0
-    # ORCA: both agents; no static polys; walls via step_filter; agent_1 capped at 0.1 m/s
+    # ORCA: the TASK drives only the human (agent_1); the robot (agent_0) runs its
+    # own self-contained RVO inside GoToGoalSkill and outputs base_velocity. The
+    # robot stays registered in the task ORCA sim as a neighbour the human avoids.
+    # No static polys; walls via step_filter.
     rvo_use_orca_nav: True
     rvo_static_map_enabled: False
-    rvo_controlled_agents: [0, 1]
+    rvo_controlled_agents: [1]
     rvo_map_resolution: 512
     reward_measure: social_nav_reward
     success_measure: social_nav_to_pos_success
@@ -138,10 +143,16 @@ habitat:
     robot_at_thresh: 3.0
 
   gym:
-    # Remove object-related keys so the policy only receives social-nav observations
+    # Remove object-related keys so the policy only receives social-nav observations.
+    # The agent_0_* sensors feed the self-contained RVO GoToGoalSkill (the
+    # agent_0_ prefix is stripped before reaching agent_0's policy).
     obs_keys:
       - agent_0_spot_head_stereo_depth_sensor
       - agent_0_humanoid_detector_sensor
+      - agent_0_localization_sensor
+      - agent_0_other_agent_gps
+      - agent_0_goal_world_delta
+      - agent_0_trajectory_buffer
       - agent_0_has_finished_oracle_nav
       - agent_1_has_finished_oracle_nav
 

@@ -117,3 +117,5 @@ habitat-web-data/
 datasets/runs/
 
 runs/
+video_dir/
+video_social_nav_skills_rvo/

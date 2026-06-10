@@ -1,0 +1,41 @@
+# Two-agent social-nav PDDL problem for the RVO-skills config.
+#
+# Same objects / goals as ``multi_agent_social_nav_twoagent_minimal`` but with a
+# ``solution`` that only references actions the human's FixedHighLevelPolicy can
+# map (``nav_to_goal_social`` -> agent_1's OracleNavPolicy skill). The robot
+# (agent_0) uses CyclingHighLevelPolicy, which ignores this solution; the human
+# (agent_1) is RVO-driven by the task each step regardless of which skill is
+# active, so this solution only needs to be crash-free for the human's
+# FixedHighLevelPolicy (the shared *_minimal solution contains ``back_off`` which
+# agent_1 has no skill for).
+
+objects:
+  - name: robot_0
+    expr_type: robot_entity_type
+  - name: robot_1
+    expr_type: robot_entity_type
+  - name: TARGET_robot_0_goal
+    expr_type: goal_entity_type
+  - name: TARGET_robot_1_goal
+    expr_type: goal_entity_type
+
+goal:
+  expr_type: AND
+  sub_exprs:
+    - robot_at(TARGET_robot_0_goal, robot_0)
+    - robot_at(TARGET_robot_1_goal, robot_1)
+
+stage_goals:
+  stage_1:
+    expr_type: AND
+    sub_exprs:
+      - robot_at(TARGET_robot_0_goal, robot_0)
+  stage_2:
+    expr_type: AND
+    sub_exprs:
+      - robot_at(TARGET_robot_1_goal, robot_1)
+
+# Human-only plan: navigate robot_1 (the human) to its goal. A wait(30) is
+# auto-appended by FixedHighLevelPolicy.
+solution:
+  - nav_to_goal_social(TARGET_robot_1_goal, robot_1)
