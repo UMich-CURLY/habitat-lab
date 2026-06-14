@@ -289,8 +289,11 @@ class HierarchicalPolicy(Policy):
                         waypoint = np.array([agent_x, agent_y])
                         self._trajectory_buffer[batch_idx].append(waypoint.copy())
 
-            # Add trajectory buffer to observations for BackOffSkill
-            batched_observations[batch_idx]["trajectory_buffer"] = self._trajectory_buffer[batch_idx].copy()
+            # NOTE: do NOT override observations["trajectory_buffer"] here. The
+            # compass-derived buffer above is in a GOAL-relative frame, but
+            # BackOffSkill retraces against the WORLD-frame robot_xz, so injecting
+            # it broke backoff. Leave the real RobotTrajectoryBufferSensor
+            # (agent_0_trajectory_buffer, world frame) in place for BackOffSkill.
 
         # Add num_steps to observations for skill cycling
         for batch_idx in range(actual_batch_size):

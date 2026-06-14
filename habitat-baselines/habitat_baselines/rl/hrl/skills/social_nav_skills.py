@@ -88,29 +88,9 @@ class SocialNavSkillBase(nn.Module, SkillPolicy):
         except (ValueError, KeyError):
             self._base_vel_start, self._base_vel_end = 0, 2
 
-        # When True, should_terminate ignores all early-exit conditions
-        # (human-distance / goal / retrace-done) and switches purely on the step
-        # counter -- used by CyclingHighLevelPolicy's fixed N-step demo cycle.
-        sd = getattr(config, "skill_data", None) or {}
-        try:
-            self._cycle_demo = bool(sd.get("cycle_demo", False))
-        except AttributeError:
-            self._cycle_demo = bool(getattr(sd, "cycle_demo", False))
-
     @property
     def num_recurrent_layers(self) -> int:
         return 0
-
-    def _timeout_terminate(self, masks, hl_wants_skill_term, actions):
-        """Fixed-cycle termination: hand back only after max_skill_steps."""
-        batch_size = masks.shape[0]
-        call_hl = hl_wants_skill_term.clone()
-        self._cur_skill_step += 1
-        if self._max_skill_steps > 0 and self._cur_skill_step >= self._max_skill_steps:
-            call_hl[:] = True
-            self._cur_skill_step = 0
-        bad = torch.zeros(batch_size, dtype=torch.bool)
-        return call_hl, bad, actions
 
     @property
     def required_obs_keys(self) -> List[str]:
@@ -132,8 +112,6 @@ class SocialNavSkillBase(nn.Module, SkillPolicy):
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
-        if self._cycle_demo:
-            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
 
@@ -190,9 +168,10 @@ class BackOffSkill(SocialNavSkillBase):
 
     On entry it snapshots the `trajectory_buffer` sensor (a fixed (N, 2) ring
     buffer of world (x, z) breadcrumbs, newest last, front-padded with the oldest
-    point) and walks back toward progressively earlier breadcrumbs via
-    turn-then-go. Hands control back to the HL switch policy once the human is far
-    again, the retrace is exhausted, or on timeout.
+    point) and reverses STRAIGHT back up it (heading unchanged, keep facing the
+    human), walking the breadcrumbs newest -> oldest. Hands control back to the HL
+    switch policy once the human is far again, the retrace is exhausted, or on
+    timeout.
     """
 
     def __init__(self, config, action_space, batch_size, **kwargs):
@@ -210,22 +189,17 @@ class BackOffSkill(SocialNavSkillBase):
         self._human_clear_dist = float(_p("human_clear_dist", 1.2))
         # Must match the agent_0_base_velocity longitudinal_lin_speed.
         self._lin_speed = float(_p("lin_speed", 10.0))
-        # Reverse-retrace: keep facing forward and back STRAIGHT up the path
-        # toward a breadcrumb ~lookahead behind -- but only when that breadcrumb
-        # is roughly behind us (angle_back < align_thresh). When the path curves
-        # away (would need a sharp turn that risks wedging into a wall) just yield
-        # in place. Stop after retreating max_back_dist from the entry point.
-        self._lookahead = float(_p("lookahead", 0.4))
+        # Reverse STRAIGHT back up the recorded path: keep facing forward (toward
+        # the human) and drive backward at retreat_speed, walking the breadcrumbs
+        # newest -> oldest. The path was already walked, so it is navigable -- no
+        # angle gating / in-place yield / max-back cap needed.
         self._retreat_speed = float(_p("retreat_speed", 0.5))   # m/s (effective)
-        self._max_back_dist = float(_p("max_back_dist", 0.8))
-        self._align_thresh = float(_p("align_thresh", 0.5))     # rad (~29 deg)
         self._arrive_thresh = float(_p("arrive_thresh", 0.15))
         self._debug = bool(_p("backoff_debug", False))
 
         # per-env retrace state (indexed by env id)
         self._retrace_path = [None] * batch_size   # (M, 2) world breadcrumbs, oldest->newest
         self._cursor = [-1] * batch_size           # breadcrumb index we steer toward
-        self._entry_xz = [None] * batch_size       # robot pos at entry (max-back reference)
         self._done = [False] * batch_size          # retrace finished -> hand back
 
     @property
@@ -259,12 +233,8 @@ class BackOffSkill(SocialNavSkillBase):
             if traj is not None and traj.shape[0] > e:
                 path = self._strip_padding(traj[e])
             self._retrace_path[e] = path
-            if path is not None:
-                self._cursor[e] = len(path) - 1     # start at the entry breadcrumb
-                self._entry_xz[e] = np.array(path[-1], dtype=np.float64)
-            else:
-                self._cursor[e] = -1
-                self._entry_xz[e] = None
+            # start at the newest breadcrumb (the entry point) and walk to oldest
+            self._cursor[e] = len(path) - 1 if path is not None else -1
             self._done[e] = False
         return rnn_hidden_states, prev_actions
 
@@ -284,7 +254,6 @@ class BackOffSkill(SocialNavSkillBase):
             if float(masks[j].reshape(-1)[0].item()) == 0.0:
                 self._retrace_path[e] = None
                 self._cursor[e] = -1
-                self._entry_xz[e] = None
                 self._done[e] = False
 
             path = self._retrace_path[e]
@@ -293,45 +262,31 @@ class BackOffSkill(SocialNavSkillBase):
 
             loc = loc_all[j]
             robot_xz = np.array([loc[0], loc[2]], dtype=np.float64)
-            yaw = float(loc[3])
 
-            # Stop once we have retreated far enough from the entry point.
-            if self._entry_xz[e] is not None and \
-                    float(np.linalg.norm(robot_xz - self._entry_xz[e])) >= self._max_back_dist:
+            # Walk the recorded breadcrumbs newest -> oldest: advance the cursor
+            # toward older points as we pass them.
+            cur = self._cursor[e]
+            while cur > 0 and float(np.linalg.norm(robot_xz - path[cur])) < self._arrive_thresh:
+                cur -= 1
+            self._cursor[e] = cur
+
+            # Reached the oldest breadcrumb -> retrace finished.
+            if cur == 0 and float(np.linalg.norm(robot_xz - path[0])) < self._arrive_thresh:
                 self._done[e] = True
                 continue
 
-            # Pick a target breadcrumb ~lookahead behind us along the path
-            # (advance the cursor toward older breadcrumbs as we move back).
-            cur = self._cursor[e]
-            while cur > 0 and float(np.linalg.norm(robot_xz - path[cur])) < self._lookahead:
-                cur -= 1
-            self._cursor[e] = cur
-            target = path[cur]
-            rel = target - robot_xz
-            dist = float(np.linalg.norm(rel))
-            if cur == 0 and dist < self._arrive_thresh:
-                self._done[e] = True  # reached the oldest breadcrumb
-                continue
-
-            # Back STRAIGHT up the path only if the target breadcrumb is roughly
-            # behind us; otherwise yield (no wedge-turn into walls).
-            robot_back = -self._robot_forward(yaw)
-            angle_back = float(get_angle(robot_back, rel))
-            if angle_back < self._align_thresh:
-                lin, ang = -self._retreat_speed / self._lin_speed, 0.0
-            else:
-                lin, ang = 0.0, 0.0  # path curves away -> yield in place
-
+            # Reverse STRAIGHT up the already-walked (navigable) path, heading
+            # unchanged (keep facing the human): no turning, no in-place yield.
+            lin, ang = -self._retreat_speed / self._lin_speed, 0.0
             action[j, lin_i] = lin
             action[j, ang_i] = ang
 
             if self._debug and e == 0:
+                target = path[cur]
                 print(
                     f"[BackOff] env0 robot_xz=({robot_xz[0]:.2f},{robot_xz[1]:.2f}) "
                     f"target=({target[0]:.2f},{target[1]:.2f}) cur={cur} "
-                    f"back_from_entry={float(np.linalg.norm(robot_xz - self._entry_xz[e])):.2f} "
-                    f"angle_back={angle_back:.2f} lin={lin:.2f} ang={ang:.2f}",
+                    f"lin={lin:.2f} ang={ang:.2f}",
                     flush=True,
                 )
 
@@ -339,8 +294,6 @@ class BackOffSkill(SocialNavSkillBase):
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
-        if self._cycle_demo:
-            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
         self._cur_skill_step += 1
@@ -611,8 +564,6 @@ class GoToGoalSkill(SocialNavSkillBase):
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
                          masks, hl_wants_skill_term, actions, **kwargs):
-        if self._cycle_demo:
-            return self._timeout_terminate(masks, hl_wants_skill_term, actions)
         batch_size = masks.shape[0]
         call_hl = hl_wants_skill_term.clone()
         self._cur_skill_step += 1

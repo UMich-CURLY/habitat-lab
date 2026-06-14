@@ -368,10 +368,26 @@ class HabitatEvaluator(Evaluator):
                             current_episodes_info[i].episode_id,
                         )
                     
-                    # Check if this episode has been evaluated enough times NOW (after incrementing count)
-                    if ep_eval_count[k] == evals_per_ep:
+                    # The env has auto-reset to its NEXT dataset episode. Pause it
+                    # only when that next episode has already been evaluated
+                    # evals_per_ep times (dataset cycled); otherwise let a single
+                    # env sequentially cover many episodes instead of stopping
+                    # after the first. Use .get() so we don't insert phantom keys
+                    # into the defaultdict (len(ep_eval_count) gates the assertion).
+                    next_k = (
+                        next_episodes_info[i].scene_id,
+                        next_episodes_info[i].episode_id,
+                    )
+                    # Only pause once we already have enough episode-evals; the
+                    # episode iterator cycles, so otherwise a single env would be
+                    # paused the moment it revisits an episode (e.g. after one
+                    # scene's worth) and the run would stop short of the target.
+                    if (
+                        ep_eval_count.get(next_k, 0) >= evals_per_ep
+                        and len(stats_episodes) >= number_of_eval_episodes * evals_per_ep
+                    ):
                         envs_to_pause.append(i)
-                        logger.info(f"Marking environment {i} for pause (reached {evals_per_ep} evaluations)")
+                        logger.info(f"Marking environment {i} for pause (next episode already fully evaluated)")
                 else:
                     # Episode not done, check if the CURRENT episode (which is running) has already been fully evaluated
                     current_ep_key = (
@@ -381,6 +397,7 @@ class HabitatEvaluator(Evaluator):
                     if (
                         current_ep_key in ep_eval_count
                         and ep_eval_count[current_ep_key] >= evals_per_ep
+                        and len(stats_episodes) >= number_of_eval_episodes * evals_per_ep
                     ):
                         envs_to_pause.append(i)
                         logger.info(f"Marking environment {i} for pause (current episode already fully evaluated)")
@@ -415,9 +432,13 @@ class HabitatEvaluator(Evaluator):
                 agent.actor_critic.on_envs_pause(envs_to_pause)
 
         pbar.close()
+        # Count episode-EVALS (instances), not unique episodes: the iterator
+        # cycles, so with test_episode_count > #unique-available we intentionally
+        # re-run episodes to reach the requested count.
+        _target_evals = number_of_eval_episodes * evals_per_ep
         assert (
-            len(ep_eval_count) >= number_of_eval_episodes
-        ), f"Expected {number_of_eval_episodes} episodes, got {len(ep_eval_count)}."
+            len(stats_episodes) >= _target_evals
+        ), f"Expected {_target_evals} episode-evals, got {len(stats_episodes)}."
 
         aggregated_stats = {}
         all_ks = set()

@@ -81,6 +81,19 @@ habitat:
     rvo_static_map_enabled: False
     rvo_controlled_agents: [1]
     rvo_map_resolution: 512
+    # Human ORCA speed cap. Default (default_structured_configs) is 0.1 m/s, which
+    # equals agent_1_oracle_nav_action.dist_thresh (0.1) with a 1 s waypoint
+    # lookahead -> any ORCA slow-down drops the waypoint below dist_thresh and the
+    # human freezes (calculate_stop_pose), and even when moving 0.1 m/s is ~1/13
+    # of a normal walk. Lifted from 0.1 so the human walks toward its goal at a
+    # reasonable pace while still using RVO to avoid the robot. Tune as needed.
+    rvo_agent_1_max_speed: 0.8
+    # Inflate the robot's radius (vs the shared rvo_agent_radius=0.2) ONLY inside
+    # the human's task ORCA. ORCA splits avoidance 50/50, but the robot is driven
+    # by its own skill (often standing/spinning) and does not reciprocate, so the
+    # human under-avoids and clips it -> DidAgentsCollide ends the episode early.
+    # A bigger safety disc makes the human keep more clearance. Tune as needed.
+    rvo_agent_0_radius: 0.5
     reward_measure: social_nav_reward
     success_measure: social_nav_to_pos_success
     success_reward: 10.0
