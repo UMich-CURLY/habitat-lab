@@ -1,0 +1,27 @@
+# @package _global_
+
+# Test GoToGoalSkill on alternative scene
+defaults:
+  - social_nav_skill_test
+  - _self_
+
+habitat:
+  dataset:
+    data_path: /habitat-lab/data/social_nav_episode_7_15.json.gz
+  environment:
+    max_episode_steps: 500
+
+habitat_baselines:
+  rl:
+    policy:
+      agent_0:
+        hierarchical_policy:
+          high_level_policy:
+            backoff_switch_step: 10000
+      agent_1:
+        hierarchical_policy:
+          high_level_policy:
+            name: "FixedHighLevelPolicy"
+            allow_other_place: False
+            add_arm_rest: False
+          ignore_skills: ["nav_to_obj", "nav_to_goal", "nav_to_goal_social", "nav_to_randcoord"]

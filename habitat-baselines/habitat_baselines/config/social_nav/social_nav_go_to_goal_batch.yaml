@@ -1,0 +1,28 @@
+# @package _global_
+
+# Batch test GoToGoalSkill on multiple episodes
+defaults:
+  - social_nav_skill_test
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 500
+
+habitat_baselines:
+  num_environments: 1
+  eval:
+    evals_per_ep: 10  # Run each episode 10 times
+  rl:
+    policy:
+      agent_0:
+        hierarchical_policy:
+          high_level_policy:
+            backoff_switch_step: 10000
+      agent_1:
+        hierarchical_policy:
+          high_level_policy:
+            name: "FixedHighLevelPolicy"
+            allow_other_place: False
+            add_arm_rest: False
+          ignore_skills: ["nav_to_obj", "nav_to_goal", "nav_to_goal_social", "nav_to_randcoord"]
