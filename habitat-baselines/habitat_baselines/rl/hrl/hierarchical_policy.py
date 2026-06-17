@@ -4,6 +4,7 @@ from typing import Dict
 import gym.spaces as spaces
 import numpy as np
 import torch
+import torch.nn as nn
 
 from habitat.tasks.rearrange.multi_task.pddl_domain import PddlProblem
 from habitat_baselines.common.baseline_registry import baseline_registry
@@ -47,7 +48,7 @@ def _to_tensor(x):
 
 
 @baseline_registry.register_policy
-class HierarchicalPolicy(Policy):
+class HierarchicalPolicy(nn.Module, Policy):
     def __init__(
         self,
         config,
@@ -59,7 +60,8 @@ class HierarchicalPolicy(Policy):
         agent_name: str = None,
         pddl_problem = None,
     ):
-        super().__init__(action_space)
+        nn.Module.__init__(self)
+        Policy.__init__(self, action_space)
 
         self._action_space = action_space
         self._num_envs: int = num_envs
@@ -143,6 +145,13 @@ class HierarchicalPolicy(Policy):
             pddl_action_name_to_skill_name=pddl_action_name_to_skill_name,
         )
         
+        # Whether the high-level policy is learned. If so, `act()` stores the
+        # discrete skill choice (for PPO) plus value/log-prob, and executes the
+        # low-level commands via `take_actions`. Otherwise (e.g. the fixed
+        # CyclingHighLevelPolicy on the partner agent) we keep the legacy
+        # behavior of storing the continuous low-level action directly.
+        self._hl_is_learnable = self._high_level_policy.should_load_agent_state
+
         # Find STOP action index if action_space is Dict (manipulation tasks)
         # For navigation-only tasks (like social nav), action_space is Box, so skip this
         ### TRIBHI CHECK ACTION SPACE!!!! 
@@ -215,10 +224,17 @@ class HierarchicalPolicy(Policy):
 
     @property
     def should_load_agent_state(self):
-        return False
+        # Defer to the high-level policy: the learned social-nav policy returns
+        # True so its weights are saved/loaded in checkpoints.
+        return self._high_level_policy.should_load_agent_state
 
-    def parameters(self):
-        return self._skills[0].parameters()
+    @property
+    def policy_action_space(self):
+        # The rollout storage for this agent is sized from the high-level
+        # policy's action space (a discrete skill choice for the learned
+        # policy). The continuous low-level commands are executed via
+        # ``take_actions`` and are not stored.
+        return self._high_level_policy.policy_action_space
 
     def to(self, device):
         for skill in self._skills.values():
@@ -227,6 +243,35 @@ class HierarchicalPolicy(Policy):
         self._call_high_level = self._call_high_level.to(device)
         self._cur_skills = self._cur_skills.to(device)
         return self
+
+    def get_value(self, observations, rnn_hidden_states, prev_actions, masks):
+        """Bootstrap value from the high-level policy (used at rollout end)."""
+        return self._high_level_policy.get_value(
+            observations, rnn_hidden_states, prev_actions, masks
+        )
+
+    def evaluate_actions(
+        self,
+        observations,
+        rnn_hidden_states,
+        prev_actions,
+        masks,
+        action,
+        rnn_build_seq_info,
+    ):
+        """Re-evaluate stored high-level skill choices for the PPO update."""
+        return self._high_level_policy.evaluate_actions(
+            observations,
+            rnn_hidden_states,
+            prev_actions,
+            masks,
+            action,
+            rnn_build_seq_info,
+        )
+
+    def _get_policy_components(self):
+        """The torch modules to optimize / clip gradients over."""
+        return self._high_level_policy.get_policy_components()
 
     def act(
         self,
@@ -440,6 +485,13 @@ class HierarchicalPolicy(Policy):
         hl_terminate = torch.zeros(
             actual_batch_size, device=use_device, dtype=torch.bool
         )
+        # Which envs are (re)planning this step. This becomes the rollout
+        # `should_inserts` mask for the learned policy: a transition is only
+        # written when a new high-level skill is selected.
+        plan_masks = self._call_high_level.clone()
+        # Learning signal from the high-level policy (only populated when it is
+        # actually queried this step).
+        hl_action_data = None
         if self._call_high_level.sum() > 0:
             # Prepare observations for HL policy with num_steps included
             hl_observations = dict(observations)
@@ -449,7 +501,7 @@ class HierarchicalPolicy(Policy):
                 new_skills,
                 new_skill_args,
                 hl_terminate,
-                _,  # PolicyActionData from high-level policy
+                hl_action_data,  # PolicyActionData from high-level policy
             ) = self._high_level_policy.get_next_skill(
                 hl_observations,
                 rnn_hidden_states,
@@ -612,15 +664,66 @@ class HierarchicalPolicy(Policy):
                 'cur_skill_idx': float(skill_idx),  # Skill index as metric
             })
 
+        if not self._hl_is_learnable:
+            # Fixed partner policy (e.g. CyclingHighLevelPolicy): store the
+            # executed low-level action directly, no learning signal.
+            return PolicyActionData(
+                actions=actions,
+                rnn_hidden_states=return_hidden_states,
+                policy_info=policy_info,
+                values=None,
+                action_log_probs=None,
+                take_actions=None,
+                should_inserts=None,
+            )
+
+        # Learned high-level policy: the env executes the continuous low-level
+        # commands (`take_actions`), while the rollout stores the discrete skill
+        # choice plus its value/log-prob so PPO can update the HL policy. A
+        # transition is only written for envs that (re)planned this step
+        # (`should_inserts`), with reward accumulated in between.
+        should_inserts = plan_masks.view(-1, 1).cpu().numpy().astype(bool)
+
+        if hl_action_data is not None and hl_action_data.actions is not None:
+            # Stored as float (width-1 Box) so it concatenates with the partner
+            # agent's continuous action buffer; cast back to index in
+            # evaluate_actions.
+            hl_actions = hl_action_data.actions.view(actual_batch_size, 1).to(
+                device=use_device, dtype=torch.float32
+            )
+            hl_values = hl_action_data.values
+            hl_log_probs = hl_action_data.action_log_probs
+            # get_next_skill returns [num_layers, batch, hidden]; storage expects
+            # [batch, num_layers, hidden].
+            if (
+                hl_action_data.rnn_hidden_states is not None
+                and hl_action_data.rnn_hidden_states.dim() == 3
+            ):
+                hl_hidden = hl_action_data.rnn_hidden_states.transpose(0, 1).to(
+                    use_device
+                )
+            else:
+                hl_hidden = return_hidden_states
+        else:
+            # No env replanned this step: nothing is written to the rollout, so
+            # these placeholders are never read.
+            hl_actions = torch.zeros(
+                actual_batch_size, 1, device=use_device, dtype=torch.float32
+            )
+            hl_values = None
+            hl_log_probs = None
+            hl_hidden = return_hidden_states
+
         return PolicyActionData(
-            actions=actions,
-            rnn_hidden_states=return_hidden_states,
+            actions=hl_actions,
+            take_actions=actions,
+            rnn_hidden_states=hl_hidden,
             policy_info=policy_info,
-            values=None,
-            action_log_probs=None,
-            take_actions=None,
-            should_inserts=None,
+            values=hl_values,
+            action_log_probs=hl_log_probs,
+            should_inserts=should_inserts,
         )
+
     def parameters(self):
         # Return parameters from high-level policy which has neural layers
         return self._high_level_policy.parameters()

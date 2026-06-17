@@ -41,6 +41,8 @@ defaults:
     - relative_resting_pos_sensor
     - localization_sensor
     - other_agent_gps
+    - other_agent_heading
+    - social_nav_policy_state
     - goal_world_delta
     - trajectory_buffer
     - humanoid_detector_sensor
@@ -166,6 +168,8 @@ habitat:
       - agent_0_humanoid_detector_sensor
       - agent_0_localization_sensor
       - agent_0_other_agent_gps
+      - agent_0_other_agent_heading
+      - agent_0_social_nav_policy_state
       - agent_0_goal_world_delta
       - agent_0_trajectory_buffer
       - agent_0_has_finished_oracle_nav

@@ -62,7 +62,12 @@ class SocialNavReward(RearrangeReward):
         self._explore_reward = config.explore_reward
         self._use_geo_distance = config.use_geo_distance
         self._collide_penalty = config.collide_penalty
-        self.interm_goal_bonus = 1.0   #Change to get from config 
+        # Dense shaping coefficients (see update_metric):
+        #   goal_progress_reward: reward per metre of progress toward the goal
+        #   backoff_reward: reward per metre of backing away from a too-close human
+        self._goal_progress_reward = getattr(config, "goal_progress_reward", 1.0)
+        self._backoff_reward = getattr(config, "backoff_reward", 1.0)
+        self.interm_goal_bonus = 1.0   #Change to get from config
         # Record the previous distance to human
         self._prev_dist = -1.0
         self._prev_dist_to_goal = -1.0
@@ -169,11 +174,10 @@ class SocialNavReward(RearrangeReward):
             # Give the reward if the agent visits the new location
             social_nav_reward += self._explore_reward
 
-        if self._prev_dist < 0:
-            social_nav_reward = 0.0
+        # Distance from the robot to its own navigation goal (XZ plane).
+        goal = task.my_nav_to_info.robot_info.nav_goal_pos
+        dist_to_goal = np.linalg.norm(np.array(robot_pos)[[0, 2]] - goal[[0, 2]])
 
-        if self._prev_dist_to_goal < -1.0:
-            social_nav_reward = 0.0
         # Componet 5: Collision detection for two agents
         did_collide = task.measurements.measures[
             DidAgentsCollide._get_uuid()
@@ -183,15 +187,30 @@ class SocialNavReward(RearrangeReward):
             social_nav_reward -= self._collide_penalty
         #### CADRL style reward ####
         else:
-            if dis <self._safe_dis_min:
+            # Dense goal-progress reward: positive when the robot reduces the
+            # distance to its goal, negative when it moves away. This gives the
+            # high-level policy a gradient toward picking `go_to_goal` when it is
+            # safe to do so (otherwise the only goal signal is the sparse success
+            # bonus, which the policy never reaches).
+            if self._prev_dist_to_goal >= 0.0:
+                social_nav_reward += self._goal_progress_reward * (
+                    self._prev_dist_to_goal - dist_to_goal
+                )
+
+            # Social back-off shaping: when the human is inside the safety
+            # radius, penalize being too close AND reward actively increasing the
+            # robot-human distance (backing off). This rewards the desired
+            # behavior of backing off / yielding when the human gets close.
+            if dis < self._safe_dis_min:
                 social_nav_reward -= (self._safe_dis_min - dis)
+                if self._prev_dist >= 0.0:
+                    social_nav_reward += self._backoff_reward * (
+                        dis - self._prev_dist
+                    )
 
-        goal = task.my_nav_to_info.robot_info.nav_goal_pos
-
-        dist_to_goal = np.linalg.norm(np.array(robot_pos)[[0, 2]]- goal[[0, 2]])
-        # if dist_to_goal<  self._config.success_distance:
-        #     task.should_end = True
-        # social_nav_reward += self.interm_goal_bonus * (self._prev_dist_to_goal - dist_to_goal)
+        # No shaping on the first step (no valid previous distances yet).
+        if self._prev_dist < 0 or self._prev_dist_to_goal < 0.0:
+            social_nav_reward = 0.0
 
         self._metric += social_nav_reward
         # Update the distance
@@ -849,6 +868,144 @@ class NavGoalWorldDeltaSensor(UsesArticulatedAgentInterface, Sensor):
         goal = np.array(goal, dtype=np.float32)
         return np.array(
             [goal[0] - base_pos[0], goal[2] - base_pos[2]], dtype=np.float32
+        )
+
+
+@registry.register_sensor
+class SocialNavPolicyStateSensor(UsesArticulatedAgentInterface, Sensor):
+    """
+    Robot-frame state features for the social-nav high-level policy. Every
+    quantity is expressed in the robot's own local frame, so the observation is
+    invariant to the robot's absolute world pose. Returns a 6-D vector:
+
+        [human_dist, human_bearing, human_rel_heading, human_rel_speed,
+         goal_dist, goal_bearing]
+
+    - human_dist / human_bearing: polar position of the human in the robot frame
+      (bearing in [-pi, pi], 0 = straight ahead).
+    - human_rel_heading: human heading minus robot heading, wrapped to [-pi, pi].
+    - human_rel_speed: magnitude of the human's velocity relative to the robot
+      (m/s), from a finite difference of base positions.
+    - goal_dist / goal_bearing: polar position of the robot's nav goal in the
+      robot frame.
+
+    Only supports 2-agent setups (robot = this agent, human = the other agent).
+    Per-agent duplication (``agent_0_*`` / ``agent_1_*``) is handled by
+    ``RearrangeTask._duplicate_sensor_suite``.
+    """
+
+    cls_uuid: str = "social_nav_policy_state"
+
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        self._prev_robot_xz = None
+        self._prev_human_xz = None
+        self._prev_episode_id = None
+        # Control timestep used for the relative-speed finite difference. Falls
+        # back to 1.0 (i.e. per-step displacement) if the sim config is missing.
+        self._dt = 1.0
+        try:
+            ctrl_freq = float(self._sim.habitat_config.ctrl_freq)
+            ac_freq_ratio = float(self._sim.habitat_config.ac_freq_ratio)
+            if ctrl_freq > 0:
+                self._dt = ac_freq_ratio / ctrl_freq
+        except Exception:
+            self._dt = 1.0
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args, **kwargs):
+        return SocialNavPolicyStateSensor.cls_uuid
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        return spaces.Box(
+            shape=(6,),
+            low=np.finfo(np.float32).min,
+            high=np.finfo(np.float32).max,
+            dtype=np.float32,
+        )
+
+    def get_observation(self, *args, task=None, episode=None, **kwargs):
+        agent_id = self.agent_id if self.agent_id is not None else 0
+        other_id = (agent_id + 1) % 2
+
+        robot = self._sim.get_agent_data(agent_id).articulated_agent
+        human = self._sim.get_agent_data(other_id).articulated_agent
+
+        # Robot orthonormal frame in the world XZ plane (rotation only, so this
+        # is robust to where the base transform's translation actually sits).
+        # forward = local +x; lateral = forward rotated +90 deg in XZ.
+        fwd = robot.base_transformation.transform_vector(mn.Vector3(1.0, 0.0, 0.0))
+        forward = np.array([fwd[0], fwd[2]], dtype=np.float64)
+        n = np.linalg.norm(forward)
+        forward = forward / n if n > 1e-8 else np.array([1.0, 0.0])
+        lateral = np.array([forward[1], -forward[0]], dtype=np.float64)
+
+        robot_xz = np.array(
+            [robot.base_pos[0], robot.base_pos[2]], dtype=np.float64
+        )
+
+        def _to_robot_frame(world_xz):
+            d = world_xz - robot_xz
+            fwd_c = float(d @ forward)
+            lat_c = float(d @ lateral)
+            return np.hypot(fwd_c, lat_c), np.arctan2(lat_c, fwd_c)
+
+        # Human polar position in the robot frame.
+        human_xz = np.array(
+            [human.base_pos[0], human.base_pos[2]], dtype=np.float64
+        )
+        human_dist, human_bearing = _to_robot_frame(human_xz)
+
+        # Human heading relative to the robot heading.
+        hfwd = human.base_transformation.transform_vector(
+            mn.Vector3(1.0, 0.0, 0.0)
+        )
+        hfwd_xz = np.array([hfwd[0], hfwd[2]], dtype=np.float64)
+        human_rel_heading = float(
+            np.arctan2(hfwd_xz @ lateral, hfwd_xz @ forward)
+        )
+
+        # Goal polar position in the robot frame.
+        goal_dist = 0.0
+        goal_bearing = 0.0
+        info = getattr(task, "my_nav_to_info", None)
+        if info is not None and info.robot_info is not None:
+            g = info.robot_info.nav_goal_pos
+            goal_dist, goal_bearing = _to_robot_frame(
+                np.array([float(g[0]), float(g[2])], dtype=np.float64)
+            )
+
+        # Relative speed via finite difference of world base positions
+        # (robot_xz / human_xz were computed above).
+        ep_id = getattr(episode, "episode_id", None)
+        if ep_id != self._prev_episode_id:
+            # New episode: reset the finite-difference state.
+            self._prev_robot_xz = None
+            self._prev_human_xz = None
+            self._prev_episode_id = ep_id
+        human_rel_speed = 0.0
+        if self._prev_robot_xz is not None and self._dt > 0:
+            rel_vel = (
+                (human_xz - self._prev_human_xz)
+                - (robot_xz - self._prev_robot_xz)
+            ) / self._dt
+            human_rel_speed = float(np.linalg.norm(rel_vel))
+        self._prev_robot_xz = robot_xz
+        self._prev_human_xz = human_xz
+
+        return np.array(
+            [
+                human_dist,
+                human_bearing,
+                human_rel_heading,
+                human_rel_speed,
+                goal_dist,
+                goal_bearing,
+            ],
+            dtype=np.float32,
         )
 
 

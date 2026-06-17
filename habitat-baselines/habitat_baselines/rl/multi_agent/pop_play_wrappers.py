@@ -206,14 +206,19 @@ class MultiPolicy(Policy):
 
         action_dims = split_index_dict["index_len_prev_actions"]
 
-        # We need to split the `take_actions` if they are being assigned from
-        # `actions`. This will be the case if `take_actions` hasn't been
-        # assigned, like in a monolithic policy where there is no policy
-        # hierarchicy.
-        if any(ac.take_actions is None for ac in agent_actions):
-            length_take_actions = action_dims
-        else:
-            length_take_actions = None
+        # The executed (`take_actions`) width can differ from the stored-action
+        # width per agent (e.g. a hierarchical agent stores a discrete skill but
+        # executes a wider continuous command), and the two agents can have
+        # different low-level action widths. Record the actual per-agent
+        # take-action widths so the concatenated tensor can be split back
+        # correctly. Falls back to `actions` when an agent did not assign
+        # `take_actions` (e.g. a monolithic policy).
+        length_take_actions = [
+            (
+                ac.take_actions if ac.take_actions is not None else ac.actions
+            ).shape[-1]
+            for ac in agent_actions
+        ]
 
         def _maybe_cat(get_dat, feature_dims, dtype):
             all_dat = [get_dat(ac) for ac in agent_actions]

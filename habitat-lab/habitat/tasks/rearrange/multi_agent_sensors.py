@@ -8,6 +8,7 @@ from habitat.tasks.rearrange.multi_task.pddl_sensors import PddlSubgoalReward
 from habitat.tasks.rearrange.utils import (
     UsesArticulatedAgentInterface,
     coll_name_matches,
+    get_angle_to_pos,
 )
 
 
@@ -111,6 +112,45 @@ class OtherAgentGps(UsesArticulatedAgentInterface, Sensor):
             other_agent_id
         ).articulated_agent.base_pos
         return np.array(my_pos - other_pos)[[0, 2]]
+
+
+@registry.register_sensor
+class OtherAgentHeading(UsesArticulatedAgentInterface, Sensor):
+    """
+    Returns the world-frame heading angle (radians) of the other agent. Used to
+    feed the partner (humanoid) orientation to the social-nav high-level policy.
+    Only supports 2-agent setups.
+    """
+
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args, **kwargs):
+        return "other_agent_heading"
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        return spaces.Box(
+            shape=(1,),
+            low=-np.pi,
+            high=np.pi,
+            dtype=np.float32,
+        )
+
+    def get_observation(self, observations, episode, *args, **kwargs):
+        assert (
+            self.agent_id < 2
+        ), f"OtherAgentHeading only supports 2 agents, got {self.agent_id=}"
+        other_agent_id = (self.agent_id + 1) % 2
+        other_T = self._sim.get_agent_data(
+            other_agent_id
+        ).articulated_agent.base_transformation
+        forward = np.array([1.0, 0.0, 0.0])
+        heading_angle = get_angle_to_pos(other_T.transform_vector(forward))
+        return np.array([heading_angle], dtype=np.float32)
 
 
 @registry.register_sensor

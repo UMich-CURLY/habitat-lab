@@ -77,7 +77,7 @@ class CyclingHighLevelPolicy(HighLevelPolicy):
 
     def get_value(self, observations, rnn_hidden_states, prev_actions, masks):
         """Return zero values for all envs (no learning signal)."""
-        return torch.zeros(masks.shape[0], 1)
+        return torch.zeros(masks.shape[0], 1, device=masks.device)
 
     def get_next_skill(
         self,

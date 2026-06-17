@@ -307,6 +307,33 @@ class HabitatEvaluator(Evaluator):
                 }
 
                 if len(config.habitat_baselines.eval.video_option) > 0:
+                    # Overlay the social-nav HL policy inputs (robot-frame) onto
+                    # the video so they can be visually verified. Angles shown in
+                    # degrees, distances in m, speed in m/s. Prepended so all six
+                    # stay visible above the measurement list. No-op for other
+                    # tasks (guarded by key).
+                    for _sk in (
+                        "agent_0_social_nav_policy_state",
+                        "social_nav_policy_state",
+                    ):
+                        if _sk in batch:
+                            _s = batch[_sk][i]
+                            _s = (
+                                _s.detach().cpu().numpy()
+                                if hasattr(_s, "detach")
+                                else np.asarray(_s)
+                            ).reshape(-1)
+                            if _s.shape[0] >= 6:
+                                disp_info = {
+                                    "hl_human_dist_m": float(_s[0]),
+                                    "hl_human_bearing_deg": float(np.degrees(_s[1])),
+                                    "hl_human_relheading_deg": float(np.degrees(_s[2])),
+                                    "hl_human_relspeed_mps": float(_s[3]),
+                                    "hl_goal_dist_m": float(_s[4]),
+                                    "hl_goal_bearing_deg": float(np.degrees(_s[5])),
+                                    **disp_info,
+                                }
+                            break
                     # TODO move normalization / channel changing out of the policy and undo it here
                     frame = observations_to_image(
                         {k: v[i] for k, v in batch.items()}, disp_info

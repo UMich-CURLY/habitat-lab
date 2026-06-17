@@ -25,7 +25,16 @@ habitat:
         count_coll_pen: 0.01
         max_count_colls: -1
         count_coll_end_pen: 5.0
-        safe_dis_min: 0.2
+        # Distance (m) below which the human is "too close": triggers the
+        # proximity penalty and the back-off reward. Tune for how early the
+        # robot should start yielding (0.2 = nearly touching, ~1.0 = social).
+        safe_dis_min: 1.0
+        # Dense reward per metre of progress toward the robot's own goal. The
+        # main driver for the policy to choose go_to_goal when it is safe.
+        goal_progress_reward: 2.0
+        # Reward per metre of backing away from a too-close human. Encourages
+        # backoff/yield behaviour when the human enters safe_dis_min.
+        backoff_reward: 2.0
     success_reward: 10.0
     slack_reward: -0.1
     end_on_success: true
@@ -108,12 +117,13 @@ habitat_baselines:
           # High-level neural policy
           high_level_policy:
             name: "SocialNavNeuralHighLevelPolicy"
-            # Input features: [hpx, hpy, velx, vely, thetar, thetah]
+            # Input: 6-D robot-frame vector from the social_nav_policy_state sensor
+            #   [human_dist, human_bearing, human_rel_heading, human_rel_speed,
+            #    goal_dist, goal_bearing]
+            # All quantities are in the robot's local frame (invariant to the
+            # robot's absolute world pose).
             policy_input_keys:
-              - "agent_0_other_agent_gps"
-              - "agent_0_goal_to_agent_gps_compass"
-              - "agent_0_orientation"
-              - "agent_1_orientation"
+              - "social_nav_policy_state"
             hidden_dim: 256
             rnn_type: "GRU"
             num_rnn_layers: 2

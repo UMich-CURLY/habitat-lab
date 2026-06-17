@@ -686,6 +686,16 @@ class OtherAgentGpsConfig(LabSensorConfig):
 
 
 @dataclass
+class OtherAgentHeadingConfig(LabSensorConfig):
+    type: str = "OtherAgentHeading"
+
+
+@dataclass
+class SocialNavPolicyStateSensorConfig(LabSensorConfig):
+    type: str = "SocialNavPolicyStateSensor"
+
+
+@dataclass
 class NavGoalWorldDeltaSensorConfig(LabSensorConfig):
     r"""
     World-frame (x, z) vector from the agent to its navigation goal. Consumed by
@@ -1367,6 +1377,10 @@ class SocialNavReward(MeasurementConfig):
     facing_human_reward: float = -1.0
     # toward_human_reward defualt is 1.0
     toward_human_reward: float = 1.0
+    # Dense reward per metre of progress toward the robot's own goal.
+    goal_progress_reward: float = 1.0
+    # Reward per metre of backing away from a human that is inside safe_dis_min.
+    backoff_reward: float = 1.0
     # -1 means that there is no near_human_bonus
     near_human_bonus: float = -1.0
     # -1 means that there is no exploration reward
@@ -2421,6 +2435,18 @@ cs.store(
     group="habitat/task/lab_sensors",
     name="other_agent_gps",
     node=OtherAgentGpsConfig,
+)
+cs.store(
+    package="habitat.task.lab_sensors.other_agent_heading",
+    group="habitat/task/lab_sensors",
+    name="other_agent_heading",
+    node=OtherAgentHeadingConfig,
+)
+cs.store(
+    package="habitat.task.lab_sensors.social_nav_policy_state",
+    group="habitat/task/lab_sensors",
+    name="social_nav_policy_state",
+    node=SocialNavPolicyStateSensorConfig,
 )
 cs.store(
     package="habitat.task.lab_sensors.goal_world_delta",
