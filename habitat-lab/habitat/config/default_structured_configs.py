@@ -706,6 +706,16 @@ class NavGoalWorldDeltaSensorConfig(LabSensorConfig):
 
 
 @dataclass
+class NavStartWorldDeltaSensorConfig(LabSensorConfig):
+    r"""
+    World-frame (x, z) vector from the agent to its episode start (spawn)
+    position. Consumed by the reverse-ORCA ``BackOffSkill`` for the ORCA
+    preferred velocity and spawn-arrival check.
+    """
+    type: str = "NavStartWorldDeltaSensor"
+
+
+@dataclass
 class RobotTrajectoryBufferSensorConfig(LabSensorConfig):
     r"""
     Fixed-length ring buffer of the agent's recent world-frame (x, z) base
@@ -2453,6 +2463,12 @@ cs.store(
     group="habitat/task/lab_sensors",
     name="goal_world_delta",
     node=NavGoalWorldDeltaSensorConfig,
+)
+cs.store(
+    package="habitat.task.lab_sensors.start_world_delta",
+    group="habitat/task/lab_sensors",
+    name="start_world_delta",
+    node=NavStartWorldDeltaSensorConfig,
 )
 cs.store(
     package="habitat.task.lab_sensors.trajectory_buffer",

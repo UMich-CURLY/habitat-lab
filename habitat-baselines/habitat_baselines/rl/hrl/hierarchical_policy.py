@@ -111,6 +111,20 @@ class HierarchicalPolicy(nn.Module, Policy):
 
         self._step_counter = 0  # Track environment steps for skill cycling
 
+        # High-level control frequency. When >= 1, the HL re-decides the skill
+        # every `_hl_control_interval` low-level steps (in addition to skill
+        # completion / episode end) -> stable decision period for training.
+        # 0 = disabled (legacy per-frame detector trigger), used by non-neural
+        # HL policies such as the partner's CyclingHighLevelPolicy.
+        self._hl_control_interval = int(
+            getattr(config.high_level_policy, "control_interval", 0)
+        )
+        # Per-env steps since this env's last HL decision (init so the first
+        # step is always a decision step).
+        self._steps_since_hl_decision = torch.full(
+            (self._num_envs,), max(self._hl_control_interval, 1), dtype=torch.long
+        )
+
         # Trajectory tracking for BackOffSkill - estimate positions from goal distance
         self._trajectory_buffer_size = 120
         self._trajectory_buffer = {i: [] for i in range(self._num_envs)}
@@ -415,9 +429,14 @@ class HierarchicalPolicy(nn.Module, Policy):
         if self._call_high_level.shape[0] != actual_batch_size:
             self._call_high_level = torch.ones(actual_batch_size, dtype=torch.bool, device=use_device)
             self._cur_skills = torch.zeros(actual_batch_size, dtype=torch.long, device=use_device)
+            self._steps_since_hl_decision = torch.full(
+                (actual_batch_size,), max(self._hl_control_interval, 1),
+                dtype=torch.long, device=use_device,
+            )
         # Ensure tensors are on the correct device (may have been moved by .to()).
         self._call_high_level = self._call_high_level.to(use_device)
         self._cur_skills = self._cur_skills.to(use_device)
+        self._steps_since_hl_decision = self._steps_since_hl_decision.to(use_device)
 
         # Check if skills should terminate.
         for batch_idx, skill_idx in enumerate(self._cur_skills):
@@ -458,27 +477,37 @@ class HierarchicalPolicy(nn.Module, Policy):
         # Always call high-level if the episode is over.
         self._call_high_level = self._call_high_level | (~masks).view(-1)
 
-        # Always call high-level at step 20 to verify skill switching works
+        if self._hl_control_interval >= 1:
+            # Fixed high-level control frequency (neural HL policy): re-decide
+            # every _hl_control_interval steps, on top of skill completion /
+            # episode end already in _call_high_level. No per-frame detector
+            # trigger -> stable decision period (fixes too-fast mode switching).
+            self._steps_since_hl_decision += 1
+            due = self._steps_since_hl_decision >= self._hl_control_interval
+            self._call_high_level = self._call_high_level | due
+            self._steps_since_hl_decision = (
+                self._steps_since_hl_decision * (~self._call_high_level).long()
+            )
+        else:
+            # Legacy per-frame trigger (e.g. partner CyclingHighLevelPolicy):
+            # re-decide whenever a human is detected.
+            if isinstance(observations, dict):
+                detector_key = None
+                for key in observations.keys():
+                    if "humanoid_detector_sensor" in key:
+                        detector_key = key
+                        break
 
-        # Rule-based: call high-level to trigger backoff if human is detected
-        if isinstance(observations, dict):
-            # Look for humanoid_detector_sensor with potential agent prefix
-            detector_key = None
-            for key in observations.keys():
-                if "humanoid_detector_sensor" in key:
-                    detector_key = key
-                    break
+                if detector_key is not None:
+                    detector = observations[detector_key]
+                    if isinstance(detector, torch.Tensor):
+                        detector = detector.cpu()
+                    elif isinstance(detector, np.ndarray):
+                        detector = torch.from_numpy(detector).float()
 
-            if detector_key is not None:
-                detector = observations[detector_key]
-                if isinstance(detector, torch.Tensor):
-                    detector = detector.cpu()
-                elif isinstance(detector, np.ndarray):
-                    detector = torch.from_numpy(detector).float()
-
-                for i in range(min(detector.shape[0], self._call_high_level.shape[0])):
-                    if detector.shape[0] > i and detector[i, 0].item() > 0.5:  # Human detected
-                        self._call_high_level[i] = True
+                    for i in range(min(detector.shape[0], self._call_high_level.shape[0])):
+                        if detector.shape[0] > i and detector[i, 0].item() > 0.5:  # Human detected
+                            self._call_high_level[i] = True
 
         # If any skills want to terminate invoke the high-level policy to get
         # the next skill.

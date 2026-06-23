@@ -872,6 +872,59 @@ class NavGoalWorldDeltaSensor(UsesArticulatedAgentInterface, Sensor):
 
 
 @registry.register_sensor
+class NavStartWorldDeltaSensor(UsesArticulatedAgentInterface, Sensor):
+    """World-frame (x, z) vector from the agent to its EPISODE START (spawn).
+
+    Returns ``(articulated_agent_start_pos - base_pos)[[0, 2]]`` in **world**
+    coordinates. Mirrors ``NavGoalWorldDeltaSensor`` but targets the spawn point
+    instead of the goal. The reverse-ORCA ``BackOffSkill`` consumes this to set
+    its ORCA preferred velocity (direction = normalized delta) and to detect
+    arrival back at the spawn (distance = ``norm(delta)``). Per-agent duplication
+    (``agent_0_*`` / ``agent_1_*``) is handled by
+    ``RearrangeTask._duplicate_sensor_suite``.
+    """
+
+    cls_uuid: str = "start_world_delta"
+
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args, **kwargs):
+        return NavStartWorldDeltaSensor.cls_uuid
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        return spaces.Box(
+            shape=(2,),
+            low=np.finfo(np.float32).min,
+            high=np.finfo(np.float32).max,
+            dtype=np.float32,
+        )
+
+    def get_observation(self, task, *args, **kwargs):
+        agent_id = self.agent_id if self.agent_id is not None else 0
+        base_pos = np.array(
+            self._sim.get_agent_data(agent_id).articulated_agent.base_pos
+        )
+        info = getattr(task, "my_nav_to_info", None)
+        if info is None:
+            return np.zeros(2, dtype=np.float32)
+        if agent_id == 1 and info.human_info is not None:
+            start = info.human_info.articulated_agent_start_pos
+        elif info.robot_info is not None:
+            start = info.robot_info.articulated_agent_start_pos
+        else:
+            return np.zeros(2, dtype=np.float32)
+        start = np.array(start, dtype=np.float32)
+        return np.array(
+            [start[0] - base_pos[0], start[2] - base_pos[2]], dtype=np.float32
+        )
+
+
+@registry.register_sensor
 class SocialNavPolicyStateSensor(UsesArticulatedAgentInterface, Sensor):
     """
     Robot-frame state features for the social-nav high-level policy. Every

@@ -117,6 +117,8 @@ habitat_baselines:
           # High-level neural policy
           high_level_policy:
             name: "SocialNavNeuralHighLevelPolicy"
+            # 降低 high-level 控制频率:高层每 30 步(≈1s @30Hz)重决策一次。
+            control_interval: 30
             # Input: 6-D robot-frame vector from the social_nav_policy_state sensor
             #   [human_dist, human_bearing, human_rel_heading, human_rel_speed,
             #    goal_dist, goal_bearing]

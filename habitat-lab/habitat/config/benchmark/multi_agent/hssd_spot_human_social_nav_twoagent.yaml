@@ -44,6 +44,7 @@ defaults:
     - other_agent_heading
     - social_nav_policy_state
     - goal_world_delta
+    - start_world_delta
     - trajectory_buffer
     - humanoid_detector_sensor
     - has_finished_oracle_nav
@@ -171,6 +172,7 @@ habitat:
       - agent_0_other_agent_heading
       - agent_0_social_nav_policy_state
       - agent_0_goal_world_delta
+      - agent_0_start_world_delta
       - agent_0_trajectory_buffer
       - agent_0_has_finished_oracle_nav
       - agent_1_has_finished_oracle_nav
