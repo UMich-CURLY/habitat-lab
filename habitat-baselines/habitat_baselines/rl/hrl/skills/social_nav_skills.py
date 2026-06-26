@@ -4,12 +4,14 @@ Low-level skills for social navigation with Spot robot.
 Three discrete skills:
   1. BackOffSkill:  Retrace the recent trajectory backward to yield to the human.
   2. WaitSkill:     Stay in place while rotating to face the robot goal.
-  3. GoToGoalSkill: Navigate toward the robot goal with **self-contained RVO/ORCA
-                    collision avoidance**. The skill builds a small per-env ORCA
-                    simulation (robot + human, no static obstacles -- walls are
-                    handled downstream by the navmesh ``step_filter`` inside
-                    ``BaseVelNonCylinderAction``) from observation sensors and
-                    outputs ``base_velocity`` ([linear, angular]) directly.
+  3. GoToGoalSkill: Navigate toward the robot goal via the **oracle navigation
+                    action** (``agent_0_oracle_nav_action`` -> ``OracleNavAction``)
+                    with NO human avoidance. The skill simply emits the robot
+                    goal's entity index; ``OracleNavAction`` navmesh-pathfinds to
+                    it (static walls only -- the human is not in the navmesh).
+                    Yielding to the human is the EXCLUSIVE job of the high-level
+                    planner (backoff / wait skills), so the go-to-goal motion is a
+                    pure shortest-path-to-goal that ignores the human entirely.
 
 Notes on the multi-agent key convention: each agent's policy receives its own
 observation/action dict with the ``agent_{i}_`` prefix **stripped**
@@ -415,18 +417,22 @@ class WaitSkill(SocialNavSkillBase):
 
 class GoToGoalSkill(SocialNavSkillBase):
     """
-    Navigate toward the robot's goal with self-contained RVO/ORCA collision
-    avoidance, outputting ``base_velocity`` ([linear, angular]) directly.
+    Navigate toward the robot's goal via the oracle navigation action with NO
+    human avoidance. The skill writes the robot goal's entity index into the
+    ``oracle_nav_action`` slot; the env-side ``OracleNavAction`` then navmesh-
+    pathfinds to that entity. The pathfinder only knows static walls (handled by
+    ``step_filter``); the human is not in the navmesh, so the resulting motion is
+    a pure shortest-path-to-goal that ignores the human entirely.
 
-    Per-env state: one keyed ``RVOManager`` (agents ``"robot"``, ``"human"``),
-    the last human position (for a finite-difference velocity estimate), and the
-    last robot ORCA velocity (warm start). The ORCA sim is rebuilt lazily on
-    episode reset / skill (re)entry.
+    Yielding to the human is the EXCLUSIVE responsibility of the high-level
+    planner (which calls the backoff / wait skills). This skill is stateless: it
+    emits the same goal entity index every step and hands control back to the HL
+    once the goal is reached (see :meth:`should_terminate`).
     """
 
     def __init__(self, config, action_space, batch_size, **kwargs):
         super().__init__(config, action_space, batch_size, **kwargs)
-        # --- ORCA params (from the skill config's `skill_data` escape hatch;
+        # --- params (from the skill config's `skill_data` escape hatch;
         # HrlDefinedSkillConfig is a closed schema, so custom keys live there) ---
         sd = getattr(config, "skill_data", None) or {}
 
@@ -436,189 +442,47 @@ class GoToGoalSkill(SocialNavSkillBase):
             except AttributeError:
                 return getattr(sd, key, default)
 
-        self._rvo_radius = float(_p("rvo_radius", 0.4))
-        self._rvo_human_radius = float(_p("rvo_human_radius", 0.4))
-        self._rvo_max_speed = float(_p("rvo_max_speed", 1.0))
-        self._rvo_neighbor_dist = float(_p("rvo_neighbor_dist", 2.0))
-        self._rvo_max_neighbors = int(_p("rvo_max_neighbors", 10))
-        self._rvo_time_horizon = float(_p("rvo_time_horizon", 2.0))
-        self._rvo_time_horizon_obst = float(_p("rvo_time_horizon_obst", 4.0))
-        self._rvo_goal_stop_radius = float(_p("rvo_goal_stop_radius", 0.3))
-        # Must match the env control step (ac_freq_ratio / ctrl_freq).
-        self._rvo_time_step = float(_p("rvo_time_step", 1.0 / 30.0))
-        # Must match the agent_0_base_velocity action's longitudinal_lin_speed so
-        # the post-clip effective forward speed equals the ORCA-solved speed.
-        self._rvo_lin_speed = float(_p("rvo_lin_speed", 10.0))
-        self._turn_thresh = float(_p("turn_thresh", 0.1))
-        self._turn_velocity = float(_p("turn_velocity", 1.0))
+        # Goal reached (within this radius, from goal_world_delta) -> hand back.
         self._goal_done_radius = float(_p("goal_done_radius", 0.5))
-        # Hand control back to the HL switch policy once the human is closer than
-        # this (so it can switch to backoff). Keep >= the CyclingHighLevelPolicy
-        # backoff_enter_dist.
-        self._human_switch_dist = float(_p("human_switch_dist", 1.0))
-        # When enabled, print a concise per-step trace for env 0 (debug/tuning).
-        self._rvo_debug = bool(_p("rvo_debug", False))
+        # Action value written into the oracle_nav_action slot. OracleNavAction
+        # interprets it as (entity_index + 1); 1.0 -> entity 0 == the robot goal
+        # (TARGET_robot_0_goal, which resolves to episode.info["robot_goal"]).
+        self._goal_entity_action_value = float(
+            _p("goal_entity_action_value", 1.0)
+        )
 
-        # --- per-env state ---
-        self._rvo = [None] * batch_size
-        self._last_human_xz = [None] * batch_size
-        self._last_robot_vel = [(0.0, 0.0)] * batch_size
+        # Locate the (stripped) oracle_nav_action slot to write the goal entity
+        # index into. Falls back to base_velocity-relative if not found.
+        try:
+            self._oracle_nav_start, self._oracle_nav_end = find_action_range(
+                action_space, "oracle_nav_action"
+            )
+        except (ValueError, KeyError):
+            logger.warning(
+                "[GoToGoalSkill] oracle_nav_action slot not found in action "
+                "space; falling back to base_velocity slot."
+            )
+            self._oracle_nav_start, self._oracle_nav_end = (
+                self._base_vel_start,
+                self._base_vel_end,
+            )
 
     @property
     def required_obs_keys(self) -> List[str]:
-        return [
-            "localization_sensor",
-            "other_agent_gps",
-            "goal_world_delta",
-            "humanoid_detector_sensor",
-        ]
+        return ["goal_world_delta"]
 
     def on_enter(self, skill_args, batch_indices, observations,
                  rnn_hidden_states, prev_actions, skill_name=None):
-        for e in batch_indices:
-            if e < len(self._rvo):
-                self._rvo[e] = None
-                self._last_human_xz[e] = None
-                self._last_robot_vel[e] = (0.0, 0.0)
         return rnn_hidden_states, prev_actions
-
-    def _build_rvo(self, robot_xz, human_xz):
-        # Lazy import so importing this module does not hard-require rvo2.
-        from habitat.tasks.rearrange.social_nav.rvo_manager import RVOManager
-
-        mgr = RVOManager(
-            time_step=self._rvo_time_step,
-            neighbor_dist=self._rvo_neighbor_dist,
-            max_neighbors=self._rvo_max_neighbors,
-            time_horizon=self._rvo_time_horizon,
-            time_horizon_obst=self._rvo_time_horizon_obst,
-            radius=self._rvo_radius,
-            default_max_speed=self._rvo_max_speed,
-            static_obstacles=None,
-        )
-        mgr.add_agent(
-            "robot",
-            (float(robot_xz[0]), float(robot_xz[1])),
-            radius=self._rvo_radius,
-            max_speed=self._rvo_max_speed,
-        )
-        mgr.add_agent(
-            "human",
-            (float(human_xz[0]), float(human_xz[1])),
-            radius=self._rvo_human_radius,
-            max_speed=self._rvo_max_speed,
-        )
-        return mgr
-
-    @staticmethod
-    def _compute_turn(rel, turn_vel, robot_forward):
-        # Mirrors OracleNavAction._compute_turn.
-        is_left = np.cross(robot_forward, rel) > 0
-        return [0.0, -turn_vel] if is_left else [0.0, turn_vel]
 
     def _internal_act(self, observations, rnn_hidden_states, prev_actions, masks,
             cur_batch_idx=None, deterministic=False):
         batch_size = masks.shape[0]
         action = torch.zeros(batch_size, self._full_ac_size, device=masks.device)
-        if cur_batch_idx is None:
-            cur_batch_idx = list(range(batch_size))
-
-        loc_all = _to_np(observations.get("localization_sensor")) if isinstance(observations, dict) else None
-        oag_all = _to_np(observations.get("other_agent_gps")) if isinstance(observations, dict) else None
-        goal_all = _to_np(observations.get("goal_world_delta")) if isinstance(observations, dict) else None
-
-        if loc_all is None or oag_all is None or goal_all is None:
-            logger.warning(
-                "[GoToGoalSkill][RVO] missing required sensors; keys=%s",
-                sorted(observations.keys()) if isinstance(observations, dict) else type(observations),
-            )
-            return PolicyActionData(actions=action, rnn_hidden_states=rnn_hidden_states)
-
-        dt = self._rvo_time_step
-        lin_i = self._base_vel_start
-        ang_i = self._base_vel_start + 1
-
-        for j in range(batch_size):
-            e = cur_batch_idx[j]
-
-            # Episode reset -> drop per-env ORCA state.
-            if float(masks[j].reshape(-1)[0].item()) == 0.0:
-                self._rvo[e] = None
-                self._last_human_xz[e] = None
-                self._last_robot_vel[e] = (0.0, 0.0)
-
-            loc = loc_all[j]
-            robot_xz = np.array([loc[0], loc[2]], dtype=np.float64)
-            yaw = float(loc[3])
-            # Derived from LocalizationSensor: heading = -atan2(fz, fx), so the
-            # world forward (x, z) of the robot is (cos yaw, -sin yaw).
-            robot_forward = np.array([math.cos(yaw), -math.sin(yaw)], dtype=np.float64)
-
-            # other_agent_gps = (robot_xz - human_xz) -> human_xz = robot_xz - oag
-            human_xz = robot_xz - np.asarray(oag_all[j][:2], dtype=np.float64)
-
-            # Human velocity via finite difference (zero on first step / reset).
-            if self._last_human_xz[e] is not None:
-                human_vel = (human_xz - self._last_human_xz[e]) / dt
-                sp = float(np.linalg.norm(human_vel))
-                if sp > self._rvo_max_speed and sp > 1e-6:
-                    human_vel = human_vel * (self._rvo_max_speed / sp)
-            else:
-                human_vel = np.zeros(2, dtype=np.float64)
-            self._last_human_xz[e] = human_xz
-
-            if self._rvo[e] is None:
-                self._rvo[e] = self._build_rvo(robot_xz, human_xz)
-            mgr = self._rvo[e]
-
-            mgr.sync_agent_pose(
-                "robot", (float(robot_xz[0]), float(robot_xz[1])), self._last_robot_vel[e]
-            )
-            mgr.sync_agent_pose(
-                "human", (float(human_xz[0]), float(human_xz[1])),
-                (float(human_vel[0]), float(human_vel[1])),
-            )
-
-            # Preferred velocity toward the goal (world-frame delta from sensor).
-            goal_delta = np.asarray(goal_all[j][:2], dtype=np.float64)
-            rho = float(np.linalg.norm(goal_delta))
-            if rho >= self._rvo_goal_stop_radius and rho > 1e-6:
-                pref = goal_delta * (self._rvo_max_speed / rho)
-            else:
-                pref = np.zeros(2, dtype=np.float64)
-            mgr.set_pref_velocity("robot", (float(pref[0]), float(pref[1])))
-            mgr.set_pref_velocity("human", (float(human_vel[0]), float(human_vel[1])))
-
-            mgr.step()
-            orca_vel = np.asarray(mgr.get_agent_velocity("robot"), dtype=np.float64)
-            self._last_robot_vel[e] = (float(orca_vel[0]), float(orca_vel[1]))
-
-            # Convert world ORCA velocity -> [linear, angular] via turn-then-go.
-            dist = float(np.linalg.norm(orca_vel))
-            if dist < 1e-3 or rho < self._rvo_goal_stop_radius:
-                lin, ang = 0.0, 0.0
-            else:
-                angle_to_target = float(get_angle(robot_forward, orca_vel))
-                if angle_to_target < self._turn_thresh:
-                    # BaseVelAction clips lin to [-1,1] then *longitudinal_lin_speed,
-                    # so dist/lin_speed yields an effective forward speed of `dist`.
-                    lin, ang = dist / self._rvo_lin_speed, 0.0
-                else:
-                    vel = self._compute_turn(orca_vel, self._turn_velocity, robot_forward)
-                    lin, ang = vel[0], vel[1]
-
-            action[j, lin_i] = lin
-            action[j, ang_i] = ang
-
-            if self._rvo_debug and e == 0:
-                print(
-                    f"[GoToGoalSkill][RVO] env0 robot_xz=({robot_xz[0]:.2f},{robot_xz[1]:.2f}) "
-                    f"yaw={yaw:.2f} human_xz=({human_xz[0]:.2f},{human_xz[1]:.2f}) "
-                    f"goal_rho={rho:.2f} pref=({pref[0]:.2f},{pref[1]:.2f}) "
-                    f"orca_vel=({orca_vel[0]:.2f},{orca_vel[1]:.2f}) lin={lin:.2f} ang={ang:.2f}",
-                    flush=True,
-                )
-
+        # Emit the robot goal entity index into the oracle_nav_action slot every
+        # step. OracleNavAction navmesh-pathfinds to the goal with no human
+        # avoidance; walls are handled by step_filter downstream.
+        action[:, self._oracle_nav_start] = self._goal_entity_action_value
         return PolicyActionData(actions=action, rnn_hidden_states=rnn_hidden_states)
 
     def should_terminate(self, observations, rnn_hidden_states, prev_actions,
@@ -634,8 +498,8 @@ class GoToGoalSkill(SocialNavSkillBase):
                 continue
             # Goal reached (task complete) -> hand back so the HL re-decides.
             # Reactive "human got close" / detector conditions are left out on
-            # purpose; switching is driven by the fixed control interval, while
-            # the in-skill RVO keeps avoiding the human every step.
+            # purpose; switching is driven by the fixed control interval. This
+            # skill never avoids the human -- yielding is the HL planner's job.
             if goal_all is not None and goal_all.shape[0] > i:
                 if float(np.linalg.norm(goal_all[i][:2])) < self._goal_done_radius:
                     call_hl[i] = True
