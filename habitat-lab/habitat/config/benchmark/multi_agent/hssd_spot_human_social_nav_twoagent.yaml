@@ -44,7 +44,8 @@ defaults:
     - other_agent_heading
     - social_nav_policy_state
     - goal_world_delta
-    - start_world_delta
+    - goal_waypoint_delta
+    - backoff_waypoint_delta
     - trajectory_buffer
     - humanoid_detector_sensor
     - has_finished_oracle_nav
@@ -76,9 +77,10 @@ habitat:
     # Use the new minimal TwoAgentSocialNavTask that doesn't bind PDDL/problems
     type: TwoAgentSocialNavTask-v0
     min_start_distance: 0.0
-    # ORCA: the TASK drives only the human (agent_1); the robot (agent_0) runs its
-    # own self-contained RVO inside GoToGoalSkill and outputs base_velocity. The
-    # robot stays registered in the task ORCA sim as a neighbour the human avoids.
+    # ORCA: the TASK drives only the human (agent_1); the robot (agent_0) is
+    # driven by its skills (geodesic go-to-goal / reverse backoff) outputting
+    # base_velocity, with NO human avoidance of its own. The robot stays
+    # registered in the task ORCA sim as a neighbour the human avoids.
     # No static polys; walls via step_filter.
     rvo_use_orca_nav: True
     rvo_static_map_enabled: False
@@ -116,7 +118,14 @@ habitat:
         count_coll_pen: 0.01
         max_count_colls: -1
         count_coll_end_pen: 5.0
-        safe_dis_min: 0.2
+        # Robot-human distance (m) below which the reward penalizes proximity
+        # and pays for opening distance -- the gradient that teaches the HL
+        # planner to yield at doorway range (at 0.2 there was no signal).
+        safe_dis_min: 1.5
+      # Robot body radius is 0.4 m, so a center-to-goal threshold below that is
+      # geometrically unreachable near walls. Success band = robot radius.
+      social_nav_to_pos_succ:
+        success_distance: 0.4
 
     actions:
       # agent_0_base_velocity:
@@ -162,8 +171,8 @@ habitat:
 
   gym:
     # Remove object-related keys so the policy only receives social-nav observations.
-    # The agent_0_* sensors feed the self-contained RVO GoToGoalSkill (the
-    # agent_0_ prefix is stripped before reaching agent_0's policy).
+    # The agent_0_* sensors feed the HRL skills (the agent_0_ prefix is stripped
+    # before reaching agent_0's policy).
     obs_keys:
       - agent_0_spot_head_stereo_depth_sensor
       - agent_0_humanoid_detector_sensor
@@ -172,7 +181,8 @@ habitat:
       - agent_0_other_agent_heading
       - agent_0_social_nav_policy_state
       - agent_0_goal_world_delta
-      - agent_0_start_world_delta
+      - agent_0_goal_waypoint_delta
+      - agent_0_backoff_waypoint_delta
       - agent_0_trajectory_buffer
       - agent_0_has_finished_oracle_nav
       - agent_1_has_finished_oracle_nav

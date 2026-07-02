@@ -871,57 +871,229 @@ class NavGoalWorldDeltaSensor(UsesArticulatedAgentInterface, Sensor):
         )
 
 
+def _geodesic_next_waypoint(sim, base_pos, target):
+    """``[wp_dx, wp_dz, remaining]``: world (x, z) delta to the next waypoint of
+    the default geodesic path from ``base_pos`` to ``target``, plus the
+    straight-line XZ distance left to ``target``."""
+    path = habitat_sim.ShortestPath()
+    path.requested_start = np.array(base_pos, dtype=np.float32)
+    path.requested_end = np.array(target, dtype=np.float32)
+    found = sim.pathfinder.find_path(path)
+    if found and len(path.points) > 1:
+        wp = np.array(path.points[1], dtype=np.float64)
+    else:
+        wp = np.array(target, dtype=np.float64)
+    wp_delta = (wp - base_pos)[[0, 2]]
+    remaining = float(np.linalg.norm((np.array(target) - base_pos)[[0, 2]]))
+    return np.array([wp_delta[0], wp_delta[1], remaining], dtype=np.float32)
+
+
 @registry.register_sensor
-class NavStartWorldDeltaSensor(UsesArticulatedAgentInterface, Sensor):
-    """World-frame (x, z) vector from the agent to its EPISODE START (spawn).
+class NavGoalWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
+    """Next-waypoint vector of the default geodesic path to the ROBOT GOAL
+    (agent_0 only). Snaps the goal to the navmesh once per episode, pathfinds
+    each step, and returns ``[wp_dx, wp_dz, remaining]``. ``GoToGoalSkill``
+    consumes this for plain shortest-path driving with no human avoidance."""
 
-    Returns ``(articulated_agent_start_pos - base_pos)[[0, 2]]`` in **world**
-    coordinates. Mirrors ``NavGoalWorldDeltaSensor`` but targets the spawn point
-    instead of the goal. The reverse-ORCA ``BackOffSkill`` consumes this to set
-    its ORCA preferred velocity (direction = normalized delta) and to detect
-    arrival back at the spawn (distance = ``norm(delta)``). Per-agent duplication
-    (``agent_0_*`` / ``agent_1_*``) is handled by
-    ``RearrangeTask._duplicate_sensor_suite``.
-    """
-
-    cls_uuid: str = "start_world_delta"
+    cls_uuid: str = "goal_waypoint_delta"
 
     def __init__(self, sim, config, *args, **kwargs):
         self._sim = sim
+        self._target = None
+        self._prev_ep_id = None
         super().__init__(config=config)
 
     def _get_uuid(self, *args, **kwargs):
-        return NavStartWorldDeltaSensor.cls_uuid
+        return NavGoalWaypointDeltaSensor.cls_uuid
 
     def _get_sensor_type(self, *args, **kwargs):
         return SensorTypes.TENSOR
 
     def _get_observation_space(self, *args, config, **kwargs):
         return spaces.Box(
-            shape=(2,),
+            shape=(3,),
             low=np.finfo(np.float32).min,
             high=np.finfo(np.float32).max,
             dtype=np.float32,
         )
 
+    def _compute_target(self, task):
+        info = getattr(task, "my_nav_to_info", None)
+        robot_info = getattr(info, "robot_info", None) if info else None
+        if robot_info is None:
+            return None
+        goal = np.array(robot_info.nav_goal_pos, dtype=np.float64)
+        snapped = np.array(self._sim.pathfinder.snap_point(goal), dtype=np.float64)
+        return goal if np.any(np.isnan(snapped)) else snapped
+
     def get_observation(self, task, *args, **kwargs):
         agent_id = self.agent_id if self.agent_id is not None else 0
+        if agent_id != 0:
+            return np.zeros(3, dtype=np.float32)
+
+        ep_id = getattr(self._sim.ep_info, "episode_id", None)
+        if self._target is None or ep_id != self._prev_ep_id:
+            self._target = self._compute_target(task)
+            self._prev_ep_id = ep_id
+        if self._target is None:
+            return np.zeros(3, dtype=np.float32)
+
         base_pos = np.array(
             self._sim.get_agent_data(agent_id).articulated_agent.base_pos
         )
-        info = getattr(task, "my_nav_to_info", None)
-        if info is None:
-            return np.zeros(2, dtype=np.float32)
-        if agent_id == 1 and info.human_info is not None:
-            start = info.human_info.articulated_agent_start_pos
-        elif info.robot_info is not None:
-            start = info.robot_info.articulated_agent_start_pos
-        else:
-            return np.zeros(2, dtype=np.float32)
-        start = np.array(start, dtype=np.float32)
-        return np.array(
-            [start[0] - base_pos[0], start[2] - base_pos[2]], dtype=np.float32
+        return _geodesic_next_waypoint(self._sim, base_pos, self._target)
+
+
+@registry.register_sensor
+class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
+    """Next-waypoint vector for the door-relative reverse backoff (agent_0 only).
+
+    Computes ONCE per episode a backoff target ~``backoff_dist`` m behind the
+    door on the robot's start side -- default straight back along the door
+    normal, otherwise the nearest navigable corridor direction on that side --
+    validated to be navigable, on the start side, with >= ``obstacle_clearance``
+    m clearance, and reachable from the robot. Each step returns
+    ``[wp_dx, wp_dz, remaining]`` where ``(wp_dx, wp_dz)`` is the world (x, z)
+    delta to the next waypoint of the **default geodesic path** to that target
+    and ``remaining`` is the straight-line distance left. ``BackOffSkill`` drives
+    the robot BACKWARD toward the waypoint and stops/terminates on ``remaining``.
+    Per-agent duplication is handled by ``RearrangeTask._duplicate_sensor_suite``.
+    """
+
+    cls_uuid: str = "backoff_waypoint_delta"
+
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        self._backoff_dist = float(getattr(config, "backoff_dist", 2.0))
+        self._clearance = float(getattr(config, "obstacle_clearance", 0.3))
+        self._target = None
+        self._prev_ep_id = None
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args, **kwargs):
+        return BackoffWaypointDeltaSensor.cls_uuid
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        return spaces.Box(
+            shape=(3,),
+            low=np.finfo(np.float32).min,
+            high=np.finfo(np.float32).max,
+            dtype=np.float32,
         )
+
+    @staticmethod
+    def _side_sign(door_start, door_end, p):
+        # Mirrors door_sampler.py: sign of the 2D cross product about the door
+        # line in the XZ plane -> which side of the door a point lies on.
+        r1, r2 = door_start[0], door_end[0]
+        c1, c2 = door_start[2], door_end[2]
+        det = (p[0] - r1) * (c2 - c1) - (p[2] - c1) * (r2 - r1)
+        return 1.0 if det > 0 else -1.0
+
+    def _compute_target(self, task, robot_pos):
+        """Door-relative backoff point on the robot's start side, validated
+        against the navmesh. Falls back to the spawn if nothing valid is found."""
+        pf = self._sim.pathfinder
+        info = getattr(self._sim.ep_info, "info", {}) or {}
+        nav_info = getattr(task, "my_nav_to_info", None)
+        robot_info = getattr(nav_info, "robot_info", None) if nav_info else None
+        if robot_info is None or "door_start" not in info or "door_end" not in info:
+            return None
+
+        door_start = np.array(info["door_start"], dtype=np.float64)
+        door_end = np.array(info["door_end"], dtype=np.float64)
+        start_pos = np.array(
+            robot_info.articulated_agent_start_pos, dtype=np.float64
+        )
+
+        door_mid = (door_start + door_end) / 2.0
+        d = door_end - door_start
+        d_xz = np.array([d[0], d[2]], dtype=np.float64)
+        nrm = float(np.linalg.norm(d_xz))
+        d_xz = d_xz / nrm if nrm > 1e-6 else np.array([1.0, 0.0])
+        n_xz = np.array([-d_xz[1], d_xz[0]])  # door normal (XZ)
+
+        # Pick the normal pointing to the robot's start side.
+        start_side = self._side_sign(door_start, door_end, start_pos)
+        probe = door_mid + np.array([n_xz[0], 0.0, n_xz[1]]) * 0.5
+        if self._side_sign(door_start, door_end, probe) != start_side:
+            n_xz = -n_xz
+
+        def _rotate(v, deg):
+            t = np.radians(deg)
+            c, s = np.cos(t), np.sin(t)
+            return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+
+        # Straight-back (0 deg) first, then fan out into the start-side corridor.
+        angles = [0, 30, -30, 60, -60, 90, -90]
+        radii = [
+            self._backoff_dist,
+            self._backoff_dist * 0.75,
+            self._backoff_dist * 0.5,
+        ]
+        candidates = []
+        for r in radii:
+            for a in angles:
+                dir_xz = _rotate(n_xz, a)
+                cand = door_mid + np.array([dir_xz[0], 0.0, dir_xz[1]]) * r
+                cand[1] = door_mid[1]
+                candidates.append(cand)
+
+        def _validate(cand, clearance):
+            snapped = np.array(pf.snap_point(cand), dtype=np.float64)
+            if np.any(np.isnan(snapped)) or not pf.is_navigable(snapped):
+                return None
+            if self._side_sign(door_start, door_end, snapped) != start_side:
+                return None  # snap flipped it across the door
+            if (
+                pf.distance_to_closest_obstacle(snapped, max_search_radius=2.0)
+                < clearance
+            ):
+                return None
+            path = habitat_sim.ShortestPath()
+            path.requested_start = np.array(robot_pos, dtype=np.float32)
+            path.requested_end = snapped.astype(np.float32)
+            if not pf.find_path(path):
+                return None  # unreachable
+            return snapped
+
+        for clearance in (self._clearance, self._clearance / 2.0):
+            for cand in candidates:
+                ok = _validate(cand, clearance)
+                if ok is not None:
+                    return ok
+
+        # Fallback: original spawn behavior.
+        print(
+            "[BackoffWaypointDeltaSensor] no valid door-relative point; "
+            "falling back to spawn",
+            flush=True,
+        )
+        snapped = np.array(pf.snap_point(start_pos), dtype=np.float64)
+        if np.any(np.isnan(snapped)):
+            return np.array(robot_pos, dtype=np.float64)
+        return snapped
+
+    def get_observation(self, task, *args, **kwargs):
+        agent_id = self.agent_id if self.agent_id is not None else 0
+        if agent_id != 0:
+            return np.zeros(3, dtype=np.float32)  # backoff is robot-only
+
+        base_pos = np.array(
+            self._sim.get_agent_data(agent_id).articulated_agent.base_pos
+        )
+
+        ep_id = getattr(self._sim.ep_info, "episode_id", None)
+        if self._target is None or ep_id != self._prev_ep_id:
+            self._target = self._compute_target(task, base_pos)
+            self._prev_ep_id = ep_id
+        if self._target is None:
+            return np.zeros(3, dtype=np.float32)
+
+        return _geodesic_next_waypoint(self._sim, base_pos, self._target)
 
 
 @registry.register_sensor

@@ -706,13 +706,26 @@ class NavGoalWorldDeltaSensorConfig(LabSensorConfig):
 
 
 @dataclass
-class NavStartWorldDeltaSensorConfig(LabSensorConfig):
+class NavGoalWaypointDeltaSensorConfig(LabSensorConfig):
     r"""
-    World-frame (x, z) vector from the agent to its episode start (spawn)
-    position. Consumed by the reverse-ORCA ``BackOffSkill`` for the ORCA
-    preferred velocity and spawn-arrival check.
+    Next geodesic-waypoint vector (world x, z) toward the robot goal, plus the
+    straight-line distance left. Consumed by ``GoToGoalSkill`` for plain
+    shortest-path driving with no human avoidance (no RVO).
     """
-    type: str = "NavStartWorldDeltaSensor"
+    type: str = "NavGoalWaypointDeltaSensor"
+
+
+@dataclass
+class BackoffWaypointDeltaSensorConfig(LabSensorConfig):
+    r"""
+    Next geodesic-waypoint vector (world x, z) toward a backoff target ~
+    ``backoff_dist`` m behind the door on the robot's start side, plus the
+    straight-line distance left. Consumed by ``BackOffSkill`` to drive the robot
+    backward there with default pathfinding (no RVO).
+    """
+    type: str = "BackoffWaypointDeltaSensor"
+    backoff_dist: float = 2.0
+    obstacle_clearance: float = 0.3
 
 
 @dataclass
@@ -2465,10 +2478,16 @@ cs.store(
     node=NavGoalWorldDeltaSensorConfig,
 )
 cs.store(
-    package="habitat.task.lab_sensors.start_world_delta",
+    package="habitat.task.lab_sensors.goal_waypoint_delta",
     group="habitat/task/lab_sensors",
-    name="start_world_delta",
-    node=NavStartWorldDeltaSensorConfig,
+    name="goal_waypoint_delta",
+    node=NavGoalWaypointDeltaSensorConfig,
+)
+cs.store(
+    package="habitat.task.lab_sensors.backoff_waypoint_delta",
+    group="habitat/task/lab_sensors",
+    name="backoff_waypoint_delta",
+    node=BackoffWaypointDeltaSensorConfig,
 )
 cs.store(
     package="habitat.task.lab_sensors.trajectory_buffer",
