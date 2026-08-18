@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import magnum as mn
+import math
 import numpy as np
 from gym import spaces
 
@@ -67,6 +68,20 @@ class SocialNavReward(RearrangeReward):
         #   backoff_reward: reward per metre of backing away from a too-close human
         self._goal_progress_reward = getattr(config, "goal_progress_reward", 1.0)
         self._backoff_reward = getattr(config, "backoff_reward", 1.0)
+        # Awareness radius for the dense yield shaping (>= safe_dis_min).
+        self._yield_dis = getattr(config, "yield_dis", self._safe_dis_min)
+        # Whether a robot-human collision ends the episode (default) or only
+        # incurs collide_penalty and lets the episode continue.
+        self._end_on_collide = getattr(config, "end_on_collide", True)
+        # Layer-2/3 shaping (see default_structured_configs.SocialNavReward).
+        self._eff_success_reward = getattr(config, "eff_success_reward", 0.0)
+        self._eff_step_cap = getattr(config, "eff_step_cap", 1200.0)
+        self._corridor_coef = getattr(config, "corridor_potential_coef", 0.0)
+        self._corridor_safe = getattr(config, "corridor_safe_clear", 1.0)
+        self._release_bonus = getattr(config, "release_bonus", 0.0)
+        self._release_mpd = getattr(config, "release_mpd_min", 0.75)
+        self._release_hold = getattr(config, "release_hold_steps", 30)
+        self._v_robot = getattr(config, "release_robot_speed", 0.008)
         self.interm_goal_bonus = 1.0   #Change to get from config
         # Record the previous distance to human
         self._prev_dist = -1.0
@@ -79,6 +94,28 @@ class SocialNavReward(RearrangeReward):
     def reset_metric(self, *args, episode, task, observations, **kwargs):
         self._prev_dist = -1.0
         self._prev_dist_to_goal = -1.0
+        # Per-episode running sums of each reward component. The measure's own
+        # _metric is the PER-STEP reward (the base class assigns, not
+        # accumulates), and the eval stats only capture a measure's final-step
+        # value -- so component totals have to be accumulated explicitly here.
+        # Read out by SocialNavRewardBreakdown.
+        self.comp_sums = {
+            "goal_progress": 0.0,
+            "backoff": 0.0,
+            "proximity": 0.0,
+            "collide": 0.0,
+            "efficiency": 0.0,
+            "corridor": 0.0,
+            "release": 0.0,
+        }
+        # Layer-2/3 per-episode state.
+        self._num_steps = 0
+        self._eff_paid = False
+        self._prev_phi = None
+        self._hold_steps = 0
+        self._release_paid = False
+        self._prev_human_xz = None
+        self._human_speed_ema = 0.0
         super().reset_metric(
             *args,
             episode=episode,
@@ -88,6 +125,40 @@ class SocialNavReward(RearrangeReward):
         )
         # Reset the location visit tracker for the agent
         self._visited_pos = set()
+
+    @staticmethod
+    def _dist_to_polyline(p, poly):
+        """Min distance from XZ point p to polyline poly[N,2] (segment-exact)."""
+        a, b = poly[:-1], poly[1:]
+        ab = b - a
+        t = np.clip(
+            ((p - a) * ab).sum(1) / ((ab * ab).sum(1) + 1e-9), 0.0, 1.0
+        )
+        proj = a + t[:, None] * ab
+        return float(np.min(np.linalg.norm(proj - p, axis=1)))
+
+    @staticmethod
+    def _walk_polyline(poly, dists):
+        """Points reached after walking each of dists along poly from start."""
+        seg = np.linalg.norm(np.diff(poly, axis=0), axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        d = np.clip(dists, 0.0, cum[-1])
+        idx = np.clip(np.searchsorted(cum, d, side="right") - 1, 0, len(seg) - 1)
+        frac = (d - cum[idx]) / (seg[idx] + 1e-9)
+        return poly[idx] + frac[:, None] * (poly[idx + 1] - poly[idx])
+
+    def _human_plan(self, human_pos, task):
+        """Human's REMAINING planned path as an XZ polyline (its oracle nav
+        plan to its goal -- privileged sim info, fine for a training reward)."""
+        goal = task.my_nav_to_info.human_info.nav_goal_pos
+        path = habitat_sim.ShortestPath()
+        path.requested_start = np.array(human_pos)
+        path.requested_end = np.array(goal)
+        if self._sim.pathfinder.find_path(path) and len(path.points) >= 2:
+            return np.array([[p[0], p[2]] for p in path.points])
+        return np.array(
+            [[human_pos[0], human_pos[2]], [float(goal[0]), float(goal[2])]]
+        )
 
     def update_metric(self, *args, episode, task, observations, **kwargs):
         super().update_metric(
@@ -119,6 +190,9 @@ class SocialNavReward(RearrangeReward):
 
         # Start social nav reward
         social_nav_reward = 0.0
+        # Snapshot so the first-step zeroing below can roll the component sums
+        # back too (otherwise the breakdown would not add up to `reward`).
+        _comp_snapshot = dict(self.comp_sums)
 
         ### CADRL Reward structure ###
 
@@ -183,39 +257,164 @@ class SocialNavReward(RearrangeReward):
             DidAgentsCollide._get_uuid()
         ].get_metric()
         if did_collide:
-            task.should_end = True
             social_nav_reward -= self._collide_penalty
+            self.comp_sums["collide"] -= self._collide_penalty
+            if self._end_on_collide:
+                task.should_end = True
         #### CADRL style reward ####
-        else:
+        # Shaping runs unless the episode is being terminated by this collision.
+        # With end_on_collide=False the robot keeps a dense learning signal
+        # right through a (non-terminal) collision, so it can recover and still
+        # experience the human clearing — instead of every contact truncating
+        # the episode with a large negative return.
+        if not (did_collide and self._end_on_collide):
             # Dense goal-progress reward: positive when the robot reduces the
             # distance to its goal, negative when it moves away. This gives the
             # high-level policy a gradient toward picking `go_to_goal` when it is
             # safe to do so (otherwise the only goal signal is the sparse success
             # bonus, which the policy never reaches).
             if self._prev_dist_to_goal >= 0.0:
-                social_nav_reward += self._goal_progress_reward * (
+                _gp = self._goal_progress_reward * (
                     self._prev_dist_to_goal - dist_to_goal
                 )
+                social_nav_reward += _gp
+                self.comp_sums["goal_progress"] += _gp
 
-            # Social back-off shaping: when the human is inside the safety
-            # radius, penalize being too close AND reward actively increasing the
-            # robot-human distance (backing off). This rewards the desired
-            # behavior of backing off / yielding when the human gets close.
+            # Proximity penalty: being closer than the safety radius is bad.
             if dis < self._safe_dis_min:
                 social_nav_reward -= (self._safe_dis_min - dis)
-                if self._prev_dist >= 0.0:
-                    social_nav_reward += self._backoff_reward * (
-                        dis - self._prev_dist
-                    )
+                self.comp_sums["proximity"] -= (self._safe_dis_min - dis)
+
+            # Dense yield shaping (potential-based): reward actively increasing
+            # the robot-human distance whenever the human is within the wider
+            # awareness radius `yield_dis`, not only inside safe_dis_min. This
+            # gives an early, dense gradient to start yielding as the human
+            # approaches — instead of the switch paying off only at the terminal
+            # success. Being potential-based (Φ = backoff_reward * dis, so the
+            # per-step reward telescopes), it densifies credit assignment
+            # without rewarding fleeing over a full episode.
+            if dis < self._yield_dis and self._prev_dist >= 0.0:
+                _bo = self._backoff_reward * (dis - self._prev_dist)
+                social_nav_reward += _bo
+                self.comp_sums["backoff"] += _bo
+
+        # --- Layer-2/3 shaping (2026-08 yield-geometry diagnosis) ---
+        self._num_steps += 1
+        robot_xz = np.array([robot_pos[0], robot_pos[2]], dtype=np.float64)
+        human_xz = np.array([human_pos[0], human_pos[2]], dtype=np.float64)
+        if self._prev_human_xz is not None:
+            self._human_speed_ema = (
+                0.9 * self._human_speed_ema
+                + 0.1 * float(np.linalg.norm(human_xz - self._prev_human_xz))
+            )
+        self._prev_human_xz = human_xz
+
+        plan = None
+        if self._corridor_coef > 0 or self._release_bonus > 0:
+            plan = self._human_plan(human_pos, task)
+            plan_clear = self._dist_to_polyline(robot_xz, plan)
+
+        # Corridor potential: credit for LEAVING the human's planned corridor,
+        # nothing for retreating beyond corridor_safe, negative for re-entry.
+        if self._corridor_coef > 0 and not (
+            did_collide and self._end_on_collide
+        ):
+            phi = -max(0.0, self._corridor_safe - plan_clear)
+            if self._prev_phi is not None:
+                _cor = self._corridor_coef * (phi - self._prev_phi)
+                social_nav_reward += _cor
+                self.comp_sums["corridor"] += _cor
+            self._prev_phi = phi
+
+        # Timely-release bonus: once per episode, on resuming goal progress
+        # after a hold, IF going now is kinematically clear of the human's
+        # planned motion (mpd_go >= release_mpd_min).
+        if self._release_bonus > 0:
+            # Scale-aware: nominal speed is ~0.008 m/step, so an absolute
+            # threshold (e.g. 1 cm/step) would never fire.
+            progressing = (
+                self._prev_dist_to_goal >= 0.0
+                and self._prev_dist_to_goal - dist_to_goal
+                > 0.5 * self._v_robot
+            )
+            if (
+                progressing
+                and not self._release_paid
+                and self._hold_steps >= self._release_hold
+            ):
+                to_goal = np.array(goal)[[0, 2]] - robot_xz
+                n = float(np.linalg.norm(to_goal))
+                tau = np.arange(0.0, 300.0, 5.0)
+                adv = np.minimum(self._v_robot * tau, n)
+                rpos = robot_xz + (to_goal / (n + 1e-9)) * adv[:, None]
+                hpos = self._walk_polyline(plan, self._human_speed_ema * tau)
+                mpd_go = float(
+                    np.min(np.linalg.norm(rpos - hpos, axis=1))
+                )
+                if mpd_go >= self._release_mpd:
+                    social_nav_reward += self._release_bonus
+                    self.comp_sums["release"] += self._release_bonus
+                    self._release_paid = True
+            self._hold_steps = 0 if progressing else self._hold_steps + 1
+
+        # Success-conditioned efficiency: same-step success recomputation
+        # (SocialNavToPosSucc = dist_to_goal < success_distance, but it
+        # updates AFTER this measure and the episode ends on success, so the
+        # measure's own flag would arrive one step too late).
+        if self._eff_success_reward > 0 and not self._eff_paid:
+            succ_cfg = task.measurements.measures[
+                "social_nav_to_pos_success"
+            ]._config
+            if dist_to_goal < succ_cfg.success_distance:
+                _eff = self._eff_success_reward * max(
+                    0.0, 1.0 - self._num_steps / self._eff_step_cap
+                )
+                social_nav_reward += _eff
+                self.comp_sums["efficiency"] += _eff
+                self._eff_paid = True
 
         # No shaping on the first step (no valid previous distances yet).
         if self._prev_dist < 0 or self._prev_dist_to_goal < 0.0:
             social_nav_reward = 0.0
+            self.comp_sums = _comp_snapshot
 
         self._metric += social_nav_reward
         # Update the distance
         self._prev_dist = dis  # type: ignore
         self._prev_dist_to_goal = dist_to_goal
+
+
+@registry.register_measure
+class SocialNavRewardBreakdown(Measure):
+    """Per-episode running sums of each `SocialNavReward` component.
+
+    `SocialNavReward._metric` is the PER-STEP reward and the evaluator only
+    stores a measure's final-step value, so component totals are invisible
+    downstream. This measure republishes the running sums that SocialNavReward
+    accumulates, as a dict -- `extract_scalars_from_info` flattens it into
+    `social_nav_reward_breakdown.goal_progress` etc., so per-episode eval stats
+    carry the full decomposition.
+
+    The two env-level terms (slack, success bonus) are NOT here: they are added
+    outside the measure (habitat/core/environments.py) and are exactly
+    recoverable as slack_reward * num_steps and success_reward * success.
+    """
+
+    cls_uuid: str = "social_nav_reward_breakdown"
+
+    @staticmethod
+    def _get_uuid(*args, **kwargs):
+        return SocialNavRewardBreakdown.cls_uuid
+
+    def reset_metric(self, *args, task, **kwargs):
+        task.measurements.check_measure_dependencies(
+            self.uuid, [SocialNavReward.cls_uuid]
+        )
+        self.update_metric(*args, task=task, **kwargs)
+
+    def update_metric(self, *args, task, **kwargs):
+        src = task.measurements.measures[SocialNavReward.cls_uuid]
+        self._metric = dict(getattr(src, "comp_sums", {}) or {})
 
 
 @registry.register_measure
@@ -966,8 +1165,29 @@ class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
         self._sim = sim
         self._backoff_dist = float(getattr(config, "backoff_dist", 2.0))
         self._clearance = float(getattr(config, "obstacle_clearance", 0.3))
+        # --- S2 clear-corridor yield knobs (default 'legacy' = old behavior) ---
+        self._yield_mode = str(getattr(config, "yield_mode", "legacy"))
+        self._corridor_clearance = float(
+            getattr(config, "corridor_clearance", 1.1)
+        )
+        self._human_goal_clearance = float(
+            getattr(config, "human_goal_clearance", 1.5)
+        )
+        self._include_door_dir = bool(
+            getattr(config, "include_door_dir", False)
+        )
+        self._recompute_human_motion = float(
+            getattr(config, "recompute_human_motion", 0.75)
+        )
+        self._include_branch = bool(getattr(config, "include_branch", False))
+        self._retreat_corridor_clearance = float(
+            getattr(config, "retreat_corridor_clearance", 0.0)
+        )
         self._target = None
+        self._last_branch = 0
         self._prev_ep_id = None
+        # Human position at the last target computation (corridor recompute).
+        self._last_human_xz = None
         super().__init__(config=config)
 
     def _get_uuid(self, *args, **kwargs):
@@ -977,8 +1197,11 @@ class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
         return SensorTypes.TENSOR
 
     def _get_observation_space(self, *args, config, **kwargs):
+        dim = 5 if bool(getattr(config, "include_door_dir", False)) else 3
+        if bool(getattr(config, "include_branch", False)):
+            dim += 1
         return spaces.Box(
-            shape=(3,),
+            shape=(dim,),
             low=np.finfo(np.float32).min,
             high=np.finfo(np.float32).max,
             dtype=np.float32,
@@ -993,15 +1216,61 @@ class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
         det = (p[0] - r1) * (c2 - c1) - (p[2] - c1) * (r2 - r1)
         return 1.0 if det > 0 else -1.0
 
+    @staticmethod
+    def _point_seg_dist_xz(p, a, b):
+        """XZ distance from point p to segment [a, b] (all 3-vectors)."""
+        p = np.array([p[0], p[2]], dtype=np.float64)
+        a = np.array([a[0], a[2]], dtype=np.float64)
+        b = np.array([b[0], b[2]], dtype=np.float64)
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        t = 0.0 if denom < 1e-9 else float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
+        return float(np.linalg.norm(p - (a + t * ab)))
+
+    def _dist_to_corridor(self, cand, corridor):
+        """Min XZ distance from cand to the human corridor polyline."""
+        return min(
+            self._point_seg_dist_xz(cand, corridor[i], corridor[i + 1])
+            for i in range(len(corridor) - 1)
+        )
+
+    def _human_route(self, pf, human_pos, human_goal, door_mid):
+        """The human's ACTUAL future route: its navmesh shortest path to the
+        goal. The straight [pos, door, goal] polyline under-covers the swept
+        area (the real path curves around furniture, and once the human is past
+        the door it no longer routes via the door), so a pocket that "clears"
+        the polyline can still sit ON the real route -> the firm human either
+        freezes against the robot (blocked-gate deadlock) or pushes into it
+        (pursuit collision). Falls back to the legacy polyline if pathing fails.
+        """
+        path = habitat_sim.ShortestPath()
+        path.requested_start = np.array(human_pos, dtype=np.float32)
+        path.requested_end = np.array(human_goal, dtype=np.float32)
+        if pf.find_path(path) and len(path.points) >= 2:
+            return [np.array(p, dtype=np.float64) for p in path.points]
+        return [human_pos, door_mid, human_goal]
+
     def _compute_target(self, task, robot_pos):
-        """Door-relative backoff point on the robot's start side, validated
-        against the navmesh. Falls back to the spawn if nothing valid is found."""
+        """Yield target on the robot's start side, validated against the navmesh.
+
+        ``legacy``: straight-back point ~backoff_dist behind the door (old).
+        ``corridor``: clear the human's path corridor -- pick the navigable
+        start-side point nearest the robot that keeps >= corridor_clearance
+        from the human polyline [human_pos, door_mid, human_goal] and
+        >= human_goal_clearance from the human goal.
+
+        Returns ``(target, branch)``: branch 0 = validated pocket, 1 = no valid
+        pocket. On branch 1 corridor mode holds IN PLACE (target = robot
+        position, an explicit defined behavior) instead of the old silent
+        reverse-to-spawn, which was never validated against the human's route.
+        Legacy mode keeps the spawn fallback byte-for-byte.
+        """
         pf = self._sim.pathfinder
         info = getattr(self._sim.ep_info, "info", {}) or {}
         nav_info = getattr(task, "my_nav_to_info", None)
         robot_info = getattr(nav_info, "robot_info", None) if nav_info else None
         if robot_info is None or "door_start" not in info or "door_end" not in info:
-            return None
+            return None, 1
 
         door_start = np.array(info["door_start"], dtype=np.float64)
         door_end = np.array(info["door_end"], dtype=np.float64)
@@ -1027,13 +1296,23 @@ class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
             c, s = np.cos(t), np.sin(t)
             return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
 
-        # Straight-back (0 deg) first, then fan out into the start-side corridor.
-        angles = [0, 30, -30, 60, -60, 90, -90]
-        radii = [
-            self._backoff_dist,
-            self._backoff_dist * 0.75,
-            self._backoff_dist * 0.5,
-        ]
+        corridor_mode = self._yield_mode == "corridor"
+        if corridor_mode:
+            # Fan wider (incl. lateral / oblique-back) and DROP the straight-back
+            # priority; selection is by proximity to the robot + corridor clearance.
+            angles = [0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150]
+            radii = [
+                self._backoff_dist,
+                self._backoff_dist * 0.75,
+                self._backoff_dist * 0.5,
+            ]
+        else:
+            angles = [0, 30, -30, 60, -60, 90, -90]
+            radii = [
+                self._backoff_dist,
+                self._backoff_dist * 0.75,
+                self._backoff_dist * 0.5,
+            ]
         candidates = []
         for r in radii:
             for a in angles:
@@ -1042,7 +1321,43 @@ class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
                 cand[1] = door_mid[1]
                 candidates.append(cand)
 
-        def _validate(cand, clearance):
+        if corridor_mode:
+            # Door-anchored candidates only cover ~backoff_dist around the door.
+            # When the door sits in a narrow single-file corridor there is NO
+            # lateral clearance beside it -- the yield pocket is further down the
+            # corridor (a side room the robot passed). Also fan a FULL circle
+            # around the ROBOT out to a few metres so the nearest corridor-clearing
+            # pocket (in any direction) becomes a candidate. Selection below still
+            # picks the valid one nearest the robot (minimum detour).
+            robot_xz = np.array([robot_pos[0], robot_pos[2]], dtype=np.float64)
+            # Radii scale off backoff_dist (config-driven); at the default 2.0
+            # this reproduces the validated 1.0..3.5 m sweep. Nearest valid wins,
+            # so a generous sweep costs nothing when close pockets exist.
+            for frac in (0.5, 0.75, 1.0, 1.25, 1.5, 1.75):
+                r = self._backoff_dist * frac
+                for a in range(0, 360, 30):
+                    dir2 = _rotate(np.array([1.0, 0.0]), a)
+                    cand = np.array(
+                        [robot_xz[0] + dir2[0] * r, door_mid[1],
+                         robot_xz[1] + dir2[1] * r],
+                        dtype=np.float64,
+                    )
+                    candidates.append(cand)
+
+        # Human corridor polyline (corridor mode only).
+        corridor = None
+        human_goal = None
+        if corridor_mode and nav_info is not None and getattr(nav_info, "human_info", None) is not None:
+            human_pos = np.array(
+                self._sim.get_agent_data(1).articulated_agent.base_pos,
+                dtype=np.float64,
+            )
+            human_goal = np.array(
+                nav_info.human_info.nav_goal_pos, dtype=np.float64
+            )
+            corridor = self._human_route(pf, human_pos, human_goal, door_mid)
+
+        def _validate(cand, clearance, corridor_clear, retreat_clear=0.0):
             snapped = np.array(pf.snap_point(cand), dtype=np.float64)
             if np.any(np.isnan(snapped)) or not pf.is_navigable(snapped):
                 return None
@@ -1053,20 +1368,107 @@ class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
                 < clearance
             ):
                 return None
+            if corridor is not None:
+                if self._dist_to_corridor(snapped, corridor) < corridor_clear:
+                    return None
+                if (
+                    human_goal is not None
+                    and float(np.linalg.norm((snapped - human_goal)[[0, 2]]))
+                    < self._human_goal_clearance
+                ):
+                    return None
             path = habitat_sim.ShortestPath()
             path.requested_start = np.array(robot_pos, dtype=np.float32)
             path.requested_end = snapped.astype(np.float32)
             if not pf.find_path(path):
                 return None  # unreachable
+            if retreat_clear > 0.0 and corridor is not None:
+                # The RETREAT PATH must clear the human's route too: a pocket
+                # that itself clears the corridor is useless if the reverse
+                # drive to it crosses the corridor (the robot backs blind into
+                # the oncoming human). The first ~1 m around the robot is
+                # exempt -- the robot usually starts ON the corridor, escaping
+                # it is the whole point.
+                pts = [np.array(p, dtype=np.float64) for p in path.points]
+                for a, b in zip(pts[:-1], pts[1:]):
+                    seg = b - a
+                    seg_len = float(np.linalg.norm(seg[[0, 2]]))
+                    n = max(1, int(seg_len / 0.25))
+                    for t in range(n + 1):
+                        q = a + seg * (t / n)
+                        if float(np.linalg.norm((q - robot_pos)[[0, 2]])) < 1.0:
+                            continue
+                        if self._dist_to_corridor(q, corridor) < retreat_clear:
+                            return None
             return snapped
 
+        if corridor_mode:
+            # Pass 1-2: full then relaxed corridor clearance, both requiring
+            # the retreat path to clear the corridor; pass 3 drops the retreat
+            # check (a crossing pocket beats no pocket -- the yield skill's
+            # human_stop_dist floor prevents actually backing into the human).
+            # With retreat_corridor_clearance=0 (legacy) passes collapse to the
+            # old two.
+            passes = []
+            if self._retreat_corridor_clearance > 0.0:
+                passes += [
+                    (self._corridor_clearance, self._retreat_corridor_clearance),
+                    (
+                        self._corridor_clearance * 0.75,
+                        self._retreat_corridor_clearance,
+                    ),
+                ]
+            passes += [
+                (self._corridor_clearance, 0.0),
+                (self._corridor_clearance * 0.75, 0.0),
+            ]
+            for corridor_clear, retreat_clear in passes:
+                best, best_d = None, None
+                for cand in candidates:
+                    ok = _validate(
+                        cand, self._clearance, corridor_clear, retreat_clear
+                    )
+                    if ok is None:
+                        continue
+                    dr = float(np.linalg.norm((ok - robot_pos)[[0, 2]]))
+                    if best_d is None or dr < best_d:
+                        best, best_d = ok, dr
+                if best is not None:
+                    self._last_corridor_dist = (
+                        self._dist_to_corridor(best, corridor)
+                        if corridor is not None
+                        else -1.0
+                    )
+                    print(
+                        f"[YieldSensor] branch=pocket "
+                        f"dist_to_corridor={self._last_corridor_dist:.2f} "
+                        f"robot_detour={best_d:.2f}",
+                        flush=True,
+                    )
+                    return best, 0
+            print(
+                "[YieldSensor] corridor-mode fallback to legacy candidates",
+                flush=True,
+            )
+
+        # Legacy ordering: first valid (straight-back preferred).
         for clearance in (self._clearance, self._clearance / 2.0):
             for cand in candidates:
-                ok = _validate(cand, clearance)
+                ok = _validate(cand, clearance, 0.0)
                 if ok is not None:
-                    return ok
+                    return ok, 0
 
-        # Fallback: original spawn behavior.
+        if corridor_mode:
+            # No valid pocket anywhere: hold in place. The stand-still is the
+            # DEFINED fallback (remaining ~ 0 keeps the yield skill parked); the
+            # HL teacher/student sees branch=1 in the observation.
+            print("[YieldSensor] branch=hold (no valid pocket)", flush=True)
+            snapped = np.array(pf.snap_point(robot_pos), dtype=np.float64)
+            if np.any(np.isnan(snapped)):
+                return np.array(robot_pos, dtype=np.float64), 1
+            return snapped, 1
+
+        # Legacy fallback: original spawn behavior.
         print(
             "[BackoffWaypointDeltaSensor] no valid door-relative point; "
             "falling back to spawn",
@@ -1074,26 +1476,295 @@ class BackoffWaypointDeltaSensor(UsesArticulatedAgentInterface, Sensor):
         )
         snapped = np.array(pf.snap_point(start_pos), dtype=np.float64)
         if np.any(np.isnan(snapped)):
-            return np.array(robot_pos, dtype=np.float64)
-        return snapped
+            return np.array(robot_pos, dtype=np.float64), 1
+        return snapped, 1
+
+    def _door_dir_xz(self):
+        """World (x, z) delta from the robot to the door mid, for facing."""
+        info = getattr(self._sim.ep_info, "info", {}) or {}
+        if "door_start" not in info or "door_end" not in info:
+            return np.zeros(2, dtype=np.float32)
+        ds = np.array(info["door_start"], dtype=np.float64)
+        de = np.array(info["door_end"], dtype=np.float64)
+        door_mid = (ds + de) / 2.0
+        base_pos = np.array(
+            self._sim.get_agent_data(0).articulated_agent.base_pos
+        )
+        delta = (door_mid - base_pos)[[0, 2]]
+        return delta.astype(np.float32)
+
+    def _target_still_valid(self, task):
+        """Hysteresis: is the CURRENT yield target still clearing the human's
+        corridor? If so we keep it (do not hop to a new candidate) so the
+        reverse-drive controller doesn't oscillate as the human moves."""
+        if self._target is None:
+            return False
+        if self._last_branch != 0:
+            # Hold-in-place has no pocket to invalidate; re-picking every
+            # human step would churn. A pocket may open later, so the episode
+            # boundary (not human motion) is the only recompute trigger.
+            return True
+        info = getattr(self._sim.ep_info, "info", {}) or {}
+        nav_info = getattr(task, "my_nav_to_info", None)
+        human_info = getattr(nav_info, "human_info", None) if nav_info else None
+        if "door_start" not in info or human_info is None:
+            return True  # no door/human info -> don't churn the target
+        ds = np.array(info["door_start"], dtype=np.float64)
+        de = np.array(info["door_end"], dtype=np.float64)
+        door_mid = (ds + de) / 2.0
+        human_pos = np.array(
+            self._sim.get_agent_data(1).articulated_agent.base_pos,
+            dtype=np.float64,
+        )
+        human_goal = np.array(human_info.nav_goal_pos, dtype=np.float64)
+        corridor = self._human_route(
+            self._sim.pathfinder, human_pos, human_goal, door_mid
+        )
+        d_corr = self._dist_to_corridor(self._target, corridor)
+        d_hgoal = float(np.linalg.norm((self._target - human_goal)[[0, 2]]))
+        return (
+            d_corr >= self._corridor_clearance
+            and d_hgoal >= self._human_goal_clearance
+        )
 
     def get_observation(self, task, *args, **kwargs):
+        out_dim = (5 if self._include_door_dir else 3) + (
+            1 if self._include_branch else 0
+        )
         agent_id = self.agent_id if self.agent_id is not None else 0
         if agent_id != 0:
-            return np.zeros(3, dtype=np.float32)  # backoff is robot-only
+            return np.zeros(out_dim, dtype=np.float32)  # yield is robot-only
 
         base_pos = np.array(
             self._sim.get_agent_data(agent_id).articulated_agent.base_pos
         )
 
         ep_id = getattr(self._sim.ep_info, "episode_id", None)
-        if self._target is None or ep_id != self._prev_ep_id:
-            self._target = self._compute_target(task, base_pos)
+        human_xz = np.array(
+            self._sim.get_agent_data(1).articulated_agent.base_pos
+        )[[0, 2]]
+        need_recompute = self._target is None or ep_id != self._prev_ep_id
+        # Corridor mode: when the human has moved enough, only RE-pick the yield
+        # target if the current one is no longer clearing the corridor
+        # (hysteresis) -- otherwise keep it to avoid fore/aft oscillation.
+        if (
+            self._yield_mode == "corridor"
+            and self._last_human_xz is not None
+            and float(np.linalg.norm(human_xz - self._last_human_xz))
+            >= self._recompute_human_motion
+        ):
+            self._last_human_xz = human_xz  # reset the motion reference
+            if not self._target_still_valid(task):
+                need_recompute = True
+        # Hold-in-place must track the robot: once it has moved off the stored
+        # hold point, re-plan (also the upgrade path if a pocket opened up).
+        if (
+            not need_recompute
+            and self._last_branch != 0
+            and self._target is not None
+            and float(np.linalg.norm((base_pos - self._target)[[0, 2]])) > 0.5
+        ):
+            need_recompute = True
+        if need_recompute:
+            self._target, self._last_branch = self._compute_target(
+                task, base_pos
+            )
             self._prev_ep_id = ep_id
-        if self._target is None:
-            return np.zeros(3, dtype=np.float32)
+            self._last_human_xz = human_xz
 
-        return _geodesic_next_waypoint(self._sim, base_pos, self._target)
+        if self._target is None:
+            out = np.zeros(out_dim, dtype=np.float32)
+            if self._include_branch:
+                out[-1] = float(self._last_branch)
+            return out
+
+        wp = _geodesic_next_waypoint(self._sim, base_pos, self._target)
+        vals = [wp[0], wp[1], wp[2]]
+        if self._include_door_dir:
+            door_dir = self._door_dir_xz()
+            vals += [door_dir[0], door_dir[1]]
+        if self._include_branch:
+            vals.append(float(self._last_branch))
+        return np.array(vals, dtype=np.float32)
+
+
+@registry.register_sensor
+class TopDownConflictMapSensor(UsesArticulatedAgentInterface, Sensor):
+    """S7-lite egocentric top-down conflict map, uint8 (S, S, 4), robot-centred
+    and heading-aligned (forward = up). Channels: (0) static occupancy,
+    (1) human disc + fading trail, (2) robot goal disc, (3) door line.
+    Static occupancy is cached once per scene; each step is one cv2 affine.
+    NOTE: verify orientation visually once per install (dump snippet in
+    hrl_pipeline/FRAMEWORKS_HOWTO.md) before large runs.
+    """
+
+    cls_uuid: str = "topdown_conflict_map"
+
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        self._size = int(getattr(config, "map_size", 64))
+        self._mpp = float(getattr(config, "meters_per_pixel", 0.1))
+        self._trail_len = int(getattr(config, "trail_len", 30))
+        super().__init__(config=config)
+        self._cache = {}
+        self._trail: list = []
+        self._prev_ep = None
+
+    def _get_uuid(self, *args, **kwargs):
+        return TopDownConflictMapSensor.cls_uuid
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        return spaces.Box(
+            shape=(self._size, self._size, 4), low=0, high=255, dtype=np.uint8
+        )
+
+    def _static_grid(self):
+        from habitat.utils.visualizations import maps
+
+        key = getattr(self._sim.ep_info, "scene_id", "?")
+        if key not in self._cache:
+            base_y = float(
+                self._sim.get_agent_data(0).articulated_agent.base_pos[1]
+            )
+            td = maps.get_topdown_map(
+                self._sim.pathfinder, height=base_y,
+                meters_per_pixel=self._mpp, draw_border=False,
+            )
+            occ = ((td == 0) * 255).astype(np.uint8)  # 255 = obstacle
+            lower, _ = self._sim.pathfinder.get_bounds()
+            self._cache[key] = (occ, np.array(lower, dtype=np.float64))
+        return self._cache[key]
+
+    def _world_to_grid(self, p, lower):
+        # maps.get_topdown_map convention: row ~ z, col ~ x.
+        return (
+            (p[0] - lower[0]) / self._mpp,   # col
+            (p[2] - lower[2]) / self._mpp,   # row
+        )
+
+    def get_observation(self, task, *args, **kwargs):
+        import cv2
+
+        agent_id = self.agent_id if self.agent_id is not None else 0
+        out = np.zeros((self._size, self._size, 4), dtype=np.uint8)
+        if agent_id != 0:
+            return out
+        grid, lower = self._static_grid()
+        agent = self._sim.get_agent_data(0).articulated_agent
+        pos = np.array(agent.base_pos, dtype=np.float64)
+        yaw = float(agent.base_rot)
+        col, row = self._world_to_grid(pos, lower)
+
+        # Rotate so the robot's forward axis points UP in the crop, then
+        # translate the robot to the crop centre.
+        fwd = np.array([math.cos(yaw), -math.sin(yaw)])  # (x, z)
+        ang_deg = math.degrees(math.atan2(fwd[1], fwd[0]))  # angle in (col,row)
+        M = cv2.getRotationMatrix2D((col, row), ang_deg + 90.0, 1.0)
+        M[0, 2] += self._size / 2.0 - col
+        M[1, 2] += self._size / 2.0 - row
+        out[:, :, 0] = cv2.warpAffine(
+            grid, M, (self._size, self._size), flags=cv2.INTER_NEAREST,
+            borderValue=255,
+        )
+
+        def to_crop(p_world):
+            c, r = self._world_to_grid(np.asarray(p_world, dtype=np.float64), lower)
+            v = M @ np.array([c, r, 1.0])
+            return int(round(v[0])), int(round(v[1]))
+
+        # Human disc + fading trail.
+        ep_id = getattr(self._sim.ep_info, "episode_id", None)
+        if ep_id != self._prev_ep:
+            self._trail = []
+            self._prev_ep = ep_id
+        human = np.array(
+            self._sim.get_agent_data(1).articulated_agent.base_pos,
+            dtype=np.float64,
+        )
+        self._trail.append(human.copy())
+        if len(self._trail) > self._trail_len:
+            self._trail = self._trail[-self._trail_len:]
+        ch1 = out[:, :, 1].copy()
+        n = len(self._trail)
+        for i, hp in enumerate(self._trail[:-1]):
+            cv2.circle(ch1, to_crop(hp), 1, int(60 + 140 * (i + 1) / n), -1)
+        cv2.circle(ch1, to_crop(human), max(1, int(0.3 / self._mpp)), 255, -1)
+        out[:, :, 1] = ch1
+
+        # Robot goal disc.
+        nav_info = getattr(task, "my_nav_to_info", None)
+        if nav_info is not None and getattr(nav_info, "robot_info", None) is not None:
+            goal = np.asarray(nav_info.robot_info.nav_goal_pos, dtype=np.float64)
+            ch2 = out[:, :, 2].copy()
+            cv2.circle(ch2, to_crop(goal), max(1, int(0.3 / self._mpp)), 255, -1)
+            out[:, :, 2] = ch2
+
+        # Door line.
+        info = getattr(self._sim.ep_info, "info", {}) or {}
+        if "door_start" in info and "door_end" in info:
+            ch3 = out[:, :, 3].copy()
+            cv2.line(ch3, to_crop(info["door_start"]), to_crop(info["door_end"]), 255, 2)
+            out[:, :, 3] = ch3
+        return out
+
+
+@registry.register_sensor
+class LidarScanSensor(UsesArticulatedAgentInterface, Sensor):
+    """Robot-frame K-ray range scan sampled on the RUNTIME navmesh (furniture
+    included) -- a simulated 2D lidar. Ray 0 points along the robot's forward
+    axis; rays proceed counter-clockwise in the same frame convention as
+    SocialNavPolicyStateSensor (forward=(cos yaw, -sin yaw)). This is the
+    deployment-legal local-geometry observation for the LEARNED yield skill
+    (replaces the privileged pocket planner's map access).
+    """
+
+    cls_uuid: str = "lidar_scan"
+
+    def __init__(self, sim, config, *args, **kwargs):
+        # Set fields BEFORE super().__init__ -- the Sensor base constructor
+        # calls _get_observation_space, which needs them.
+        self._sim = sim
+        self._num_rays = int(getattr(config, "num_rays", 16))
+        self._max_range = float(getattr(config, "max_range", 3.0))
+        self._step = float(getattr(config, "ray_step", 0.1))
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args, **kwargs):
+        return LidarScanSensor.cls_uuid
+
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args, config, **kwargs):
+        return spaces.Box(
+            shape=(self._num_rays,), low=0.0, high=self._max_range,
+            dtype=np.float32,
+        )
+
+    def get_observation(self, task, *args, **kwargs):
+        agent_id = self.agent_id if self.agent_id is not None else 0
+        agent = self._sim.get_agent_data(agent_id).articulated_agent
+        pos = np.array(agent.base_pos, dtype=np.float64)
+        yaw = float(agent.base_rot)
+        fwd = np.array([math.cos(yaw), -math.sin(yaw)])
+        lat = np.array([fwd[1], -fwd[0]])
+        pf = self._sim.pathfinder
+        out = np.full(self._num_rays, self._max_range, dtype=np.float32)
+        n_steps = int(self._max_range / self._step)
+        for k in range(self._num_rays):
+            phi = 2.0 * math.pi * k / self._num_rays
+            d = math.cos(phi) * fwd + math.sin(phi) * lat
+            for i in range(1, n_steps + 1):
+                t = i * self._step
+                q = np.array([pos[0] + d[0] * t, pos[1], pos[2] + d[1] * t],
+                             dtype=np.float32)
+                if not pf.is_navigable(q):
+                    out[k] = t
+                    break
+        return out
 
 
 @registry.register_sensor
@@ -1110,9 +1781,16 @@ class SocialNavPolicyStateSensor(UsesArticulatedAgentInterface, Sensor):
       (bearing in [-pi, pi], 0 = straight ahead).
     - human_rel_heading: human heading minus robot heading, wrapped to [-pi, pi].
     - human_rel_speed: magnitude of the human's velocity relative to the robot
-      (m/s), from a finite difference of base positions.
+      (m/s), from a finite difference of base positions. NOTE: unsigned and
+      polluted by ego motion (a parked human "moves" at the robot's own speed).
     - goal_dist / goal_bearing: polar position of the robot's nav goal in the
       robot frame.
+
+    With ``include_approach_speed`` a 7th dim is appended:
+
+    - human_approach_speed: the human's ABSOLUTE velocity projected onto the
+      human->robot direction (m/s, EMA-smoothed). Positive = human closing in,
+      ~0 = parked, negative = receding — regardless of what the robot does.
 
     Only supports 2-agent setups (robot = this agent, human = the other agent).
     Per-agent duplication (``agent_0_*`` / ``agent_1_*``) is handled by
@@ -1126,6 +1804,11 @@ class SocialNavPolicyStateSensor(UsesArticulatedAgentInterface, Sensor):
         self._prev_robot_xz = None
         self._prev_human_xz = None
         self._prev_episode_id = None
+        self._include_approach = bool(
+            getattr(config, "include_approach_speed", False)
+        )
+        self._approach_alpha = float(getattr(config, "approach_ema_alpha", 0.2))
+        self._approach_ema = 0.0
         # Control timestep used for the relative-speed finite difference. Falls
         # back to 1.0 (i.e. per-step displacement) if the sim config is missing.
         self._dt = 1.0
@@ -1145,8 +1828,9 @@ class SocialNavPolicyStateSensor(UsesArticulatedAgentInterface, Sensor):
         return SensorTypes.TENSOR
 
     def _get_observation_space(self, *args, config, **kwargs):
+        dim = 7 if getattr(config, "include_approach_speed", False) else 6
         return spaces.Box(
-            shape=(6,),
+            shape=(dim,),
             low=np.finfo(np.float32).min,
             high=np.finfo(np.float32).max,
             dtype=np.float32,
@@ -1211,27 +1895,40 @@ class SocialNavPolicyStateSensor(UsesArticulatedAgentInterface, Sensor):
             self._prev_robot_xz = None
             self._prev_human_xz = None
             self._prev_episode_id = ep_id
+            self._approach_ema = 0.0
         human_rel_speed = 0.0
+        approach_raw = 0.0
         if self._prev_robot_xz is not None and self._dt > 0:
             rel_vel = (
                 (human_xz - self._prev_human_xz)
                 - (robot_xz - self._prev_robot_xz)
             ) / self._dt
             human_rel_speed = float(np.linalg.norm(rel_vel))
+            # Human ABSOLUTE velocity projected onto human->robot: positive
+            # only when the human itself is closing in (ego-motion invariant).
+            human_vel = (human_xz - self._prev_human_xz) / self._dt
+            to_robot = robot_xz - human_xz
+            n_tr = np.linalg.norm(to_robot)
+            if n_tr > 1e-8:
+                approach_raw = float(human_vel @ (to_robot / n_tr))
         self._prev_robot_xz = robot_xz
         self._prev_human_xz = human_xz
 
-        return np.array(
-            [
-                human_dist,
-                human_bearing,
-                human_rel_heading,
-                human_rel_speed,
-                goal_dist,
-                goal_bearing,
-            ],
-            dtype=np.float32,
-        )
+        feats = [
+            human_dist,
+            human_bearing,
+            human_rel_heading,
+            human_rel_speed,
+            goal_dist,
+            goal_bearing,
+        ]
+        if self._include_approach:
+            self._approach_ema = (
+                self._approach_alpha * approach_raw
+                + (1.0 - self._approach_alpha) * self._approach_ema
+            )
+            feats.append(self._approach_ema)
+        return np.array(feats, dtype=np.float32)
 
 
 @registry.register_sensor
@@ -1305,3 +2002,216 @@ class RobotTrajectoryBufferSensor(UsesArticulatedAgentInterface, Sensor):
             out[self._buffer_size - n :] = arr
             out[: self._buffer_size - n] = arr[0]  # front-pad with the oldest point
         return out.reshape(-1)  # (buffer_size*2,)
+
+
+def _door_side_sign(door_start, door_end, p):
+    """Sign of the 2D cross product about the door line in the XZ plane.
+    Mirrors ``BackoffWaypointDeltaSensor._side_sign`` so measures and the
+    yield sensor agree on which side of the door a point lies on."""
+    r1, r2 = door_start[0], door_end[0]
+    c1, c2 = door_start[2], door_end[2]
+    det = (p[0] - r1) * (c2 - c1) - (p[2] - c1) * (r2 - r1)
+    return 1.0 if det > 0 else -1.0
+
+
+def _door_perp_dist(door_start, door_end, p):
+    """Perpendicular XZ distance from point ``p`` to the (infinite) door line."""
+    a = np.array([door_start[0], door_start[2]], dtype=np.float64)
+    b = np.array([door_end[0], door_end[2]], dtype=np.float64)
+    q = np.array([p[0], p[2]], dtype=np.float64)
+    ab = b - a
+    n = float(np.linalg.norm(ab))
+    if n < 1e-9:
+        return float(np.linalg.norm(q - a))
+    return float(abs(np.cross(ab, q - a)) / n)
+
+
+@registry.register_measure
+class HumanPassedDoor(Measure):
+    """1.0 (latched) once the human has crossed to the robot's start side of
+    the door AND is > 0.3 m past the door line. Robot-only episodes leave it 0."""
+
+    cls_uuid: str = "human_passed_door"
+
+    def __init__(self, *args, sim, config, **kwargs):
+        self._sim = sim
+        self._config = config
+        self._passed = False
+        super().__init__(*args, sim=sim, config=config, **kwargs)
+
+    @staticmethod
+    def _get_uuid(*args, **kwargs):
+        return HumanPassedDoor.cls_uuid
+
+    def reset_metric(self, *args, task, **kwargs):
+        self._passed = False
+        self.update_metric(*args, task=task, **kwargs)
+
+    def update_metric(self, *args, task, **kwargs):
+        if self._passed:
+            self._metric = 1.0
+            return
+        info = getattr(self._sim.ep_info, "info", {}) or {}
+        if "door_start" not in info or "door_end" not in info:
+            self._metric = 0.0
+            return
+        ds = np.array(info["door_start"], dtype=np.float64)
+        de = np.array(info["door_end"], dtype=np.float64)
+        robot_start = np.array(task.my_nav_to_info.robot_info.articulated_agent_start_pos, dtype=np.float64)
+        robot_side = _door_side_sign(ds, de, robot_start)
+        human_pos = np.array(self._sim.get_agent_data(1).articulated_agent.base_pos, dtype=np.float64)
+        if (
+            _door_side_sign(ds, de, human_pos) == robot_side
+            and _door_perp_dist(ds, de, human_pos) > 0.3
+        ):
+            self._passed = True
+        self._metric = 1.0 if self._passed else 0.0
+
+
+@registry.register_measure
+class HumanDelay(Measure):
+    """Extra seconds the human spent reaching its goal vs. an unobstructed
+    nominal (geodesic / speed). Freezes once the human reaches its goal."""
+
+    cls_uuid: str = "human_delay"
+
+    def __init__(self, *args, sim, config, **kwargs):
+        self._sim = sim
+        self._config = config
+        self._steps = 0
+        self._nominal = 0.0
+        self._frozen_val = None
+        self._dt = 1.0
+        try:
+            cf = float(self._sim.habitat_config.ctrl_freq)
+            afr = float(self._sim.habitat_config.ac_freq_ratio)
+            if cf > 0:
+                self._dt = afr / cf
+        except Exception:
+            self._dt = 1.0
+        super().__init__(*args, sim=sim, config=config, **kwargs)
+
+    @staticmethod
+    def _get_uuid(*args, **kwargs):
+        return HumanDelay.cls_uuid
+
+    def reset_metric(self, *args, task, **kwargs):
+        self._steps = 0
+        self._frozen_val = None
+        speed = float(getattr(self._config, "human_speed", 0.8)) or 0.8
+        try:
+            info = getattr(self._sim.ep_info, "info", {}) or {}
+            hs = np.array(info["human_start"], dtype=np.float32)
+            hg = np.array(task.my_nav_to_info.human_info.nav_goal_pos, dtype=np.float32)
+            geo = self._sim.geodesic_distance(hs, hg)
+            if not np.isfinite(geo):
+                geo = float(np.linalg.norm((hs - hg)[[0, 2]]))
+            self._nominal = geo / speed
+        except Exception:
+            self._nominal = 0.0
+        self.update_metric(*args, task=task, **kwargs)
+
+    def update_metric(self, *args, task, **kwargs):
+        self._steps += 1
+        if self._frozen_val is not None:
+            self._metric = self._frozen_val
+            return
+        hg = np.array(task.my_nav_to_info.human_info.nav_goal_pos, dtype=np.float64)
+        hp = np.array(self._sim.get_agent_data(1).articulated_agent.base_pos, dtype=np.float64)
+        elapsed = self._steps * self._dt
+        val = max(0.0, elapsed - self._nominal)
+        if float(np.linalg.norm((hp - hg)[[0, 2]])) < 0.4:
+            self._frozen_val = val
+        self._metric = val
+
+
+@registry.register_measure
+class MinAgentClearance(Measure):
+    """Running minimum XZ distance between the robot and human base positions."""
+
+    cls_uuid: str = "min_agent_clearance"
+
+    def __init__(self, *args, sim, config, **kwargs):
+        self._sim = sim
+        self._config = config
+        self._min = float("inf")
+        super().__init__(*args, sim=sim, config=config, **kwargs)
+
+    @staticmethod
+    def _get_uuid(*args, **kwargs):
+        return MinAgentClearance.cls_uuid
+
+    def reset_metric(self, *args, task, **kwargs):
+        self._min = float("inf")
+        self.update_metric(*args, task=task, **kwargs)
+
+    def update_metric(self, *args, task, **kwargs):
+        r = np.array(self._sim.get_agent_data(0).articulated_agent.base_pos, dtype=np.float64)
+        h = np.array(self._sim.get_agent_data(1).articulated_agent.base_pos, dtype=np.float64)
+        d = float(np.linalg.norm((r - h)[[0, 2]]))
+        self._min = min(self._min, d)
+        self._metric = self._min
+
+
+@registry.register_measure
+class HumanFrozenWhileClear(Measure):
+    """Max consecutive steps where the human is nearly still (< 0.05 m/s) while
+    the robot is > 1.0 m off the human's straight line to its goal and the
+    human has not reached its goal. Detects a firm human that fails to resume."""
+
+    cls_uuid: str = "human_frozen_while_clear"
+
+    def __init__(self, *args, sim, config, **kwargs):
+        self._sim = sim
+        self._config = config
+        self._prev_hp = None
+        self._run = 0
+        self._max_run = 0
+        self._dt = 1.0
+        try:
+            cf = float(self._sim.habitat_config.ctrl_freq)
+            afr = float(self._sim.habitat_config.ac_freq_ratio)
+            if cf > 0:
+                self._dt = afr / cf
+        except Exception:
+            self._dt = 1.0
+        super().__init__(*args, sim=sim, config=config, **kwargs)
+
+    @staticmethod
+    def _get_uuid(*args, **kwargs):
+        return HumanFrozenWhileClear.cls_uuid
+
+    def reset_metric(self, *args, task, **kwargs):
+        self._prev_hp = None
+        self._run = 0
+        self._max_run = 0
+        self.update_metric(*args, task=task, **kwargs)
+
+    @staticmethod
+    def _point_seg_dist(p, a, b):
+        p = np.asarray(p, dtype=np.float64)
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        t = 0.0 if denom < 1e-9 else float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
+        return float(np.linalg.norm(p - (a + t * ab)))
+
+    def update_metric(self, *args, task, **kwargs):
+        hp = np.array(self._sim.get_agent_data(1).articulated_agent.base_pos, dtype=np.float64)
+        hg = np.array(task.my_nav_to_info.human_info.nav_goal_pos, dtype=np.float64)
+        rp = np.array(self._sim.get_agent_data(0).articulated_agent.base_pos, dtype=np.float64)
+        speed = 0.0
+        if self._prev_hp is not None and self._dt > 0:
+            speed = float(np.linalg.norm((hp - self._prev_hp)[[0, 2]]) / self._dt)
+        self._prev_hp = hp
+        at_goal = float(np.linalg.norm((hp - hg)[[0, 2]])) < 0.4
+        robot_off = (
+            self._point_seg_dist(rp[[0, 2]], hp[[0, 2]], hg[[0, 2]]) > 1.0
+        )
+        if speed < 0.05 and robot_off and not at_goal:
+            self._run += 1
+            self._max_run = max(self._max_run, self._run)
+        else:
+            self._run = 0
+        self._metric = float(self._max_run)

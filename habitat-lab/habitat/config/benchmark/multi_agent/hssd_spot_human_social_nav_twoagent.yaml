@@ -216,4 +216,4 @@ habitat:
       enable_physics: True
 
   dataset:
-    data_path: /habitat-lab/data/social_nav_episode_0415_570.json.gz
+    data_path: /habitat-lab/data/archive_20260817/social_nav_episode_0415_570.json.gz

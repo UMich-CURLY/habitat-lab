@@ -50,6 +50,7 @@ class PPO(nn.Module, Updater):
             use_normalized_advantage=config.use_normalized_advantage,
             entropy_target_factor=config.entropy_target_factor,
             use_adaptive_entropy_pen=config.use_adaptive_entropy_pen,
+            critic_lr=float(getattr(config, "critic_lr", 0.0) or 0.0),
         )
 
     def __init__(
@@ -67,6 +68,7 @@ class PPO(nn.Module, Updater):
         use_normalized_advantage: bool = True,
         entropy_target_factor: float = 0.0,
         use_adaptive_entropy_pen: bool = False,
+        critic_lr: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -101,6 +103,7 @@ class PPO(nn.Module, Updater):
             ).to(device=self.device)
 
         self.use_normalized_advantage = use_normalized_advantage
+        self._critic_lr = critic_lr
         self.optimizer = self._create_optimizer(lr, eps)
 
         self.non_ac_params = [
@@ -116,6 +119,31 @@ class PPO(nn.Module, Updater):
         )
         if len(params) > 0:
             optim_cls = optim.Adam
+            # Optional critic-specific learning rate. Adam moves each weight by
+            # ~lr per step, so a value head that must travel from its init
+            # range (|w|=1 -> output ~±2) to task returns (~±40) needs O(1e5)
+            # steps at the actor's lr -- it never fits, and the actor is then
+            # trained on advantages with no usable baseline. A separate, larger
+            # lr for the value head alone fixes the timescale without touching
+            # gradient magnitudes elsewhere. 0 (default) = single param group,
+            # i.e. exactly the previous behavior.
+            critic_lr = float(getattr(self, "_critic_lr", 0.0) or 0.0)
+            if critic_lr > 0:
+                critic_ids = {
+                    id(p)
+                    for name, p in self.named_parameters()
+                    if "._critic." in name and p.requires_grad
+                }
+                critic_params = [p for p in params if id(p) in critic_ids]
+                other_params = [p for p in params if id(p) not in critic_ids]
+                logger.info(
+                    f"critic_lr={critic_lr}: {len(critic_params)} critic "
+                    f"tensors at {critic_lr}, {len(other_params)} at {lr}"
+                )
+                params = [
+                    {"params": other_params, "lr": lr},
+                    {"params": critic_params, "lr": critic_lr},
+                ]
             optim_kwargs = dict(
                 params=params,
                 lr=lr,

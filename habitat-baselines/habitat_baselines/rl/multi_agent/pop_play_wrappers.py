@@ -517,8 +517,18 @@ class MultiStorage(Storage):
             storage.advance_rollout(buffer_index)
 
     def compute_returns(self, next_value, use_gae, gamma, tau):
-        for storage in self._active_storages:
-            storage.compute_returns(next_value, use_gae, gamma, tau)
+        # MultiPolicy.get_value stacks per-agent values on the last dim
+        # ([envs, 1, n_agents]); each agent's storage needs its own slice
+        # for the GAE bootstrap.
+        for agent_i, storage in enumerate(self._active_storages):
+            agent_value = next_value
+            if (
+                torch.is_tensor(next_value)
+                and next_value.dim() >= 3
+                and next_value.size(-1) == len(self._active_storages)
+            ):
+                agent_value = next_value[..., agent_i]
+            storage.compute_returns(agent_value, use_gae, gamma, tau)
 
     def after_update(self):
         for storage in self._active_storages:

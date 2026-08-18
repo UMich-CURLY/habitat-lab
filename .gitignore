@@ -145,3 +145,28 @@ checkpoints*/
 *.md
 !README.md
 !CLAUDE.md
+
+# --- hrl_pipeline: keep the scripts visible, hide the run output ---
+# Everything below is generated or archival. It is 4,700+ files, which is what
+# floods the source-control view; none of it is source. Ignoring rather than
+# deleting: the data stays on disk, it just stops being proposed as a change.
+hrl_pipeline/_archive/
+hrl_pipeline/tb/
+hrl_pipeline/tb_clean/
+hrl_pipeline/checkpoints/
+hrl_pipeline/videos/
+hrl_pipeline/results/
+hrl_pipeline/demos/
+hrl_pipeline/weights/
+hrl_pipeline/clicking/review/
+hrl_pipeline/clicking/review0805/
+hrl_pipeline/clicking/live_requests/
+hrl_pipeline/**/__pycache__/
+
+# `*.md` above hides ALL markdown; the pipeline's own documentation is a
+# deliverable, so re-include it.
+!hrl_pipeline/docs/*.md
+!hrl_pipeline/**/*.md
+
+# Generated navmesh cache (recomputed from the scenes on demand).
+navmeshes_r0.4/

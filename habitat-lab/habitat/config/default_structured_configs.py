@@ -301,6 +301,9 @@ class BaseVelocityNonCylinderActionConfig(ActionConfig):
     enable_lateral_move: bool = False
     # If the condition of sliding includs the checking of rotation
     enable_rotation_check_for_dyn_slide: bool = True
+    # If a blocked translation should still apply the commanded rotation (turn
+    # in place to escape a wedge) instead of freezing the whole move.
+    rotate_on_collision: bool = False
 
 
 @dataclass
@@ -365,6 +368,12 @@ class OracleNavActionConfig(ActionConfig):
     # For social nav training only. It controls the distance threshold
     # between the robot and the human and decide if the human wants to walk or not
     human_stop_and_walk_to_robot_distance_threshold: float = -1.0
+    # Firm-human blocked-gate (OracleNavWaypointAction, human_joints only).
+    # Default False reproduces the legacy "stop when ORCA speed ~ 0" behavior.
+    firm_mode: bool = False
+    block_clearance: float = 0.8
+    block_hysteresis_steps: int = 5
+    block_other_agent_idx: int = 0
 
 
 @dataclass
@@ -693,6 +702,29 @@ class OtherAgentHeadingConfig(LabSensorConfig):
 @dataclass
 class SocialNavPolicyStateSensorConfig(LabSensorConfig):
     type: str = "SocialNavPolicyStateSensor"
+    # When True, append a 7th dim: the human's ABSOLUTE velocity projected onto
+    # the human->robot direction (positive = approaching, ~0 = parked, negative
+    # = receding). Unlike human_rel_speed (unsigned, ego-motion-polluted), this
+    # is invariant to the robot's own motion. EMA-smoothed to denoise the
+    # finite difference.
+    include_approach_speed: bool = False
+    approach_ema_alpha: float = 0.2
+
+
+@dataclass
+class LidarScanSensorConfig(LabSensorConfig):
+    type: str = "LidarScanSensor"
+    num_rays: int = 16
+    max_range: float = 3.0
+    ray_step: float = 0.1
+
+
+@dataclass
+class TopDownConflictMapSensorConfig(LabSensorConfig):
+    type: str = "TopDownConflictMapSensor"
+    map_size: int = 64
+    meters_per_pixel: float = 0.1
+    trail_len: int = 30
 
 
 @dataclass
@@ -726,6 +758,23 @@ class BackoffWaypointDeltaSensorConfig(LabSensorConfig):
     type: str = "BackoffWaypointDeltaSensor"
     backoff_dist: float = 2.0
     obstacle_clearance: float = 0.3
+    # S2 clear-corridor yield. 'legacy' = straight-back behavior (default);
+    # 'corridor' = pick a start-side point that clears the human's path.
+    yield_mode: str = "legacy"
+    corridor_clearance: float = 1.1
+    human_goal_clearance: float = 1.5
+    # Append [door_dx, door_dz] so the yield skill can face the door on hold.
+    include_door_dir: bool = False
+    # Recompute the corridor target when the human moved this far (m).
+    recompute_human_motion: float = 0.75
+    # Append the fallback-cascade branch as the LAST dim: 0 = validated pocket,
+    # 1 = no valid pocket -> explicit hold-in-place (target = robot position).
+    # Replaces the silent unvalidated spawn fallback in corridor mode.
+    include_branch: bool = False
+    # Corridor mode: also require the robot's RETREAT PATH to the pocket to
+    # keep this distance (m) from the human's route (first ~1 m around the
+    # robot exempt); relaxes away when no candidate passes. 0 = off (legacy).
+    retreat_corridor_clearance: float = 0.0
 
 
 @dataclass
@@ -1103,6 +1152,31 @@ class SocialNavStatsMeasurementConfig(MeasurementConfig):
 
 
 @dataclass
+class HumanPassedDoorMeasurementConfig(MeasurementConfig):
+    r"""Latches 1.0 once the human crosses to the robot's side of the door."""
+    type: str = "HumanPassedDoor"
+
+
+@dataclass
+class HumanDelayMeasurementConfig(MeasurementConfig):
+    r"""Extra seconds the human takes to reach its goal vs. an unobstructed nominal."""
+    type: str = "HumanDelay"
+    human_speed: float = 0.8
+
+
+@dataclass
+class MinAgentClearanceMeasurementConfig(MeasurementConfig):
+    r"""Running minimum XZ distance between robot and human."""
+    type: str = "MinAgentClearance"
+
+
+@dataclass
+class HumanFrozenWhileClearMeasurementConfig(MeasurementConfig):
+    r"""Max consecutive steps the human is frozen while its corridor is clear."""
+    type: str = "HumanFrozenWhileClear"
+
+
+@dataclass
 class NavSeekSuccessMeasurementConfig(MeasurementConfig):
     r"""
     Social nav seek success measurement
@@ -1404,6 +1478,38 @@ class SocialNavReward(MeasurementConfig):
     goal_progress_reward: float = 1.0
     # Reward per metre of backing away from a human that is inside safe_dis_min.
     backoff_reward: float = 1.0
+    # Awareness radius for the dense yield shaping. The potential-based
+    # backoff/yield term fires whenever the human is within this distance, not
+    # only inside safe_dis_min, giving an early dense gradient to keep clear as
+    # the human approaches. Default equals safe_dis_min (no behaviour change).
+    yield_dis: float = 1.0
+    # If True (default) a robot-human collision ends the episode; if False the
+    # collision only costs collide_penalty and the episode continues, keeping
+    # returns lower-variance and letting the robot recover past a contact.
+    end_on_collide: bool = True
+    # --- Layer-2/3 shaping (all default OFF; thresholds from the 2026-08-14
+    # yield-geometry diagnosis, hrl_pipeline/YIELD_GEOM_REPORT.txt) ---
+    # Success-conditioned efficiency: on the success step, add
+    # eff_success_reward * max(0, 1 - steps / eff_step_cap). Terminal-only, so
+    # a short collision gains nothing from ending early. 0 = off.
+    eff_success_reward: float = 0.0
+    eff_step_cap: float = 1200.0
+    # Corridor potential: Phi = -max(0, corridor_safe_clear - plan_clear),
+    # where plan_clear is the robot's distance to the human's REMAINING
+    # planned path. Reward = coef * dPhi (telescopes; retreating past
+    # corridor_safe_clear earns nothing extra; re-entering goes negative).
+    # 0 = off.
+    corridor_potential_coef: float = 0.0
+    corridor_safe_clear: float = 1.0
+    # Timely-release bonus: once per episode, when the robot resumes goal
+    # progress after >= release_hold_steps of holding AND the kinematic
+    # go-counterfactual clearance mpd_go >= release_mpd_min. 0 = off.
+    release_bonus: float = 0.0
+    release_mpd_min: float = 0.75
+    release_hold_steps: int = 30
+    # Nominal speeds (m per env step) for the mpd_go counterfactual: robot
+    # advances straight to its goal, human advances along its planned path.
+    release_robot_speed: float = 0.008
     # -1 means that there is no near_human_bonus
     near_human_bonus: float = -1.0
     # -1 means that there is no exploration reward
@@ -1423,6 +1529,17 @@ class SocialNavReward(MeasurementConfig):
     max_count_colls: int = -1
     count_coll_end_pen: float = 1.0
     collide_penalty: float = 1.0
+
+
+@dataclass
+class SocialNavRewardBreakdownConfig(MeasurementConfig):
+    r"""
+    Per-episode running sums of each SocialNavReward component
+    (goal_progress / backoff / proximity / collide). Diagnostic only: it does
+    not change the reward, it just makes the decomposition visible in the
+    per-episode eval stats.
+    """
+    type: str = "SocialNavRewardBreakdown"
 
 
 @dataclass
@@ -1588,6 +1705,17 @@ class TaskConfig(HabitatBaseConfig):
     rvo_agent_0_max_speed: Optional[float] = None
     # Cap agent_1 (often the faster) in ORCA to reduce doorway deadlocks vs agent_0.
     rvo_agent_1_max_speed: Optional[float] = 0.1
+    # Firm-human knobs (defaults reproduce legacy cooperative behavior).
+    # 1.0: ORCA models all agents as cooperatively goal-seeking; <1.0 blends in
+    # uncontrolled agents' OBSERVED velocity so the human stops assuming the
+    # robot will give way. 0.0 = fully non-reciprocal.
+    rvo_reciprocity: float = 1.0
+    # Controlled agents' preferred velocity follows the navmesh next waypoint
+    # (detour capability) instead of a straight line to the goal.
+    rvo_navmesh_pref_vel: bool = False
+    # Lower bound (fraction of max speed) on a controlled agent's solved speed
+    # while its preferred velocity is non-zero, so ORCA can escape a standoff.
+    rvo_resume_speed_floor: float = 0.0
     # Dump a PNG of navmesh-derived RVO obstacles when ``TwoAgentSocialNavTask`` builds ORCA static polys.
     rvo_debug_save_obstacle_figure: bool = False
     rvo_debug_obstacle_figure_dir: str = "video_dir/rvo_static_obstacles"
@@ -1883,6 +2011,12 @@ class SimulatorConfig(HabitatBaseConfig):
     default_agent_navmesh: bool = True
     # if default navmesh is used, should it include static objects
     navmesh_include_static_objects: bool = False
+    # If set (non-None), force-recompute the navmesh with this agent radius
+    # instead of loading the baked navmesh. Use to match the robot's physical
+    # body footprint (~0.4 m) so path planning does not route through doors the
+    # body cannot fit. Cached in a radius-specific dir; original baked navmeshes
+    # are left untouched. None (default) preserves the legacy load-baked behavior.
+    navmesh_agent_radius: Optional[float] = None
 
     habitat_sim_v0: HabitatSimV0Config = HabitatSimV0Config()
     # ep_info is added to the config in some rearrange tasks inside
@@ -2472,6 +2606,18 @@ cs.store(
     node=SocialNavPolicyStateSensorConfig,
 )
 cs.store(
+    package="habitat.task.lab_sensors.lidar_scan",
+    group="habitat/task/lab_sensors",
+    name="lidar_scan",
+    node=LidarScanSensorConfig,
+)
+cs.store(
+    package="habitat.task.lab_sensors.topdown_conflict_map",
+    group="habitat/task/lab_sensors",
+    name="topdown_conflict_map",
+    node=TopDownConflictMapSensorConfig,
+)
+cs.store(
     package="habitat.task.lab_sensors.goal_world_delta",
     group="habitat/task/lab_sensors",
     name="goal_world_delta",
@@ -2709,6 +2855,12 @@ cs.store(
     node=SocialNavReward,
 )
 cs.store(
+    package="habitat.task.measurements.social_nav_reward_breakdown",
+    group="habitat/task/measurements",
+    name="social_nav_reward_breakdown",
+    node=SocialNavRewardBreakdownConfig,
+)
+cs.store(
     package="habitat.task.measurements.did_agents_collide",
     group="habitat/task/measurements",
     name="did_agents_collide",
@@ -2786,6 +2938,30 @@ cs.store(
     group="habitat/task/measurements",
     name="social_nav_stats",
     node=SocialNavStatsMeasurementConfig,
+)
+cs.store(
+    package="habitat.task.measurements.human_passed_door",
+    group="habitat/task/measurements",
+    name="human_passed_door",
+    node=HumanPassedDoorMeasurementConfig,
+)
+cs.store(
+    package="habitat.task.measurements.human_delay",
+    group="habitat/task/measurements",
+    name="human_delay",
+    node=HumanDelayMeasurementConfig,
+)
+cs.store(
+    package="habitat.task.measurements.min_agent_clearance",
+    group="habitat/task/measurements",
+    name="min_agent_clearance",
+    node=MinAgentClearanceMeasurementConfig,
+)
+cs.store(
+    package="habitat.task.measurements.human_frozen_while_clear",
+    group="habitat/task/measurements",
+    name="human_frozen_while_clear",
+    node=HumanFrozenWhileClearMeasurementConfig,
 )
 cs.store(
     package="habitat.task.measurements.social_nav_seek_success",

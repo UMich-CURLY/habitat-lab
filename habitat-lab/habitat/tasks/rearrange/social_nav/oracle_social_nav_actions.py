@@ -451,7 +451,31 @@ class OracleNavWaypointAction(OracleNavAction):  # type: ignore
     No door logic, no backward "avoid" mode, no ``_get_target_for_coord`` re-snap,
     no pathfinder: ORCA handles avoidance and ``step_filter`` (inside
     ``BaseVelAction`` / ``_update_controller_to_navmesh``) keeps us on the navmesh.
+
+    Firm-human blocked-gate (human_joints only, ``firm_mode=True``): under
+    ``kinematic_mode`` the humanoid's ``step_filter`` respects the navmesh but
+    NOT the robot body, so a firm (non-reciprocal) human would clip through a
+    stationary robot. The gate stops the human only when it is physically
+    blocked — the other agent within ``block_clearance`` and roughly ahead —
+    with hysteresis both ways, and resumes automatically once clear.
     """
+
+    def __init__(self, *args, task, **kwargs):
+        super().__init__(*args, task=task, **kwargs)
+        self._firm_mode = bool(getattr(self._config, "firm_mode", False))
+        self._block_clearance = float(
+            getattr(self._config, "block_clearance", 0.8)
+        )
+        self._block_hysteresis_steps = int(
+            getattr(self._config, "block_hysteresis_steps", 5)
+        )
+        self._block_other_agent_idx = int(
+            getattr(self._config, "block_other_agent_idx", 0)
+        )
+        self._blocked_state = False
+        self._blocked_raw_count = 0
+        self._clear_raw_count = 0
+        self._blocked_prev_ep = None
 
     @property
     def action_space(self):
@@ -466,6 +490,62 @@ class OracleNavWaypointAction(OracleNavAction):  # type: ignore
                 )
             }
         )
+
+    def _update_blocked_gate(self, robot_pos, rel_targ) -> bool:
+        """Return True when the human is physically blocked by the other agent.
+
+        Raw block = other agent within ``block_clearance`` AND roughly ahead
+        (angle between commanded motion and the vector to it < 75 deg). The
+        latched state flips only after ``block_hysteresis_steps`` consecutive
+        raw observations, both entering and leaving.
+        """
+        ep_id = getattr(self._sim.ep_info, "episode_id", None)
+        if ep_id != self._blocked_prev_ep:
+            self._blocked_prev_ep = ep_id
+            self._blocked_state = False
+            self._blocked_raw_count = 0
+            self._clear_raw_count = 0
+
+        try:
+            other = self._sim.get_agent_data(
+                self._block_other_agent_idx
+            ).articulated_agent
+            other_xz = np.array(other.base_pos)[[0, 2]]
+        except Exception:
+            return self._blocked_state
+
+        self_xz = np.asarray(robot_pos)[[0, 2]]
+        to_other = other_xz - self_xz
+        d = float(np.linalg.norm(to_other))
+        raw = False
+        if d < self._block_clearance and d > 1e-6:
+            motion = np.asarray(rel_targ, dtype=float)
+            if float(np.linalg.norm(motion)) > 1e-6:
+                cos_ang = float(
+                    np.dot(motion, to_other)
+                    / (np.linalg.norm(motion) * d)
+                )
+                # cos(75 deg) ~= 0.2588
+                raw = cos_ang > 0.2588
+
+        if raw:
+            self._blocked_raw_count += 1
+            self._clear_raw_count = 0
+        else:
+            self._clear_raw_count += 1
+            self._blocked_raw_count = 0
+
+        if (
+            not self._blocked_state
+            and self._blocked_raw_count >= self._block_hysteresis_steps
+        ):
+            self._blocked_state = True
+        elif (
+            self._blocked_state
+            and self._clear_raw_count >= self._block_hysteresis_steps
+        ):
+            self._blocked_state = False
+        return self._blocked_state
 
     def step(self, *args, **kwargs):
         self.skill_done = False
@@ -504,9 +584,17 @@ class OracleNavWaypointAction(OracleNavAction):  # type: ignore
 
         elif self.motion_type == "human_joints":
             self.humanoid_controller.obj_transform_base = base_T
-            if dist < self._config.dist_thresh:
+            physically_blocked = False
+            if self._firm_mode:
+                physically_blocked = self._update_blocked_gate(
+                    robot_pos, rel_targ
+                )
+            if dist < self._config.dist_thresh or physically_blocked:
                 self.humanoid_controller.calculate_stop_pose()
-                self.skill_done = True
+                # Only a true goal arrival ends the skill; a physical block is
+                # a transient wait, so leave skill_done False to keep replanning.
+                if dist < self._config.dist_thresh:
+                    self.skill_done = True
             else:
                 # Match the ORCA speed; the controller turns gradually itself.
                 self.humanoid_controller.set_framerate_for_linspeed(

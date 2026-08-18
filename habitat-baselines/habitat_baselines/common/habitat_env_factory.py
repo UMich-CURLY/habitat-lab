@@ -10,7 +10,7 @@ from habitat import ThreadedVectorEnv, VectorEnv, logger, make_dataset
 from habitat.config import read_write
 from habitat.gym import make_gym_from_config
 from habitat_baselines.common.env_factory import VectorEnvFactory
-from IPython import embed
+
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
@@ -46,7 +46,20 @@ class HabitatVectorEnvFactory(VectorEnvFactory):
         random.shuffle(scenes)
 
         scene_splits: List[List[str]] = [[] for _ in range(num_environments)]
-        if len(scenes) < num_environments:
+        if not int(os.environ.get("SPLIT_SCENES", "1")):
+            # SPLIT_SCENES=0: every env cycles the FULL episode set instead of
+            # owning a scene subset. With per-env scene ownership each env
+            # contributes equal frames regardless of dataset-level episode
+            # duplication, so upsampling never reaches the global rollout mix
+            # (measured: nominal 0.52 -> actual 0.27 on quick15_up3).
+            logger.warn(
+                "SPLIT_SCENES=0: every environment uses all "
+                f"{len(scenes)} scenes."
+            )
+            for scene in scenes:
+                for split in scene_splits:
+                    split.append(scene)
+        elif len(scenes) < num_environments:
             msg = f"There are less scenes ({len(scenes)}) than environments ({num_environments}). "
             if enforce_scenes_greater_eq_environments:
                 logger.warn(

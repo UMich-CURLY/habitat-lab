@@ -106,6 +106,27 @@ class TwoAgentSocialNavTask(PddlTask):
             0: getattr(config, "rvo_agent_0_max_speed", None),
             1: getattr(config, "rvo_agent_1_max_speed", None),
         }
+        # --- Firm-human knobs (defaults reproduce legacy behavior) ---
+        # 1.0: ORCA models every agent as cooperatively goal-seeking (legacy).
+        # 0.0: uncontrolled agents (the robot) enter ORCA with their OBSERVED
+        # velocity only, so the human stops counting on them to give way.
+        self._rvo_reciprocity: float = float(
+            getattr(config, "rvo_reciprocity", 1.0)
+        )
+        # Controlled agents' preferred velocity follows the navmesh shortest
+        # path instead of the straight line to the goal (lets ORCA detour).
+        self._rvo_navmesh_pref_vel: bool = bool(
+            getattr(config, "rvo_navmesh_pref_vel", False)
+        )
+        # Lower bound on a controlled agent's solved speed (fraction of its
+        # max speed) while its preferred velocity is non-zero — guarantees the
+        # ORCA solution can recover from a near-zero standoff.
+        self._rvo_resume_speed_floor: float = float(
+            getattr(config, "rvo_resume_speed_floor", 0.0)
+        )
+        # Previous base positions for finite-difference observed velocities.
+        self._rvo_prev_pos: Dict[int, np.ndarray] = {}
+        self._rvo_step_dt: Optional[float] = None
         self._rvo_debug_save_obstacle_figure: bool = bool(
             getattr(config, "rvo_debug_save_obstacle_figure", False)
         )
@@ -293,6 +314,15 @@ class TwoAgentSocialNavTask(PddlTask):
 
         self._rvo_agent_keys = []
         self._rvo_last_vel = {}
+        # Reset the finite-difference state for observed velocities and pin the
+        # per-env-step dt (ORCA drive runs once per env step, not per sim tick).
+        self._rvo_prev_pos = {}
+        try:
+            _cf = float(self._sim.habitat_config.ctrl_freq)
+            _afr = float(self._sim.habitat_config.ac_freq_ratio)
+            self._rvo_step_dt = _afr / _cf if _cf > 0 else 1.0
+        except Exception:
+            self._rvo_step_dt = 1.0
         n_agents = getattr(self._sim, "num_articulated_agents", 1)
         for aid in range(n_agents):
             agent_data = self._sim.get_agent_data(aid)
@@ -533,40 +563,134 @@ class TwoAgentSocialNavTask(PddlTask):
             for aid in range(n)
         }
 
-        # 1) Sync ORCA with each agent's current position (warm-started velocity).
+        # Observed (finite-difference) XZ velocity per agent, used to feed
+        # uncontrolled agents into ORCA non-reciprocally (firm human).
+        dt = self._rvo_step_dt or 1.0
+        observed_vel: Dict[int, Tuple[float, float]] = {}
+        for aid in range(n):
+            prev = self._rvo_prev_pos.get(aid)
+            if prev is None:
+                observed_vel[aid] = (0.0, 0.0)
+            else:
+                observed_vel[aid] = (
+                    float((cur_pos[aid][0] - prev[0]) / dt),
+                    float((cur_pos[aid][2] - prev[2]) / dt),
+                )
+            self._rvo_prev_pos[aid] = cur_pos[aid].copy()
+
+        # 1) Sync ORCA with each agent's current position. Uncontrolled agents
+        #    are warm-started with their OBSERVED velocity when reciprocity is
+        #    reduced, so ORCA does not assume they will cooperatively avoid.
         for aid, key in enumerate(self._rvo_agent_keys):
             pos3 = cur_pos[aid]
+            if aid in self._rvo_controlled_agents:
+                warm = self._rvo_last_vel.get(key, (0.0, 0.0))
+            else:
+                warm = (
+                    tuple(
+                        self._rvo_reciprocity * c
+                        + (1.0 - self._rvo_reciprocity) * o
+                        for c, o in zip(
+                            self._rvo_last_vel.get(key, (0.0, 0.0)),
+                            observed_vel[aid],
+                        )
+                    )
+                )
             mgr.sync_agent_pose(
                 key,
                 (float(pos3[0]), float(pos3[2])),
-                self._rvo_last_vel.get(key, (0.0, 0.0)),
+                warm,
             )
 
-        # 2) Preferred velocity toward each agent's nav goal (0 within stop radius).
+        # 2) Preferred velocity toward each agent's nav goal (0 within stop
+        #    radius). Controlled agents optionally follow the navmesh next
+        #    waypoint (detour capability); uncontrolled agents blend
+        #    goal-seeking with observed motion by the reciprocity factor.
+        pref_dir: Dict[int, Tuple[float, float]] = {}
         for aid, key in enumerate(self._rvo_agent_keys):
             pos3 = cur_pos[aid]
             goal_xz = self._rvo_goal_xz_for_agent(aid)
+            override_ms = self._rvo_agent_max_speed.get(aid)
+            max_speed = (
+                float(override_ms)
+                if override_ms is not None
+                else self._rvo_max_speed
+            )
             pref = (0.0, 0.0)
             if goal_xz is not None:
-                dx = goal_xz[0] - float(pos3[0])
-                dz = goal_xz[1] - float(pos3[2])
+                target_xz = goal_xz
+                # Controlled agents route via the navmesh: aim at the next
+                # path waypoint rather than straight at the goal.
+                if (
+                    self._rvo_navmesh_pref_vel
+                    and aid in self._rvo_controlled_agents
+                ):
+                    path_xz, status = self._navmesh_path_xz(
+                        cur_pos[aid],
+                        np.array(
+                            [goal_xz[0], float(pos3[1]), goal_xz[1]],
+                            dtype=np.float32,
+                        ),
+                    )
+                    if status == "ok" and path_xz is not None:
+                        nxt = path_xz[1]
+                        if (
+                            np.hypot(nxt[0] - pos3[0], nxt[1] - pos3[2])
+                            < self._rvo_goal_stop_radius
+                            and len(path_xz) > 2
+                        ):
+                            nxt = path_xz[2]
+                        target_xz = nxt
+                dx = target_xz[0] - float(pos3[0])
+                dz = target_xz[1] - float(pos3[2])
                 goal_dist = float(np.hypot(dx, dz))
-                if goal_dist >= self._rvo_goal_stop_radius and goal_dist > 1e-6:
+                # Stop only on the TRUE goal proximity, not an intermediate wp.
+                true_dist = float(
+                    np.hypot(
+                        goal_xz[0] - float(pos3[0]),
+                        goal_xz[1] - float(pos3[2]),
+                    )
+                )
+                if true_dist >= self._rvo_goal_stop_radius and goal_dist > 1e-6:
+                    inv = max_speed / goal_dist
+                    pref = (dx * inv, dz * inv)
+            # Uncontrolled agents: blend the goal-seeking pref with observed
+            # motion so a non-reciprocal robot is modeled by what it does.
+            if aid not in self._rvo_controlled_agents:
+                pref = (
+                    self._rvo_reciprocity * pref[0]
+                    + (1.0 - self._rvo_reciprocity) * observed_vel[aid][0],
+                    self._rvo_reciprocity * pref[1]
+                    + (1.0 - self._rvo_reciprocity) * observed_vel[aid][1],
+                )
+            pref_dir[aid] = pref
+            mgr.set_pref_velocity(key, pref)
+
+        # 3) Advance ORCA and cache the solved velocities. Apply the resume
+        #    speed floor so a controlled agent whose preferred velocity is
+        #    non-zero cannot be pinned to a near-zero solution (deadlock).
+        mgr.step()
+        for aid, key in enumerate(self._rvo_agent_keys):
+            v = mgr.get_agent_velocity(key)
+            vx, vz = float(v[0]), float(v[1])
+            if (
+                self._rvo_resume_speed_floor > 0.0
+                and aid in self._rvo_controlled_agents
+            ):
+                pdx, pdz = pref_dir.get(aid, (0.0, 0.0))
+                pmag = float(np.hypot(pdx, pdz))
+                if pmag > 1e-6:
                     override_ms = self._rvo_agent_max_speed.get(aid)
                     max_speed = (
                         float(override_ms)
                         if override_ms is not None
                         else self._rvo_max_speed
                     )
-                    inv = max_speed / goal_dist
-                    pref = (dx * inv, dz * inv)
-            mgr.set_pref_velocity(key, pref)
-
-        # 3) Advance ORCA and cache the solved velocities.
-        mgr.step()
-        for key in self._rvo_agent_keys:
-            v = mgr.get_agent_velocity(key)
-            self._rvo_last_vel[key] = (float(v[0]), float(v[1]))
+                    floor = self._rvo_resume_speed_floor * max_speed
+                    if float(np.hypot(vx, vz)) < floor:
+                        vx = floor * pdx / pmag
+                        vz = floor * pdz / pmag
+            self._rvo_last_vel[key] = (vx, vz)
 
         # 4) Project a 1 s-ahead waypoint into each controlled agent's
         #    oracle_nav_action. RVO is the sole driver of controlled agents, so
@@ -616,20 +740,7 @@ class TwoAgentSocialNavTask(PddlTask):
         """
         if self._rvo_enabled and self._rvo_manager is not None:
             try:
-                print(
-                    f"[RVO][dbg] IN type={type(action).__name__} "
-                    f"keys={list(action.keys()) if isinstance(action, dict) else 'NOT-A-DICT'}"
-                )
                 action = self._rvo_drive_action(action)
-                _vels = {
-                    k: (round(v[0], 3), round(v[1], 3))
-                    for k, v in self._rvo_last_vel.items()
-                }
-                print(
-                    f"[RVO][dbg] OUT names={action.get('action')} "
-                    f"orca_vel={_vels} "
-                    f"arg_keys={list(action.get('action_args', {}).keys())}"
-                )
             except Exception as e:  # pragma: no cover - defensive
                 import traceback
 

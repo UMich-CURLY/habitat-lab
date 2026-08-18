@@ -221,7 +221,10 @@ def load_resume_state(
     if rank0_only():
         logger.info(f"Loading resume state: {filename}")
 
-    return torch.load(filename, map_location="cpu")
+    # weights_only=False: the resume state is a locally produced checkpoint and
+    # carries the omegaconf DictConfig, which PyTorch >=2.6 refuses to unpickle
+    # under the new weights_only=True default.
+    return torch.load(filename, map_location="cpu", weights_only=False)
 
 
 def requeue_job():

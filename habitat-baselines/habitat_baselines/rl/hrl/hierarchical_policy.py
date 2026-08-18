@@ -31,6 +31,9 @@ from habitat_baselines.rl.hrl.skills import (  # noqa: F401.
 )
 from habitat_baselines.rl.hrl.skills.social_nav_skills import (  # noqa: F401.
     BackOffSkill,
+    ClearCorridorYieldSkill,
+    LearnedYieldSkill,
+    FlatNavSkill,
     WaitSkill,
     GoToGoalSkill,
 )

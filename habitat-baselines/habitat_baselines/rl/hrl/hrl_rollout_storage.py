@@ -33,6 +33,10 @@ class HrlRolloutStorage(RolloutStorage):
         super().__init__(numsteps, num_envs, *args, **kwargs)
         self._num_envs = num_envs
         self._cur_step_idxs = torch.zeros(self._num_envs, dtype=torch.long)
+        # Slot of the most recent written HL decision per env; rewards from
+        # every env step accumulate there so each stored transition carries
+        # its own skill's full payoff.
+        self._reward_write_idxs = torch.zeros(self._num_envs, dtype=torch.long)
         self._last_should_inserts = None
         self._current_step = {}
         assert (
@@ -102,15 +106,18 @@ class HrlRolloutStorage(RolloutStorage):
         # Starts as shape [batch_size, 1]
         should_inserts = should_inserts.flatten()
 
+        env_idxs = torch.arange(self._num_envs)
+        if rewards is not None:
+            # Accumulate rewards on EVERY step (also when no env replans)
+            # into the slot of the most recent HL decision, so each stored
+            # transition carries its own skill's accumulated payoff.
+            self.buffers["rewards"][
+                self._reward_write_idxs, env_idxs
+            ] += rewards
+
         if should_inserts.sum() == 0:
             self._last_should_inserts = should_inserts
             return
-
-        env_idxs = torch.arange(self._num_envs)
-        if rewards is not None:
-            rewards = rewards.to(self.device)
-            # Accumulate rewards between writes to the observations.
-            self.buffers["rewards"][self._cur_step_idxs, env_idxs] += rewards
 
         if len(next_step) > 0:
             self.buffers.set(
@@ -131,6 +138,27 @@ class HrlRolloutStorage(RolloutStorage):
                 current_step[should_inserts],
                 strict=False,
             )
+            # Pin the observation/mask the decision was actually computed
+            # from (held in `_current_step`) to the same slot, so
+            # `evaluate_actions` re-scores the action on the right input.
+            aligned = TensorDict(
+                {
+                    k: v
+                    for k, v in self._current_step.items()
+                    if k in ("observations", "masks")
+                }
+            )
+            self.buffers.set(
+                (
+                    self._cur_step_idxs[should_inserts],
+                    env_idxs[should_inserts],
+                ),
+                aligned[should_inserts],
+                strict=False,
+            )
+            self._reward_write_idxs[should_inserts] = self._cur_step_idxs[
+                should_inserts
+            ]
         self._last_should_inserts = should_inserts
 
     def advance_rollout(self, buffer_index: int = 0):
@@ -146,14 +174,28 @@ class HrlRolloutStorage(RolloutStorage):
         self.buffers[0] = self.buffers[self._cur_step_idxs, env_idxs]
         self.buffers["masks"][1:] = False
         self.buffers["rewards"][1:] = 0.0
+        # Clear stale value/return slots so they can't leak into the next
+        # rollout's GAE bootstrap or advantage-normalization statistics.
+        self.buffers["value_preds"][1:] = 0.0
+        self.buffers["returns"][1:] = 0.0
 
         self._cur_step_idxs[:] = 0
+        self._reward_write_idxs[:] = 0
 
     def compute_returns(self, next_value, use_gae, gamma, tau):
         if not use_gae:
             raise ValueError("Only GAE is supported with HRL trainer")
 
         assert isinstance(self.buffers["value_preds"], torch.Tensor)
+        # Bootstrap: write V(s_T) of each env's final (not-yet-written) step
+        # into its next slot, mirroring the base RolloutStorage. Without this
+        # the last stored transition's GAE delta reads whatever was left in
+        # that slot and the garbage propagates through the recursion into
+        # every earlier return.
+        env_idxs = torch.arange(self._num_envs)
+        self.buffers["value_preds"][self._cur_step_idxs, env_idxs] = (
+            next_value.to(self.buffers["value_preds"].device)
+        )
         gae = 0.0
         for step in reversed(range(self._cur_step_idxs.max())):
             delta = (
@@ -164,6 +206,13 @@ class HrlRolloutStorage(RolloutStorage):
                 - self.buffers["value_preds"][step]
             )
             gae = delta + gamma * tau * gae * self.buffers["masks"][step + 1]
+            # Envs wrote different numbers of transitions; past an env's own
+            # end (step >= cur_step_idxs) the delta is junk. Zero the carried
+            # gae there so the recursion restarts cleanly from the bootstrap
+            # at that env's true last transition instead of leaking junk in.
+            gae = gae * (step < self._cur_step_idxs).view(-1, 1).to(
+                dtype=gae.dtype, device=gae.device
+            )
             self.buffers["returns"][step] = (  # type: ignore
                 gae + self.buffers["value_preds"][step]  # type: ignore
             )
