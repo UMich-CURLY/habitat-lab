@@ -1,0 +1,99 @@
+# @package _global_
+
+# v2 benchmark: narrow-doorway social navigation with a FIRM human.
+# Inherits the legacy two-agent benchmark and flips on the firm-human ORCA
+# behavior + the clear-corridor yield sensor + the new diagnostic measures.
+# All changes are new config keys whose defaults reproduce the old behavior,
+# so the legacy yaml is untouched.
+defaults:
+  - hssd_spot_human_social_nav_twoagent
+  - /habitat/task/lab_sensors@habitat.task.lab_sensors.lidar_scan: lidar_scan
+  - /habitat/task/measurements@habitat.task.measurements.human_passed_door: human_passed_door
+  - /habitat/task/measurements@habitat.task.measurements.human_delay: human_delay
+  - /habitat/task/measurements@habitat.task.measurements.min_agent_clearance: min_agent_clearance
+  - /habitat/task/measurements@habitat.task.measurements.human_frozen_while_clear: human_frozen_while_clear
+  # Diagnostic: per-episode running sums of each reward component so the
+  # eval stats show WHICH term pays for a behavior change (no reward change).
+  - /habitat/task/measurements@habitat.task.measurements.social_nav_reward_breakdown: social_nav_reward_breakdown
+  - _self_
+
+habitat:
+  # NOTE: navmesh_agent_radius override was tried (0.4, physical footprint) and
+  # made door-frame ramming WORSE (robot stalls/rams at the door instead of
+  # planning through), so it is left at the default (load baked navmesh). The
+  # real constraint is that many HSSD doors are physically too narrow for Spot;
+  # that is handled by dataset-side passability filtering, not navmesh radius.
+  task:
+    # --- Firm human (S1): robot no longer inflated in the human's ORCA; the
+    # human plans around the robot's OBSERVED motion (non-reciprocal), routes
+    # on the navmesh, and cannot be pinned to a near-zero speed. ---
+    rvo_agent_0_radius: 0.25
+    rvo_reciprocity: 0.0
+    rvo_navmesh_pref_vel: true
+    rvo_resume_speed_floor: 0.3
+
+    lab_sensors:
+      # S2 clear-corridor yield: target that clears the human's path corridor
+      # (not straight-back onto it); include the door direction so the yield
+      # skill can face the door while holding.
+      backoff_waypoint_delta:
+        yield_mode: corridor
+        include_door_dir: true
+        # Yield search space stays generous (user: 让行空间可以更大).
+        backoff_dist: 2.0
+        # Last dim = fallback branch (0 pocket, 1 hold-in-place); replaces the
+        # silent reverse-to-spawn when no valid pocket exists.
+        include_branch: true
+        # Prefer pockets whose retreat path does not cross the human's route
+        # (the reverse drive is blind; a crossing retreat backs into the human).
+        retreat_corridor_clearance: 0.5
+      # 7th policy-state dim: the human's ABSOLUTE approach speed (ego-motion
+      # invariant, unlike human_rel_speed). Lets the HL distinguish an
+      # approaching human from a parked one without hidden teacher state.
+      social_nav_policy_state:
+        include_approach_speed: true
+
+    actions:
+      agent_1_oracle_nav_action:
+        # Firm blocked-gate: stop only when physically blocked by the robot
+        # (kinematic mode ignores the robot body otherwise), resume when clear.
+        firm_mode: true
+        block_clearance: 0.8
+        block_hysteresis_steps: 5
+        block_other_agent_idx: 0
+      agent_0_base_velocity:
+        # S2: realistic Spot turn rate (the skills act through this action;
+        # proportional turns handle the fine control, killing bang-bang cycles).
+        ang_speed: 4.0
+        # F4: restore the robot footprint so BaseVelNonCylinderAction.collision_check
+        # actually clamps against the navmesh (was empty -> robot slid through
+        # walls). Values from the (commented) legacy block. Robot still has no
+        # avoidance of the human body (that is the HL's job); a human contact is
+        # handled by end_on_collide (fail-terminate), not by dodging.
+        navmesh_offset: [[0.0, 0.0], [0.225, 0.0]]
+        # F2: with the wall-clamp active, a robot whose forward point touches a
+        # wall used to freeze completely (rotation AND translation reverted) and
+        # ram in place forever. Keep the rotation so it can always turn in place
+        # to face a clear direction and drive out — the fix is "只要能转".
+        rotate_on_collision: true
+      agent_0_oracle_nav_action:
+        ang_speed: 4.0
+
+  gym:
+    obs_keys:
+      - agent_0_spot_head_stereo_depth_sensor
+      - agent_0_humanoid_detector_sensor
+      - agent_0_localization_sensor
+      - agent_0_other_agent_gps
+      - agent_0_other_agent_heading
+      - agent_0_social_nav_policy_state
+      - agent_0_goal_world_delta
+      - agent_0_goal_waypoint_delta
+      - agent_0_backoff_waypoint_delta
+      - agent_0_trajectory_buffer
+      - agent_0_has_finished_oracle_nav
+      - agent_1_has_finished_oracle_nav
+      - agent_0_goal_to_agent_gps_compass
+      # L1: simulated 2D lidar for the learned yield LL (deployment-legal
+      # local geometry; replaces the privileged pocket planner's map access).
+      - agent_0_lidar_scan

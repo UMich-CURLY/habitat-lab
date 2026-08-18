@@ -1,0 +1,21 @@
+# @package _global_
+
+# Flat-BC baseline: one end-to-end MLP (FlatNavSkill) drives the whole episode.
+# The HL is bypassed by evaluating with the harness in always_backoff mode,
+# which pins every macro decision to this skill. Fair architecture comparison
+# against the hierarchical stack: same deployment-legal obs + goal polar.
+defaults:
+  - social_nav_hierarchical_v2
+  - _self_
+
+habitat_baselines:
+  rl:
+    policy:
+      agent_0:
+        hierarchical_policy:
+          defined_skills:
+            backoff:
+              skill_name: "FlatNavSkill"
+              skill_data:
+                model_path: /habitat-lab/hrl_pipeline/flat_bc.pth
+                lidar_max_range: 3.0

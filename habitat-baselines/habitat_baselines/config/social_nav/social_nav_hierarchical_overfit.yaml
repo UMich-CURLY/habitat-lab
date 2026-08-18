@@ -1,0 +1,55 @@
+# @package _global_
+
+# Overfit-first sanity check: train the HL policy with a tiny network on a
+# single episode to validate reward/credit-assignment/obs-action plumbing.
+defaults:
+  - social_nav_hierarchical
+  - _self_
+
+habitat:
+  dataset:
+    data_path: /habitat-lab/data/archive_20260817/social_nav_episode_overfit_1.json.gz
+  task:
+    measurements:
+      social_nav_reward:
+        # Don't truncate on contact: ending on collision makes returns swing by
+        # ±collide_penalty and starves the tiny critic (value_loss stuck high,
+        # policy never commits). Letting the episode continue keeps returns
+        # low-variance and lets the robot recover past a contact and still reach
+        # the goal after the human clears.
+        end_on_collide: false
+        # Per-contact-step penalty (now applied every colliding step, not once).
+        collide_penalty: 2.0
+        # Dense yield shaping: reward keeping clear of the human out to 3 m (not
+        # just inside safe_dis_min=1 m), so the policy gets an early gradient to
+        # yield as the human approaches instead of only the terminal +10.
+        yield_dis: 3.0
+
+habitat_baselines:
+  total_num_steps: 3.0e5
+  eval_ckpt_path_dir: checkpoints_social_nav_overfit/latest.pth
+
+  eval:
+    should_load_ckpt: true
+    evals_per_ep: 10
+
+  rl:
+    ppo:
+      hidden_size: 32  # Must match HL policy hidden_dim
+      # HL returns are ~tens (30 accumulated env-steps per transition);
+      # without these the 0.5 grad clip starves both actor and critic.
+      use_normalized_advantage: True
+      max_grad_norm: 10.0
+      # 0.001 collapses too fast into rush-and-collide; 0.01 froze the policy at
+      # max entropy (never commits). 0.004 keeps exploration without stalling.
+      entropy_coef: 0.004
+    policy:
+      agent_0:
+        hierarchical_policy:
+          high_level_policy:
+            hidden_dim: 32
+            num_rnn_layers: 1
+
+  checkpoint_folder: "checkpoints_social_nav_overfit"
+  tensorboard_dir: "tb_social_nav_overfit"
+  video_dir: "video_social_nav_overfit"

@@ -1,0 +1,21 @@
+# @package _global_
+
+# L4/L5: v2 stack with the yield LL swapped for the LEARNED policy
+# (LearnedYieldSkill: lidar + human polar + door dir -> base_vel; no privileged
+# pocket planner at execution time). Everything else identical to v2, so an
+# eval here isolates the LL substitution.
+defaults:
+  - social_nav_hierarchical_v2
+  - _self_
+
+habitat_baselines:
+  rl:
+    policy:
+      agent_0:
+        hierarchical_policy:
+          defined_skills:
+            backoff:
+              skill_name: "LearnedYieldSkill"
+              skill_data:
+                model_path: /habitat-lab/hrl_pipeline/ll_yield_bc.pth
+                lidar_max_range: 3.0

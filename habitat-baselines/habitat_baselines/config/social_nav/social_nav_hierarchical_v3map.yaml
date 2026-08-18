@@ -1,0 +1,19 @@
+# @package _global_
+
+# Route 3 / S7-lite: HL with the egocentric top-down conflict map branch.
+# Post-GRU fusion + zero-init map columns => at init this policy is
+# functionally identical to the scalar v2 HL, so scalar BC weights load via
+# pretrained_hl_weights and the proven BC+PPO recipe applies unchanged.
+defaults:
+  - social_nav_hierarchical_v2
+  - override /benchmark/multi_agent: hssd_spot_human_social_nav_twoagent_v3map
+  - _self_
+
+habitat_baselines:
+  rl:
+    policy:
+      agent_0:
+        hierarchical_policy:
+          high_level_policy:
+            map_obs_key: topdown_conflict_map
+            map_feature_dim: 64

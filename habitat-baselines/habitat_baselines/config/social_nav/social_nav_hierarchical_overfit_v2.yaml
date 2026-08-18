@@ -1,0 +1,37 @@
+# @package _global_
+
+# The settled recipe, pointed at ONE episode.
+#
+# This file used to carry its own copy of the reward and PPO settings, frozen at
+# the phase-1 values (success 30, collide 5, safe_dis_min 1.5, grad_norm 10,
+# entropy 0.004). Those are exactly the values later diagnosed as wrong, so every
+# caller had to override them on the command line -- and the README's override
+# list had drifted, silently dropping the three layer-3 reward terms. It now
+# inherits social_nav_hrl_final instead, so the recipe lives in ONE place and
+# cannot drift again. Only what is genuinely single-episode-specific is set here.
+#
+# This is also the config `hl/scripted_hl_eval.py` runs the scripted teacher under
+# (RULE_CONFIG). The scripted rule ignores the reward entirely -- it overrides the
+# policy's choice directly -- so certification labels (success / collision) are
+# unaffected by this change; only the reward logged alongside them moves onto the
+# training reward, which is what "evaluate under the training reward" asks for.
+defaults:
+  - social_nav_hrl_final
+  - _self_
+
+habitat:
+  dataset:
+    # ep70fix: the one clean SWEET doorway episode, human_goal moved below the
+    # door so the crossing is a true head-on conflict rather than a fake trivial.
+    data_path: /habitat-lab/data/archive_20260817/social_nav_episode_overfit_ep70_v2.json.gz
+
+habitat_baselines:
+  # One episode converges (or fails to) long before the 3e6 the full suite needs.
+  total_num_steps: 5.0e5
+
+  eval:
+    evals_per_ep: 5
+
+  checkpoint_folder: "hrl_pipeline/checkpoints/overfit_ep70_v2"
+  tensorboard_dir: "hrl_pipeline/tb/overfit_ep70_v2"
+  video_dir: "hrl_pipeline/videos/overfit_ep70_v2"
