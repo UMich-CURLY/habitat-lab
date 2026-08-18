@@ -170,3 +170,11 @@ hrl_pipeline/**/__pycache__/
 
 # Generated navmesh cache (recomputed from the scenes on demand).
 navmeshes_r0.4/
+
+# `data` above hides the whole directory (scene assets are huge and external).
+# The nine built episode files are 148 KB and ARE the experiment definition, so
+# a clone without them cannot run anything. Re-include just those.
+!data/
+data/*
+!data/socialnav_*.json.gz
+!data/DATASETS.md
