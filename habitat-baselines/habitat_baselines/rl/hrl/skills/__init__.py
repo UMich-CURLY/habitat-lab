@@ -27,6 +27,7 @@ from habitat_baselines.rl.hrl.skills.back_off import BackOffSkillPolicy
 # resolves against the partially-initialized package.
 from habitat_baselines.rl.hrl.skills.social_nav_skills import (  # noqa: E402
     BackOffSkill,
+    ClearCorridorYieldSkill, LearnedYieldSkill, FlatNavSkill,
     GoToGoalSkill,
     WaitSkill,
 )
@@ -50,4 +51,5 @@ __all__ = [
     "GoToGoalSkill",
     "WaitSkill",
     "BackOffSkill",
+    "ClearCorridorYieldSkill",
 ]

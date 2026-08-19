@@ -1,0 +1,114 @@
+# @package _global_
+
+# THE settled HL recipe. Everything that was diagnosed and fixed is baked in
+# here, so a training run only has to supply what is genuinely per-run:
+# the dataset, the BC warm start, and where to write.
+#
+#   python -u -m habitat_baselines.run \
+#     --config-name=social_nav/social_nav_hrl_final.yaml \
+#     habitat.dataset.data_path=/habitat-lab/data/social_nav_episode_TRAIN.json.gz \
+#     +habitat_baselines.rl.policy.agent_0.hierarchical_policy.high_level_policy.pretrained_hl_weights=<bc.pth> \
+#     habitat_baselines.checkpoint_folder=hrl_pipeline/checkpoints/<name> \
+#     habitat_baselines.tensorboard_dir=hrl_pipeline/tb/<name>
+#
+# Two environment variables are still required (they gate code paths, not config):
+#   SPLIT_SCENES=1   each env gets its own slice of the episode set
+#   DISABLE_CUDNN=1  run the HL GRU on native CUDA kernels
+#
+# Inherits social_nav_hierarchical_v2 (firm human, corridor yield, 7-D policy
+# state, prev-action input) and NOT the phase-1 overfit config, whose reward
+# values are stale.
+defaults:
+  - social_nav_hierarchical_v2
+  - _self_
+
+habitat:
+  dataset:
+    # Without this the benchmark chain's 570-episode default leaks through.
+    data_path: /habitat-lab/data/socialnav_big_train.json.gz
+  environment:
+    # A full yield + wait + resume takes ~1.2k sim steps; leave room to finish
+    # rather than truncating mid-yield.
+    max_episode_steps: 1500
+
+  task:
+    success_reward: 50.0     # must dominate: success(+50) > collision(-30) > timeout(0)
+    slack_reward: -0.01      # per ENV step, i.e. 0.3 per HL decision
+    measurements:
+      social_nav_reward:
+        end_on_collide: true
+        collide_penalty: 30.0
+        # safe_dis_min=0 DISABLES the proximity penalty. It was an absolute
+        # per-step cost, so it accumulated with episode length and welded
+        # "shorter episode = higher return" into the objective -- the policy
+        # then learned to cut the yield short and collide. Terminal safety is
+        # carried by collide_penalty, which is outcome-based, not time-based.
+        safe_dis_min: 0.0
+        # Potential-based shaping (telescopes over an episode, so it cannot be
+        # farmed by making episodes shorter or longer).
+        goal_progress_reward: 2.0
+        backoff_reward: 3.0
+        yield_dis: 3.0
+        # Layer-3 terms: reward finishing quickly ON SUCCESS ONLY (terminal, so
+        # it cannot be traded against safety), keep clear of the human's
+        # corridor, and pay for releasing the yield promptly once it is clear.
+        eff_success_reward: 20.0
+        corridor_potential_coef: 3.0
+        release_bonus: 3.0
+
+habitat_baselines:
+  num_environments: 8
+  # Stop EARLY. Deterministic eval on the identical 108 keys (36 episodes x 3),
+  # teacher = 0.8333 success / 0.1204 collision:
+  #   BC start 0.8056/0.1389 -> 1.0M 0.8148/0.1389 -> 1.5M 0.8056/0.1481
+  #   -> 2.0M 0.7963/0.1481 -> 3.0M 0.7593/0.1574
+  # So PPO buys ~1 point over BC by 1.0M and gives it all back afterwards, and
+  # 1.0M (ckpt.9) dominates 1.5M (ckpt.14) on every metric. Nothing here passes
+  # the teacher; the best run anywhere is seed 200, which TIES it exactly.
+  # 3e6 is kept only because the tail is the evidence for stopping early.
+  total_num_steps: 3.0e6
+  num_checkpoints: 30
+
+  eval:
+    should_load_ckpt: false   # always evaluate via pretrained_hl_weights
+    deterministic: true
+    evals_per_ep: 3
+
+  rl:
+    ppo:
+      # --- the four fixes that made PPO stable, in the order they were found ---
+      # 1. a value head initialised to output ~±2 cannot reach ±40 returns at
+      #    the actor's lr (Adam moves ~lr per step); it never fits and the
+      #    advantages have no usable baseline.
+      critic_lr: 3.0e-2
+      # 2. the HL acts once per 30 env steps, so the default rollout yields ~17
+      #    samples per gradient step. Longer rollout + single minibatch.
+      num_steps: 1024
+      num_mini_batch: 1
+      # 3. with noisy advantages the entropy bonus becomes the only consistent
+      #    gradient and slowly melts the cloned policy.
+      entropy_coef: 0.0
+      # 4. keep the value gradient from drowning the actor's, and clip the
+      #    occasional cliff that used to end a run in one step.
+      value_loss_coef: 0.05
+      lr: 5.0e-5
+      max_grad_norm: 2.0
+      gamma: 0.99
+      tau: 0.95
+      hidden_size: 32          # must match high_level_policy.hidden_dim
+      use_normalized_advantage: true
+
+    policy:
+      agent_0:
+        hierarchical_policy:
+          high_level_policy:
+            hidden_dim: 32
+            num_rnn_layers: 1
+            # BC warms only the actor; a random critic destroys it within ~50
+            # updates. Freeze the actor while the critic fits (120 calls ~= 60
+            # updates at ppo_epoch=2, num_mini_batch=1).
+            critic_warmup_calls: 120
+
+  checkpoint_folder: "hrl_pipeline/checkpoints/hrl_final"
+  tensorboard_dir: "hrl_pipeline/tb/hrl_final"
+  video_dir: "hrl_pipeline/videos/hrl_final"

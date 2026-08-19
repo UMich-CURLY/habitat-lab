@@ -1,9 +1,9 @@
 # @package _global_
 
-# HRL social-nav config where agent_0's GoToGoalSkill drives the robot with a
-# self-contained RVO/ORCA collision-avoidance behaviour (outputs base_velocity),
+# HRL social-nav config where agent_0's GoToGoalSkill drives the robot along the
+# default navmesh geodesic (no RVO, no human avoidance; outputs base_velocity),
 # while the task drives the human (agent_1) with its own RVO. CyclingHighLevelPolicy
-# selects go_to_goal by default and switches to backoff when the human is detected.
+# selects go_to_goal by default and switches to backoff when the human gets close.
 
 defaults:
   - /benchmark/multi_agent: hssd_spot_human_social_nav_twoagent
@@ -27,7 +27,6 @@ habitat:
         count_coll_pen: 0.01
         max_count_colls: -1
         count_coll_end_pen: 5.0
-        safe_dis_min: 0.2
     success_reward: 10.0
     slack_reward: -0.1
     end_on_success: true
@@ -109,27 +108,25 @@ habitat_baselines:
             name: "CyclingHighLevelPolicy"
             # Rule-based switch policy: backoff when the human gets within
             # backoff_enter_dist, resume go_to_goal once farther than
-            # backoff_exit_dist. Narrow band so the robot yields only in very
-            # close encounters and quickly resumes (RVO in go_to_goal already
-            # avoids the human, so the yield is just a brief social pause).
-            backoff_enter_dist: 1.0
-            backoff_exit_dist: 1.2
+            # backoff_exit_dist. Earlier trigger (1.5 m) so the robot starts
+            # yielding sooner; exit > enter keeps a hysteresis band.
+            backoff_enter_dist: 1.5
+            backoff_exit_dist: 1.7
           defined_skills:
             backoff:
               skill_name: "BackOffSkill"
               pddl_action_names: null
-              max_skill_steps: 60          # safety cap; human-clear / retrace-done usually fire first
+              max_skill_steps: 60          # safety cap; target-reached usually fires first
               skill_data:
-                # Reverse-retrace the robot's own path backward (collision-free):
-                # keep facing forward, back straight up along the breadcrumb trail.
-                # Resume go_to_goal once the human is farther than human_clear_dist.
-                human_clear_dist: 1.2
-                lookahead: 0.4            # target a breadcrumb ~0.4 m behind
-                retreat_speed: 0.5        # m/s reverse speed
-                max_back_dist: 0.8        # retreat at most 0.8 m from the entry point
-                align_thresh: 0.5         # only reverse if path-behind within ~29 deg; else yield
-                lin_speed: 10.0           # = agent_0_base_velocity longitudinal_lin_speed
-                arrive_thresh: 0.15
+                # Back up to a point ~2 m behind the door on the start side via
+                # default pathfinding (target/waypoint come from the
+                # backoff_waypoint_delta sensor); drive in reverse the whole way.
+                max_back_speed: 1.0        # m/s reverse speed (ramps down near target)
+                lin_speed: 10.0            # = agent_0_base_velocity longitudinal_lin_speed
+                turn_thresh: 0.1           # rad; align back-to-waypoint before reversing
+                turn_velocity: 1.0
+                start_stop_radius: 0.15    # stop forcing motion within this of target
+                start_done_radius: 0.3     # reached target -> hand back to HL
                 backoff_debug: False
             wait:
               skill_name: "WaitSkill"
@@ -139,32 +136,16 @@ habitat_baselines:
               skill_name: "GoToGoalSkill"
               pddl_action_names: null
               max_skill_steps: 100
-              # Custom RVO/ORCA params live under skill_data (HrlDefinedSkillConfig
-              # is a closed schema). rvo_time_step must match ac_freq_ratio/ctrl_freq
-              # (4/120 = 0.0333) and rvo_lin_speed must match the agent_0_base_velocity
-              # longitudinal_lin_speed (default 10.0).
               skill_data:
-                rvo_radius: 0.4
-                rvo_human_radius: 0.4
-                rvo_max_speed: 1.0
-                rvo_neighbor_dist: 2.0
-                rvo_max_neighbors: 10
-                rvo_time_horizon: 2.0
-                rvo_time_horizon_obst: 4.0
-                # Stop band must be < the success_distance (0.2 m) so the robot
-                # actually reaches its goal rather than halting just outside.
-                rvo_goal_stop_radius: 0.15
-                rvo_time_step: 0.0333
-                rvo_lin_speed: 10.0
+                # Geodesic path following (goal_waypoint_delta sensor); lin_speed
+                # must match the agent_0_base_velocity longitudinal_lin_speed.
+                max_speed: 1.0             # m/s forward speed (ramps down near goal)
+                lin_speed: 10.0
                 turn_thresh: 0.1
                 turn_velocity: 1.0
-                goal_done_radius: 0.2
-                # Hand back to the HL once the human is closer than this so it can
-                # switch to backoff (>= high_level_policy.backoff_enter_dist).
-                human_switch_dist: 1.0
-                # Set True to print a per-step RVO trace for env 0 (robot/human
-                # xz, goal_rho, pref, orca_vel, lin, ang) -- useful for tuning.
-                rvo_debug: False
+                goal_stop_radius: 0.15     # < success_distance (0.4) so success fires
+                goal_done_radius: 0.3      # reached goal -> hand back to HL
+                goal_debug: False
           ignore_skills: []
 
       agent_1:

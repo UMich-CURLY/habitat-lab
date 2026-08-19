@@ -89,6 +89,16 @@ class PPOTrainer(BaseRLTrainer):
         self._is_static_encoder = False
         self._encoder = None
         self._env_spec = None
+        # Rollout episode-mix tracking (None=uninitialized, False=episodes
+        # carry no info.pool.teacher_class -> permanently off for this run).
+        self._ep_track = None
+        # DISABLE_CUDNN=1: run RNNs on native CUDA kernels. The HL GRU is
+        # 10->32, where cuDNN buys nothing but its workspace allocation can
+        # fail under memory pressure (observed: CUDNN_STATUS_INTERNAL_ERROR
+        # in backward at the first post-warmup update on the 23-scene set).
+        if os.environ.get("DISABLE_CUDNN") == "1":
+            torch.backends.cudnn.enabled = False
+            logger.info("cuDNN disabled (DISABLE_CUDNN=1)")
 
         # Distributed if the world size would be
         # greater than 1
@@ -402,6 +412,65 @@ class PPOTrainer(BaseRLTrainer):
                 action_data=action_data,
             )
 
+    @staticmethod
+    def _ep_track_key(episode):
+        pool = (getattr(episode, "info", None) or {}).get("pool") or {}
+        return (
+            str(pool.get("teacher_class", "unknown")),
+            str(pool.get("train36_id", episode.episode_id)),
+        )
+
+    def _full_current_episodes(self):
+        # envs.current_episodes() returns the gym wrapper's TRIMMED episode
+        # (episode_id/scene_id only, info=None); info.pool needs all_info.
+        n = self.envs.num_envs
+        return self.envs.call(["current_episode"] * n, [{"all_info": True}] * n)
+
+    def _track_rollout_episodes(self, env_slice, dones):
+        """Count rollout frames per teacher_class / train36_id.
+
+        The per-env scene split (idx % num_envs) means dataset-level episode
+        duplication does NOT guarantee the intended global sampling mix, so
+        the actual mix is measured, not assumed. No-op unless the training
+        episodes carry info.pool.teacher_class (stamped by build_quickset.py).
+        current_episodes() is only re-fetched when an episode ended, so the
+        added IPC is amortized over full episodes.
+        """
+        if self._ep_track is None:
+            try:
+                cur = self._full_current_episodes()
+            except Exception as e:
+                logger.info(f"rollout episode tracking off: {e!r}")
+                self._ep_track = False
+                return
+            if not any(
+                self._ep_track_key(e)[0] != "unknown" for e in cur
+            ):
+                logger.info(
+                    "rollout episode tracking off: episodes carry no "
+                    f"info.pool.teacher_class (sample info: "
+                    f"{getattr(cur[0], 'info', None)})"
+                )
+                self._ep_track = False
+                return
+            self._ep_track = [self._ep_track_key(e) for e in cur]
+            self._ep_frame_counts: Dict[str, int] = defaultdict(int)
+            self._class_frame_counts: Dict[str, int] = defaultdict(int)
+        if self._ep_track is False:
+            return
+        # The frame just collected belongs to the episode that was active
+        # BEFORE any auto-reset, so count first, then refresh finished envs.
+        for i in range(env_slice.start, env_slice.stop):
+            cls, tid = self._ep_track[i]
+            self._class_frame_counts[cls] += 1
+            self._ep_frame_counts[f"{cls}|{tid}"] += 1
+        if any(dones):
+            cur = self._full_current_episodes()
+            for j, done in enumerate(dones):
+                if done:
+                    i = env_slice.start + j
+                    self._ep_track[i] = self._ep_track_key(cur[i])
+
     def _collect_environment_result(self, buffer_index: int = 0):
         num_envs = self.envs.num_envs
         env_slice = slice(
@@ -437,6 +506,8 @@ class PPOTrainer(BaseRLTrainer):
                 device=self.current_episode_reward.device,
             )
             done_masks = torch.logical_not(not_done_masks)
+
+            self._track_rollout_episodes(env_slice, dones)
 
             self.current_episode_reward[env_slice] += rewards
             current_ep_reward = self.current_episode_reward[env_slice]
@@ -592,6 +663,29 @@ class PPOTrainer(BaseRLTrainer):
             writer.add_scalar(f"metrics/{k}", v, self.num_steps_done)
         for k, v in losses.items():
             writer.add_scalar(f"learner/{k}", v, self.num_steps_done)
+
+        if self._ep_track not in (None, False) and self._class_frame_counts:
+            total = sum(self._class_frame_counts.values())
+            writer.add_scalar(
+                "metrics/rollout_fail_frac",
+                self._class_frame_counts.get("stable-failure", 0) / total,
+                self.num_steps_done,
+            )
+            for cls, c in self._class_frame_counts.items():
+                writer.add_scalar(
+                    f"metrics/rollout_frac_{cls}", c / total, self.num_steps_done
+                )
+            self._class_frame_counts.clear()
+            import json as _json
+
+            ckpt_dir = self.config.habitat_baselines.checkpoint_folder
+            os.makedirs(ckpt_dir, exist_ok=True)
+            with open(
+                os.path.join(ckpt_dir, "rollout_counts.json"), "w"
+            ) as f:
+                _json.dump(
+                    dict(sorted(self._ep_frame_counts.items())), f, indent=1
+                )
 
         for k, v in self._single_proc_infos.items():
             writer.add_scalar(k, np.mean(v), self.num_steps_done)

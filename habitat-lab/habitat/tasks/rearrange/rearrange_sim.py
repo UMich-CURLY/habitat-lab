@@ -453,6 +453,45 @@ class RearrangeSim(HabitatSim):
         scene_name = ep_info.scene_id.split("/")[-1].split(".")[0]
         base_dir = osp.join(*ep_info.scene_id.split("/")[:2])
 
+        # Optional override: force-recompute the navmesh with a specific agent
+        # radius (e.g. the robot's PHYSICAL body footprint ~0.4 m) instead of
+        # loading the baked navmesh (which uses a small generic radius and lets
+        # the robot plan through doors its body cannot physically fit). Cached
+        # in a radius-specific dir so the original baked navmeshes are untouched.
+        override_r = getattr(
+            self.habitat_config, "navmesh_agent_radius", None
+        )
+        if override_r is not None:
+            override_r = float(override_r)
+            navmesh_path = osp.join(
+                base_dir, f"navmeshes_r{override_r}", scene_name + ".navmesh"
+            )
+            if osp.exists(navmesh_path):
+                self.pathfinder.load_nav_mesh(navmesh_path)
+            else:
+                navmesh_settings = NavMeshSettings()
+                navmesh_settings.set_defaults()
+                agent_config = (
+                    self.habitat_config.agents.agent_0
+                    if hasattr(self.habitat_config.agents, "agent_0")
+                    else self.habitat_config.agents.main_agent
+                )
+                navmesh_settings.agent_radius = override_r
+                navmesh_settings.agent_height = agent_config.height
+                navmesh_settings.agent_max_climb = agent_config.max_climb
+                navmesh_settings.agent_max_slope = agent_config.max_slope
+                navmesh_settings.include_static_objects = True
+                self.recompute_navmesh(self.pathfinder, navmesh_settings)
+                os.makedirs(osp.dirname(navmesh_path), exist_ok=True)
+                self.pathfinder.save_nav_mesh(navmesh_path)
+                logger.info(
+                    f"Recomputed navmesh (agent_radius={override_r}) -> {navmesh_path}"
+                )
+            self._largest_indoor_island_idx = get_largest_island_index(
+                self.pathfinder, self, allow_outdoor=True
+            )
+            return
+
         navmesh_path = osp.join(base_dir, "navmeshes", scene_name + ".navmesh")
 
         if osp.exists(navmesh_path):

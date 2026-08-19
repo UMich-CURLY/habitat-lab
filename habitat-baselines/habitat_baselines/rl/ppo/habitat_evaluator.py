@@ -59,9 +59,12 @@ class HabitatEvaluator(Evaluator):
 
         current_episode_reward = torch.zeros(envs.num_envs, 1, device="cpu")
 
+        # construct_envs may have reduced the env count below the configured
+        # num_environments (eval caps it at #scenes) — size per-env state by
+        # the actual env count.
         test_recurrent_hidden_states = torch.zeros(
             (
-                config.habitat_baselines.num_environments,
+                envs.num_envs,
                 *agent.actor_critic.hidden_state_shape,
             ),
             device=device,
@@ -71,13 +74,13 @@ class HabitatEvaluator(Evaluator):
         action_space_lens = agent.actor_critic.policy_action_space_shape_lens
 
         prev_actions = torch.zeros(
-            config.habitat_baselines.num_environments,
+            envs.num_envs,
             *action_shape,
             device=device,
             dtype=torch.long if discrete_actions else torch.float,
         )
         not_done_masks = torch.zeros(
-            config.habitat_baselines.num_environments,
+            envs.num_envs,
             *agent.masks_shape,
             device=device,
             dtype=torch.bool,
@@ -95,7 +98,9 @@ class HabitatEvaluator(Evaluator):
                         {k: v[env_idx] for k, v in batch.items()}, {}
                     )
                 ]
-                for env_idx in range(config.habitat_baselines.num_environments)
+                # construct_envs may have reduced the env count below the
+                # configured num_environments (eval caps it at #scenes).
+                for env_idx in range(envs.num_envs)
             ]
         else:
             rgb_frames = None
@@ -139,7 +144,14 @@ class HabitatEvaluator(Evaluator):
             
         step_count = 0
         episode_step_counts = [0] * envs.num_envs  # Track steps per environment
-        max_episode_steps_override = 500  # Force reset after 500 steps
+        # Force reset after this many steps; -1 disables the forced reset.
+        max_episode_steps_override = int(
+            getattr(
+                config.habitat_baselines.eval,
+                "max_episode_steps_override",
+                500,
+            )
+        )
         
         while (
             len(stats_episodes) < (number_of_eval_episodes * evals_per_ep)
@@ -168,7 +180,13 @@ class HabitatEvaluator(Evaluator):
                     test_recurrent_hidden_states,
                     prev_actions,
                     not_done_masks,
-                    deterministic=False,
+                    deterministic=bool(
+                        getattr(
+                            config.habitat_baselines.eval,
+                            "deterministic",
+                            False,
+                        )
+                    ),
                     **space_lengths,
                 )
                 
@@ -275,7 +293,10 @@ class HabitatEvaluator(Evaluator):
 
             # Force episode end if it's been running too long (step counter safety) - DO THIS BEFORE CREATING MASKS
             for i in range(len(dones)):
-                if episode_step_counts[i] >= max_episode_steps_override:
+                if (
+                    max_episode_steps_override > 0
+                    and episode_step_counts[i] >= max_episode_steps_override
+                ):
                     dones[i] = True
                     episode_step_counts[i] = 0
                     if step_count % 100 == 0:
@@ -475,6 +496,24 @@ class HabitatEvaluator(Evaluator):
             aggregated_stats[stat_key] = np.mean(
                 [v[stat_key] for v in stats_episodes.values() if stat_key in v]
             )
+
+        episode_stats_path = str(
+            getattr(config.habitat_baselines.eval, "episode_stats_path", "")
+        )
+        if episode_stats_path:
+            import json as _json
+
+            with open(episode_stats_path, "w") as f:
+                _json.dump(
+                    {
+                        f"{scene_ep[0]}|{scene_ep[1]}|{count}": stats
+                        for (scene_ep, count), stats in stats_episodes.items()
+                    },
+                    f,
+                    indent=1,
+                    default=float,
+                )
+            logger.info(f"Wrote per-episode eval stats to {episode_stats_path}")
 
         for k, v in aggregated_stats.items():
             logger.info(f"Average episode {k}: {v:.4f}")

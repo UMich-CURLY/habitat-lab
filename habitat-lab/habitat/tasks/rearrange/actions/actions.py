@@ -556,6 +556,13 @@ class BaseVelNonCylinderAction(ArticulatedAgentAction):
         self._enable_rotation_check_for_dyn_slide = (
             self._config.enable_rotation_check_for_dyn_slide
         )
+        # When a translation would collide (and sliding is off), still apply the
+        # commanded ROTATION so the robot can always turn in place to face a free
+        # direction and escape a wedge, instead of being frozen (rotation +
+        # translation both reverted). Default False reproduces legacy behavior.
+        self._rotate_on_collision = self._config.get(
+            "rotate_on_collision", False
+        )
         self._allow_back = self._config.allow_back
         self._collision_threshold = self._config.collision_threshold
         self._longitudinal_lin_speed = self._config.longitudinal_lin_speed
@@ -638,6 +645,12 @@ class BaseVelNonCylinderAction(ArticulatedAgentAction):
                 new_end_pos = trans.translation + move_vec
                 return True, mn.Matrix4.from_(
                     target_rigid_state.rotation.to_matrix(), new_end_pos
+                )
+            if self._rotate_on_collision:
+                # Keep the commanded rotation (turn in place), revert only the
+                # blocked translation, so the robot can always turn to escape.
+                return True, mn.Matrix4.from_(
+                    target_rigid_state.rotation.to_matrix(), trans.translation
                 )
             return True, trans
         else:

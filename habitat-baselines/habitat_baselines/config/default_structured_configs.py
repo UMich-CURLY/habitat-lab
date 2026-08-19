@@ -44,6 +44,13 @@ class EvalConfig(HabitatBaselinesBaseConfig):
     # The number of time to run each episode through evaluation.
     # Only works when evaluating on all episodes.
     evals_per_ep: int = 1
+    # Whether the policy acts with argmax (True) or samples (False) at eval.
+    deterministic: bool = False
+    # Force-reset an env after this many steps during eval. -1 disables the
+    # forced reset (episodes then end only by their own termination/timeout).
+    max_episode_steps_override: int = 500
+    # If non-empty, dump per-episode eval stats as JSON to this path.
+    episode_stats_path: str = ""
     video_option: List[str] = field(
         # available options are "disk" and "tensorboard"
         default_factory=list
@@ -293,6 +300,12 @@ class PPOConfig(HabitatBaselinesBaseConfig):
     value_loss_coef: float = 0.5
     entropy_coef: float = 0.01
     lr: float = 2.5e-4
+    # Separate learning rate for the value head only (0 = use `lr` for
+    # everything, i.e. unchanged behavior). Needed when returns are large
+    # relative to the critic's init output range: Adam moves each weight by
+    # ~lr per step, so the value head otherwise needs O(1e5) steps to reach
+    # the return scale and never provides a usable baseline.
+    critic_lr: float = 0.0
     eps: float = 1e-5
     max_grad_norm: float = 0.5
     num_steps: int = 5

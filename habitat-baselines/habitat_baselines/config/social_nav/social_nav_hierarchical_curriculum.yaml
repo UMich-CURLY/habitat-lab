@@ -1,0 +1,39 @@
+# @package _global_
+
+# Curriculum training for the yield-then-go switch on ep118. Same tiny HL net as
+# the overfit check; pure base reward (only collide_penalty + max_episode_steps
+# tuned). Per-stage dataset / pretrained_weights / output dirs are set on the CLI.
+defaults:
+  - social_nav_hierarchical
+  - _self_
+
+habitat:
+  environment:
+    # Bound episode length so a failing policy can't farm a huge negative return
+    # by running out a 1500-step clock (the run9 degenerate).
+    max_episode_steps: 500
+  task:
+    measurements:
+      social_nav_reward:
+        # Make ramming the human clearly worse than yielding (default was 1.0,
+        # which return-tied with success). Pure base reward otherwise — no
+        # yield_dis / end_on_collide (they stay default = original behaviour).
+        collide_penalty: 5.0
+
+habitat_baselines:
+  eval:
+    should_load_ckpt: true
+    evals_per_ep: 10
+
+  rl:
+    ppo:
+      hidden_size: 32  # Must match HL policy hidden_dim
+      use_normalized_advantage: True
+      max_grad_norm: 10.0
+      entropy_coef: 0.005
+    policy:
+      agent_0:
+        hierarchical_policy:
+          high_level_policy:
+            hidden_dim: 32
+            num_rnn_layers: 1

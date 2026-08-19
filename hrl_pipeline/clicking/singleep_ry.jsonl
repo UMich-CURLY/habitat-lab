@@ -1,0 +1,5 @@
+{"idx": 0, "RYsu": 0.0, "steps": 1200, "collide": 0}
+{"idx": 3, "RYsu": 0.0, "steps": 1200, "collide": 0}
+{"idx": 4, "RYsu": 0.0, "steps": 1200, "collide": 0}
+{"idx": 7, "RYsu": null, "error": "[Errno 2] No such file or directory: '/habitat-lab/scratch_diag/manual/_se_stats"}
+{"idx": 14, "RYsu": null, "error": "[Errno 2] No such file or directory: '/habitat-lab/scratch_diag/manual/_se_stats"}

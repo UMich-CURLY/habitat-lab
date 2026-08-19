@@ -1,0 +1,56 @@
+# @package _global_
+
+# v2 HRL config: same hierarchical policy as the legacy config, but on the
+# FIRM-human v2 benchmark and with the S0 evaluator controls turned on.
+# Later stages (S2 yield primitive, S3a 10-D obs, S5 reward) extend this file.
+defaults:
+  - social_nav_hierarchical
+  - override /benchmark/multi_agent: hssd_spot_human_social_nav_twoagent_v2
+  - _self_
+
+habitat_baselines:
+  eval:
+    # S0: deterministic eval, no forced 500-step slicing (use the task's own
+    # episode cap), and dump per-episode stats for the audit harness.
+    deterministic: true
+    max_episode_steps_override: -1
+    episode_stats_path: ""
+
+  rl:
+    policy:
+      agent_0:
+        hierarchical_policy:
+          defined_skills:
+            # S2: the index-0 skill is now the clear-corridor yield primitive
+            # (class renamed BackOffSkill -> ClearCorridorYieldSkill). The yaml
+            # key stays "backoff" as an internal identifier (like the sensor
+            # uuid) to avoid a Hydra dict-merge that would add a stale 4th skill.
+            backoff:
+              skill_name: "ClearCorridorYieldSkill"
+              skill_data:
+                hold_at_target: true
+                proportional_turn: true
+                # F1: back up WHILE turning (no dead in-place spin at start),
+                # floor the angular rate so the alignment tail isn't sluggish.
+                drive_while_turning: true
+                min_turn_rate: 0.35
+                turn_thresh: 0.3
+                # Reverse-safety floor: freeze instead of backing into a human
+                # closer than this (the reverse drive is blind). Must sit
+                # ABOVE the human's 0.8 m firm block gate so the mutual
+                # standoff settles with room for the release turn.
+                human_stop_dist: 1.0
+            go_to_goal:
+              skill_data:
+                proportional_turn: true
+                drive_while_turning: true
+                min_turn_rate: 0.35
+                turn_thresh: 0.3
+          high_level_policy:
+            # Index order unchanged; names drive skill_name_to_idx lookup.
+            hl_action_names: ["backoff", "wait", "go_to_goal"]
+            # 7-D policy state (include_approach_speed in the v2 benchmark)
+            # plus the previous HL action as a pre-GRU one-hot, so the
+            # teacher's hysteresis is recoverable from the student's inputs.
+            input_feature_dim: 7
+            use_prev_action: true

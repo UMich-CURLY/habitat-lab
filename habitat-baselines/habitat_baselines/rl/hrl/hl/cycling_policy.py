@@ -109,13 +109,6 @@ class CyclingHighLevelPolicy(HighLevelPolicy):
             next_skill[i] = float(skill_idx)
             skill_args_data[i] = []
 
-            d_str = "n/a" if d is None else f"{d:.2f}"
-            print(
-                f"[CyclingPolicy] env{i} dist_to_human={d_str} -> "
-                f"skill={'backoff' if self._in_backoff[i] else 'go_to_goal'}"
-                f" (idx={skill_idx})",
-                flush=True,
-            )
 
         return next_skill, skill_args_data, immediate_end, PolicyActionData()
 

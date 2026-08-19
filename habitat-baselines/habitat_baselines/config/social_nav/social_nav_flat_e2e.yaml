@@ -1,0 +1,48 @@
+# @package _global_
+
+# Route-2 baseline: FLAT end-to-end PPO for agent_0 (no hierarchy, no skills).
+# A single recurrent policy maps observations directly to the full continuous
+# action vector every step. Expected role: a supporting baseline/ablation —
+# prior evidence (HL M2) says PPO-from-scratch stalls in an avoid-timeout
+# local optimum on this task; this config lets you verify that end-to-end.
+#
+# Plumbing notes (verified in code):
+# - PointNavResNetPolicy runs "blind" on 1-D obs; with the depth key present it
+#   builds a visual encoder over it (both fine).
+# - updater/storage names are GLOBAL (not per-agent) and must be the standard
+#   PPO/DDPPO/RolloutStorage here (the HRL variants require HrlRolloutStorage).
+#   agent_1 stays scripted-hierarchical and is skipped by MultiUpdater.
+# - CAVEAT: agent_0's action vector concatenates ALL its actions
+#   (base_velocity + rearrange_stop + oracle_nav). The stop dim can терminate
+#   episodes early if the policy emits it; see FRAMEWORKS_HOWTO.md for the
+#   optional action-pruning step before serious runs.
+defaults:
+  - social_nav_hierarchical_v2
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 1200
+
+habitat_baselines:
+  updater_name: "PPO"
+  distrib_updater_name: "DDPPO"
+  rollout_storage_name: "RolloutStorage"
+
+  total_num_steps: 5.0e6
+  num_environments: 8
+  checkpoint_folder: "checkpoints_flat_e2e"
+  tensorboard_dir: "tb_flat_e2e"
+
+  rl:
+    ppo:
+      # Flat continuous control: standard PPO sizes (not the tiny HL net).
+      hidden_size: 512
+      num_steps: 128
+      lr: 2.5e-4
+      entropy_coef: 0.005
+      use_normalized_advantage: True
+    policy:
+      agent_0:
+        name: "PointNavResNetPolicy"
+        action_distribution_type: "gaussian"
